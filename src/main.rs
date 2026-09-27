@@ -1,8 +1,8 @@
-//! Khaṇa v0.6 desktop prototype.
+//! Khaṇa v0.7 desktop prototype.
 //!
-//! v0.6 adds transport, editable tonal/metric settings, visible voicing,
-//! semantic phrase playback/queueing, and an explicit chord -> voice-engine
-//! boundary while retaining the two-screen MVP.
+//! v0.7 replaces local chord heuristics with progression-context ranking,
+//! makes chord identity stable across performance macros, and keeps chord
+//! display / MIDI realization semantically aligned.
 
 mod input;
 mod midi;
@@ -44,6 +44,7 @@ struct App {
     current_chord: Chord,
     chord_started_beat: f64,
     current_render: VoiceRender,
+    progression_history: Vec<Chord>,
     recommendation_engine: RecommendationEngine,
     recommendations: RecommendationSet,
     selected_class: RecommendationClass,
@@ -67,8 +68,9 @@ impl App {
         let current_chord = settings.tonal.tonic_chord();
         let recommendation_engine = RecommendationEngine::new();
         let direction = HarmonicDirection::Neutral;
+        let progression_history = vec![current_chord];
         let recommendations =
-            recommendation_engine.recommend(current_chord, settings.tonal, direction, false);
+            recommendation_engine.recommend(&progression_history, settings.tonal, direction, false);
         let voices = default_voices();
         let mut voice_engine = VoiceEngine::new();
         let current_render = voice_engine.harmonic_change(current_chord, &voices);
@@ -80,6 +82,7 @@ impl App {
             current_chord,
             chord_started_beat: 0.0,
             current_render,
+            progression_history,
             recommendation_engine,
             recommendations,
             selected_class: RecommendationClass::Safe,
@@ -100,7 +103,7 @@ impl App {
 
     fn refresh_recommendations(&mut self) {
         self.recommendations = self.recommendation_engine.recommend(
-            self.current_chord,
+            &self.progression_history,
             self.settings.tonal,
             self.direction,
             self.surprise,
@@ -133,13 +136,25 @@ impl App {
             self.recorder.chord_changed(now_beat, chord);
         }
 
+        if self.progression_history.last().copied() != Some(chord) {
+            self.progression_history.push(chord);
+            if self.progression_history.len() > 8 {
+                self.progression_history.remove(0);
+            }
+        }
+
         self.refresh_recommendations();
 
+        let chord_name = self.settings.tonal.chord_symbol(self.current_chord);
+        let note_names = self
+            .current_render
+            .voicing
+            .notes
+            .map(|note| self.settings.tonal.midi_note_label(note));
+
         println!(
-            "CHORD {} / {} -> {:?}",
-            self.current_chord.symbol(),
-            self.current_render.realized_chord.symbol(),
-            self.current_render.voicing.notes
+            "CHORD {} -> {:?} MIDI {:?}",
+            chord_name, note_names, self.current_render.voicing.notes
         );
 
         Ok(())
@@ -195,13 +210,15 @@ impl App {
         self.current_render = self
             .voice_engine
             .harmonic_change(self.current_chord, &self.voices);
+        self.progression_history.clear();
+        self.progression_history.push(self.current_chord);
         midi.stop_all()?;
         self.refresh_recommendations();
         Ok(())
     }
 }
 
-/// Runs Khaṇa v0.6.
+/// Runs Khaṇa v0.7.
 ///
 /// # Errors
 ///
@@ -211,7 +228,7 @@ fn main() -> Result<(), String> {
     let video = sdl_context.video()?;
     let window = video
         .window(
-            "Khaṇa v0.6.5 — corrected harmony and voicing",
+            "Khaṇa v0.7.0 — progression-context harmony",
             WINDOW_WIDTH,
             WINDOW_HEIGHT,
         )
@@ -438,7 +455,7 @@ fn handle_performance_action(
         InputAction::AdjustMacro { kind, delta } => {
             adjust_macro(&mut app.voices, app.scope, kind, delta);
 
-            if matches!(kind, MacroKind::Spread | MacroKind::Color) {
+            if kind == MacroKind::Spread {
                 app.revoice_current(midi, transport.is_running())?;
             }
         }
@@ -655,18 +672,21 @@ fn replace_selected_with_safe_choice(app: &mut App) {
     let Some(phrase) = app.phrases.get(phrase_index) else {
         return;
     };
-    let Some(event) = phrase.events.get(event_index) else {
+    if phrase.events.get(event_index).is_none() {
         return;
-    };
+    }
 
-    let context_chord = if event_index > 0 {
-        phrase.events[event_index - 1].chord
-    } else {
-        event.chord
-    };
+    let mut history = phrase.events[..event_index]
+        .iter()
+        .map(|event| event.chord)
+        .collect::<Vec<_>>();
+
+    if history.is_empty() {
+        history.push(app.settings.tonal.tonic_chord());
+    }
 
     let set = app.recommendation_engine.recommend(
-        context_chord,
+        &history,
         app.settings.tonal,
         HarmonicDirection::Neutral,
         false,
@@ -679,7 +699,7 @@ fn replace_selected_with_safe_choice(app: &mut App) {
 }
 
 fn print_controls() {
-    println!("Khaṇa v0.6.5");
+    println!("Khaṇa v0.7.0");
     println!("GLOBAL:");
     println!("  Space   transport start/stop");
     println!("  Tab     Performance / Phrase Editor");

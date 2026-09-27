@@ -1,6 +1,6 @@
 //! SDL rendering for Khaṇa's two 1024×768 MVP screens.
 
-use crate::music::chord::{Chord, midi_note_label};
+use crate::music::chord::Chord;
 use crate::music::recommendation::{HarmonicDirection, RecommendationClass, RecommendationSet};
 use crate::music::settings::{MusicalSettings, SettingField};
 use crate::phrase::{Phrase, RecorderStatus};
@@ -47,17 +47,21 @@ impl Ui {
 
         draw_panel(canvas, Rect::new(32, 82, 250, 220), panel())?;
         draw_text(canvas, 54, 100, "CURRENT", 2, dim_text())?;
-        draw_text(canvas, 54, 140, &current_chord.symbol(), 5, text_color())?;
         draw_text(
             canvas,
             54,
-            190,
-            &format!("VOICED {}", current_render.realized_chord.symbol()),
-            2,
-            accent(),
+            140,
+            &settings.tonal.chord_symbol(current_chord),
+            5,
+            text_color(),
         )?;
+        draw_text(canvas, 54, 192, "4 VOICES", 2, accent())?;
 
-        let note_line = current_render.voicing.notes.map(midi_note_label).join(" ");
+        let note_line = current_render
+            .voicing
+            .notes
+            .map(|note| settings.tonal.midi_note_label(note))
+            .join(" ");
         draw_text(canvas, 54, 225, &note_line, 2, text_color())?;
 
         let elapsed = if sync_status.running {
@@ -68,15 +72,30 @@ impl Ui {
         draw_text(canvas, 54, 263, &elapsed, 2, dim_text())?;
 
         draw_text(canvas, 315, 88, "NEXT", 2, dim_text())?;
-        draw_recommendations(canvas, recommendations, selected_class, selected_row)?;
+        draw_recommendations(
+            canvas,
+            settings.tonal,
+            recommendations,
+            selected_class,
+            selected_row,
+        )?;
 
         draw_panel(canvas, Rect::new(780, 82, 212, 220), panel())?;
         draw_text(canvas, 800, 100, "DIRECTION", 2, dim_text())?;
         draw_text(canvas, 800, 138, direction.label(), 3, accent())?;
         draw_text(canvas, 800, 194, "SCOPE", 2, dim_text())?;
         draw_text(canvas, 800, 230, &scope.label(), 4, text_color())?;
+        draw_text(canvas, 800, 274, "WHY", 1, dim_text())?;
+        draw_text(
+            canvas,
+            835,
+            274,
+            recommendations.reason(selected_class, selected_row).label(),
+            1,
+            accent(),
+        )?;
 
-        draw_voice_rows(canvas, voices, scope, current_render)?;
+        draw_voice_rows(canvas, settings.tonal, voices, scope, current_render)?;
 
         draw_panel(canvas, Rect::new(32, 660, 960, 82), panel())?;
         draw_recording_strip(
@@ -150,12 +169,26 @@ impl Ui {
             dim_text(),
         )?;
 
-        draw_timeline(canvas, phrase, selected_event, pixels_per_beat, self.width)?;
+        draw_timeline(
+            canvas,
+            settings.tonal,
+            phrase,
+            selected_event,
+            pixels_per_beat,
+            self.width,
+        )?;
 
         if let Some(event) = phrase.events.get(selected_event) {
             draw_panel(canvas, Rect::new(32, 610, 960, 112), panel())?;
             draw_text(canvas, 52, 626, "SELECTED", 2, dim_text())?;
-            draw_text(canvas, 52, 660, &event.chord.symbol(), 5, text_color())?;
+            draw_text(
+                canvas,
+                52,
+                660,
+                &settings.tonal.chord_symbol(event.chord),
+                5,
+                text_color(),
+            )?;
             draw_text(
                 canvas,
                 260,
@@ -301,6 +334,7 @@ fn playback_label(playing_phrase: Option<usize>, queued_phrase: Option<usize>) -
 
 fn draw_recommendations(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    context: crate::music::settings::TonalContext,
     recommendations: &RecommendationSet,
     selected_class: RecommendationClass,
     selected_row: usize,
@@ -329,7 +363,7 @@ fn draw_recommendations(
                 canvas,
                 x + 12,
                 y + 10,
-                &chord.symbol(),
+                &context.chord_symbol(chord),
                 2,
                 if selected { background() } else { text_color() },
             )?;
@@ -341,6 +375,7 @@ fn draw_recommendations(
 
 fn draw_voice_rows(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    context: crate::music::settings::TonalContext,
     voices: &[Voice; 4],
     scope: VoiceScope,
     render: VoiceRender,
@@ -368,7 +403,7 @@ fn draw_voice_rows(
                 "{} {} {}",
                 index + 1,
                 voice.role.label(),
-                midi_note_label(render.voicing.notes[index])
+                context.midi_note_label(render.voicing.notes[index])
             ),
             2,
             text_color(),
@@ -440,6 +475,7 @@ fn draw_recording_strip(
 
 fn draw_timeline(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    context: crate::music::settings::TonalContext,
     phrase: &Phrase,
     selected_event: usize,
     pixels_per_beat: f32,
@@ -488,7 +524,7 @@ fn draw_timeline(
             canvas,
             x as i32 + 10,
             275,
-            &event.chord.symbol(),
+            &context.chord_symbol(event.chord),
             3,
             if selected { background() } else { text_color() },
         )?;

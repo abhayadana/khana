@@ -1,257 +1,195 @@
-# Khaṇa v0.6.5
+# Khaṇa v0.7.0
 
-This revision adds optional Ableton Link synchronization and fixes the bitmap
-font's `V` glyph (the source of `XOICED` / `XOICES`).
+v0.7 is the harmonic-engine overhaul.
 
-## The font bug
+The design goal is that **Safe / Colorful / Bold are three levels of
+adventurousness inside the same evolving musical story**. Chord selection is
+now driven primarily by progression context and harmonic function. Smooth
+voice-leading happens after chord selection.
 
-Those labels were meant to be:
-
-- `VOICED`
-- `VOICES`
-
-The old five-by-seven `V` glyph was accidentally drawn like an X. v0.6.2 fixes
-the glyph.
-
-## Ableton Link
-
-Khaṇa keeps a unified synchronization layer:
+## Recommendation pipeline
 
 ```text
-                 Internal clock
-                      │
-Khaṇa SyncTransport ──┤
-                      │
-                 Ableton Link
-                      │
-                 beat / tempo
-                      │
-        phrase playback + recording
+last 2–4+ played chords
+        +
+tonic / mode
+        +
+Resolve / Neutral / Tension
+        ↓
+broad candidate generation
+        ↓
+progression + function scoring
+        ↓
+contextual novelty classification
+        ↓
+SAFE / COLORFUL / BOLD
+        ↓
+selected chord
+        ↓
+four-voice VoicingEngine
 ```
 
-The harmony, phrase, and voice engines do not depend on Link.
+### Candidate sources
 
-### Why Link is feature-gated
+The engine generates candidates from:
 
-The normal build remains simple:
+- diatonic harmony,
+- common functional continuations,
+- secondary dominants,
+- borrowed/modal-interchange harmony,
+- chromatic mediants,
+- diminished approaches,
+- tritone-related dominants,
+- a small additional rare-path vocabulary when Surprise is active.
 
-```bash
-cargo run
+These sources do not directly dictate the final column. A contextual novelty
+score assigns each candidate to Safe, Colorful, or Bold.
+
+## Ranking priorities
+
+The current implementation uses the following approximate hierarchy:
+
+```text
+38% progression context
+22% harmonic/function coherence
+18% Resolve/Neutral/Tension intent
+10% source prior
+ 7% phrase/repetition history
+ 5% chord-level voice-leading hint
 ```
 
-To compile Link support:
+The 5% voice-leading term only rewards shared essential pitch classes. It is a
+tie-breaker. Actual four-part voice-leading happens *after* the chord is chosen.
 
-```bash
-cargo run --features ableton-link
+## Progression memory
+
+Khaṇa keeps the last eight actually played/selected chords and uses the recent
+history to recognize patterns such as:
+
+```text
+ii → V → I
+IV → V → I
+vi → ii → V
+I → vi → ii → V
 ```
 
-The implementation uses `rusty_link 0.4.9`, which wraps Ableton's official
-`abl_link` C API. The crate builds the Link C++ code and requires CMake and
-libclang on Linux.
+Dominant chords also receive a strong generic resolution relationship down a
+fifth / up a fourth, so secondary dominants have meaningful implied targets.
 
-Ubuntu/Xubuntu prerequisites are typically:
+Examples tested in C:
 
-```bash
-sudo apt update
-sudo apt install cmake libclang-dev build-essential
+```text
+Dm7 → G7 + Resolve  => Cmaj7 ranks first in Safe
+Cmaj7 → E7          => Am7 ranks first in Safe
+Cmaj7 → Am7 → Dm7  => G7 ranks first in Safe
 ```
 
-Your existing SDL2/ALSA development packages are still required.
+## Safe / Colorful / Bold
 
-### Strict quality check with Link
+The categories are contextual rather than permanent chord lists.
+
+- **Safe**: low-novelty candidates with strong progression/function precedent.
+- **Colorful**: secondary dominants, borrowed harmony, or other moderately
+  surprising moves with a clear harmonic explanation.
+- **Bold**: chromatic-mediant, diminished, tritone, and rarer coherent paths.
+
+A chord's novelty is reduced when the progression strongly supports it or when
+that harmonic vocabulary has already appeared recently.
+
+## Reroll versus Surprise
+
+- **Reroll** changes the small stochastic ordering component while preserving
+  candidate vocabulary and novelty thresholds.
+- **Surprise** adds rarer coherent candidate generators and gives non-diatonic
+  paths a modest ranking boost. It does not mean random chromatic chords.
+
+## Recommendation explanation
+
+The Performance screen now shows a compact `WHY` label for the highlighted
+recommendation, such as:
+
+```text
+WHY II TO V
+WHY DOM RESOLVE
+WHY BORROWED
+WHY CHROM MEDIANT
+```
+
+This is intentionally visible during prototype tuning.
+
+## Stable chord identity
+
+Color no longer changes the chord itself.
+
+If you select:
+
+```text
+C
+```
+
+Khaṇa stores, displays, voices, records, and plays back **C**. It does not
+silently convert the chord into Cmaj7 or Cmaj9.
+
+For v0.7:
+
+- Spread still revoices the current chord immediately while playing.
+- Dynamics applies on the next attack.
+- Density remains reserved for the upcoming rhythmic performer engine.
+- Color remains editable but does not alter MIDI yet. In v0.8 it will become a
+  role-sensitive performer/decorative parameter.
+
+## Display / spelling
+
+The large CURRENT chord and the four displayed note names now describe the same
+harmonic object.
+
+Pitch spelling uses the current tonal context. Common borrowed relationships in
+C, for example, display as:
+
+```text
+Eb
+Ab
+Bb
+```
+
+rather than D#, G#, A#.
+
+This is a pragmatic contextual spelling layer rather than a complete notation
+engine, but it makes borrowed harmony substantially clearer.
+
+## Existing v0.6 functionality retained
+
+- reliable Note On/Off on MIDI channels 1–4,
+- four-voice essential-tone voicing,
+- internal transport,
+- optional Ableton Link,
+- optional Link start/stop sync,
+- editable tonic/mode/tempo/meter,
+- semantic phrase recording,
+- phrase playback and queueing,
+- Phrase Editor.
+
+## Build
+
+Normal:
 
 ```bash
 cargo fmt
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo run
+```
+
+With Ableton Link:
+
+```bash
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
+cargo run --features ableton-link
 ```
 
-## UI / interaction
+## Next milestone
 
-While transport is stopped, press `M`.
-
-The settings fields are now:
-
-```text
-TONIC → MODE → TEMPO → METER → SYNC → START/STOP SYNC
-```
-
-For `SYNC`:
-
-```text
-INTERNAL
-LINK
-```
-
-For Link start/stop sharing:
-
-```text
-STARTSYNC OFF
-STARTSYNC ON
-```
-
-If the binary was compiled without `--features ableton-link`, selecting Link
-prints a clear message and remains on the internal clock.
-
-The header uses minimal status:
-
-```text
-INT
-LINK 0
-LINK 2
-```
-
-where the number is the current count of other Link peers.
-
-## Link behavior
-
-### Tempo
-In Internal mode, Khaṇa owns tempo.
-
-In Link mode, the displayed BPM follows the Link session. Changing Khaṇa's tempo
-submits a new tempo to the Link session.
-
-### Beat / phase
-Khaṇa's transport beat is read from Link while Link mode is active. Phrase
-recording and phrase queue boundaries therefore use the shared Link beat grid.
-
-Khaṇa still uses its own meter as the quantum for phrase/bar behavior. Link does
-not replace Khaṇa's time-signature setting.
-
-### Start / stop
-Start/stop sharing defaults OFF.
-
-With STARTSYNC OFF:
-- Khaṇa can start/stop locally while remaining phase-synchronized to Link.
-
-With STARTSYNC ON:
-- Khaṇa submits start/stop changes to Link.
-- Khaṇa also follows Link's shared playing state.
-
-## Build scope
-
-v0.6.2 is still a timing prototype. Four voices still sustain one note each per
-harmonic attack. The next major musical milestone remains role-aware rhythmic
-voice generation behind `VoiceEngine`.
-
-## Licensing
-
-Ableton Link is dual-licensed GPLv2+ / proprietary. `rusty_link` is GPLv2+
-because it wraps Link. If Khaṇa is distributed with Link under an open-source
-license, the combined distribution must be license-compatible; proprietary
-distribution requires appropriate licensing from Ableton.
-
-
-## Session-join behavior
-
-When switching from Internal to Link, Khaṇa sets its private Link timeline to the
-current local tempo *before* networking is enabled. It does not push that tempo
-after joining. This follows the intended Link behavior that a new participant
-should not hijack an existing jam's tempo.
-
-Remote Link start/stop is edge-detected by the app. With STARTSYNC ON, a remote
-start sounds Khaṇa's current realization and a remote stop sends MIDI Note Off
-and cancels phrase playback.
-
-
-## v0.6.3 Clippy cleanup
-
-This maintenance revision removes four `clippy::needless_return` findings from
-the feature-gated Ableton Link branches in `src/sync.rs`.
-
-Behavior is unchanged. The Link-enabled v0.6.2 build already compiled and all
-eight unit tests passed; this revision only makes the strict all-features Clippy
-check clean under Rust 1.98.
-
-
-## v0.6.4 MIDI reliability fix
-
-The previous sustained-chord prototype still used `Density` as a deterministic
-probability gate at each harmonic attack. That meant MIDI channels could be
-skipped intentionally, and in some transitions every voice could be skipped.
-This looked like unreliable MIDI output.
-
-That behavior is removed.
-
-For the current sustained-chord engine:
-
-- every successful chord attack sends exactly four Note On messages,
-- those messages use MIDI channels 1, 2, 3, and 4,
-- every tracked sounding voice receives a matching Note Off before the next
-  four-channel articulation,
-- Spread/Color revoicing also produces a complete four-channel articulation
-  while transport is running,
-- Density remains editable but does not mute channels yet.
-
-Density will become meaningful when the role-aware rhythmic performer engine is
-implemented; it will control event frequency/occupancy rather than whether a
-sustained chord voice exists.
-
-Two unit tests now verify the exact status bytes:
-
-```text
-Note On : 90 91 92 93
-Note Off: 80 81 82 83
-```
-
-for MIDI channels 1–4 respectively.
-
-
-## v0.6.5 harmony / voicing correctness
-
-Two musical correctness problems were found and fixed.
-
-### Half-diminished sevenths
-
-The diatonic diminished degree of each standard seven-note mode uses a
-half-diminished seventh (0, 3, 6, 10), not a fully diminished seventh
-(0, 3, 6, 9).
-
-Example in C Ionian:
-
-```text
-B m7b5 = B D F A
-```
-
-The previous engine could produce B D F G#.
-
-Khaṇa now has a distinct `HalfDiminished` quality and displays it as `M7B5`
-because the bitmap font does not yet include the ø symbol.
-
-### Essential-tone coverage
-
-Previously, smooth voice-leading could choose any four pitches belonging to a
-chord. That allowed musically weak realizations that duplicated one chord tone
-while omitting an essential one.
-
-Now:
-- triads must contain root, third, and fifth (one tone may be doubled),
-- sevenths must contain all four chord tones,
-- ninths use a four-voice reduction containing root, third, seventh, and ninth;
-  the fifth is the default omitted tone.
-
-The engine still minimizes movement after enforcing those harmonic constraints.
-
-### New tests
-
-The test suite now additionally verifies:
-- half-diminished interval construction,
-- every diatonic seventh chord across all seven modes against stacked scale
-  tones,
-- full essential-tone coverage for major sevenths,
-- G9 four-voice reduction as G/B/F/A.
-
-### SDL X11 unknown-key console message
-
-An occasional message such as:
-
-```text
-The key you just pressed is not recognized by SDL...
-X11 KeyCode 248 ... KeySym 0x0
-```
-
-comes from SDL's X11 keyboard mapping layer when X11 reports a keycode with no
-known keysym. It is not generated by Khaṇa's MIDI/harmony code and does not
-indicate a MIDI failure. v0.6.5 leaves SDL warnings visible rather than globally
-suppressing them, because other SDL warnings may be useful during Brick input
-mapping.
+v0.8 should build role-aware rhythmic performers behind the existing
+`VoiceEngine`, making Density and Color musically active without changing the
+new progression engine.

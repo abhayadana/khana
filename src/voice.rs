@@ -87,7 +87,6 @@ pub enum MacroKind {
 /// Fully realized voice state ready for MIDI output and display.
 #[derive(Clone, Copy, Debug)]
 pub struct VoiceRender {
-    pub realized_chord: Chord,
     pub voicing: Voicing,
     pub velocities: [u8; 4],
 }
@@ -121,12 +120,10 @@ impl VoiceEngine {
     }
 
     fn render(&mut self, chord: Chord, voices: &[Voice; 4]) -> VoiceRender {
-        let color = average_color(voices);
         let spread = average_spread(voices);
-        let realized_chord = chord.colored(color);
         let voicing = self
             .voicing_engine
-            .realize(realized_chord, self.current_voicing, spread);
+            .realize(chord, self.current_voicing, spread);
 
         let velocities =
             std::array::from_fn(|index| velocity_from_dynamics(voices[index].parameters.dynamics));
@@ -134,7 +131,6 @@ impl VoiceEngine {
         self.current_voicing = Some(voicing);
 
         VoiceRender {
-            realized_chord,
             voicing,
             velocities,
         }
@@ -223,15 +219,6 @@ fn average_spread(voices: &[Voice; 4]) -> f32 {
         .sum::<f32>()
         / voices.len() as f32
 }
-
-fn average_color(voices: &[Voice; 4]) -> f32 {
-    voices
-        .iter()
-        .map(|voice| voice.parameters.color)
-        .sum::<f32>()
-        / voices.len() as f32
-}
-
 fn velocity_from_dynamics(dynamics: f32) -> u8 {
     (35.0 + dynamics.clamp(0.0, 1.0) * 92.0).round() as u8
 }

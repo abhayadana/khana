@@ -35,6 +35,24 @@ impl PitchClass {
         }
     }
 
+    /// Returns a compact flat-oriented pitch name.
+    pub const fn flat_label(self) -> &'static str {
+        match self.0 {
+            0 => "C",
+            1 => "DB",
+            2 => "D",
+            3 => "EB",
+            4 => "E",
+            5 => "F",
+            6 => "GB",
+            7 => "G",
+            8 => "AB",
+            9 => "A",
+            10 => "BB",
+            _ => "B",
+        }
+    }
+
     /// Returns this pitch class transposed upward by `semitones`.
     pub const fn transpose(self, semitones: u8) -> Self {
         Self::from_value(self.0 + semitones)
@@ -101,26 +119,9 @@ impl Chord {
         }
     }
 
-    /// Applies the live Color macro without mutating the phrase's stored chord.
-    pub fn colored(self, color: f32) -> Self {
-        let diminished_family = matches!(
-            self.quality,
-            ChordQuality::Diminished | ChordQuality::HalfDiminished
-        );
-
-        let extension = match self.extension {
-            ChordExtension::Triad if color >= 0.72 && !diminished_family => ChordExtension::Ninth,
-            ChordExtension::Triad if color >= 0.34 => ChordExtension::Seventh,
-            ChordExtension::Seventh if color >= 0.68 && !diminished_family => ChordExtension::Ninth,
-            other => other,
-        };
-
-        Self { extension, ..self }
-    }
-
-    /// Returns a compact chord symbol suitable for the Brick Pro UI.
-    pub fn symbol(self) -> String {
-        let quality = match self.quality {
+    /// Returns the chord-quality / extension suffix without its root.
+    pub const fn suffix(self) -> &'static str {
+        match self.quality {
             ChordQuality::Major => match self.extension {
                 ChordExtension::Triad => "",
                 ChordExtension::Seventh => "MAJ7",
@@ -146,9 +147,12 @@ impl Chord {
                 ChordExtension::Seventh => "M7B5",
                 ChordExtension::Ninth => "M9B5",
             },
-        };
+        }
+    }
 
-        format!("{}{}", self.root.label(), quality)
+    /// Returns a compact chord symbol using the default sharp-oriented root.
+    pub fn symbol(self) -> String {
+        format!("{}{}", self.root.label(), self.suffix())
     }
 
     /// Returns true when `midi_note` belongs to this chord realization.
@@ -183,13 +187,6 @@ impl Chord {
     }
 }
 
-/// Returns a compact MIDI note label where MIDI 60 is C4.
-pub fn midi_note_label(note: u8) -> String {
-    let pitch = PitchClass::from_value(note % 12).label();
-    let octave = i16::from(note / 12) - 1;
-    format!("{pitch}{octave}")
-}
-
 impl fmt::Display for Chord {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.symbol())
@@ -198,7 +195,7 @@ impl fmt::Display for Chord {
 
 #[cfg(test)]
 mod tests {
-    use super::{Chord, ChordExtension, ChordQuality, PitchClass, midi_note_label};
+    use super::{Chord, ChordExtension, ChordQuality, PitchClass};
 
     #[test]
     fn pitch_classes_transpose_with_wraparound() {
@@ -217,12 +214,6 @@ mod tests {
         );
 
         assert_eq!(chord.intervals(), vec![0, 4, 7, 11, 14]);
-    }
-
-    #[test]
-    fn midi_note_labels_use_scientific_pitch_notation() {
-        assert_eq!(midi_note_label(60), "C4");
-        assert_eq!(midi_note_label(69), "A4");
     }
 
     #[test]

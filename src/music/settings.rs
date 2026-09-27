@@ -162,6 +162,46 @@ impl TonalContext {
     pub fn tonic_chord(self) -> Chord {
         self.diatonic_chord(0, ChordExtension::Seventh)
     }
+
+    /// Returns a context-aware compact spelling for a pitch class.
+    ///
+    /// Diatonic notes follow the key's broad sharp/flat tendency. Chromatic
+    /// b2/b3/b6/b7 relationships prefer flats, which keeps common borrowed
+    /// harmony readable (e.g. Ab/Eb/Bb in C rather than G#/D#/A#).
+    pub fn pitch_label(self, pitch: PitchClass) -> &'static str {
+        let relative = (12 + pitch.value() - self.tonic.value()) % 12;
+        let diatonic = self
+            .mode
+            .intervals()
+            .iter()
+            .any(|interval| self.tonic.transpose(*interval) == pitch);
+
+        let key_prefers_flats = matches!(self.tonic.value(), 1 | 3 | 5 | 8 | 10);
+
+        if diatonic {
+            if key_prefers_flats {
+                pitch.flat_label()
+            } else {
+                pitch.label()
+            }
+        } else if matches!(relative, 1 | 3 | 8 | 10) {
+            pitch.flat_label()
+        } else {
+            pitch.label()
+        }
+    }
+
+    /// Returns a chord symbol using tonal-context pitch spelling.
+    pub fn chord_symbol(self, chord: Chord) -> String {
+        format!("{}{}", self.pitch_label(chord.root), chord.suffix())
+    }
+
+    /// Returns a context-aware MIDI note label where MIDI 60 is C4.
+    pub fn midi_note_label(self, note: u8) -> String {
+        let pitch = PitchClass::from_value(note % 12);
+        let octave = i16::from(note / 12) - 1;
+        format!("{}{}", self.pitch_label(pitch), octave)
+    }
 }
 
 fn interval_above(note_interval: u8, root_interval: u8, wrapped: bool) -> u8 {
@@ -254,6 +294,29 @@ mod tests {
     #[test]
     fn six_eight_is_three_quarter_note_beats_per_bar() {
         assert_eq!(TimeSignature::new(6, 8).beats_per_bar(), 3.0);
+    }
+
+    #[test]
+    fn c_context_spells_common_borrowed_roots_with_flats() {
+        let context = TonalContext {
+            tonic: PitchClass::from_value(0),
+            mode: ScaleMode::Ionian,
+        };
+
+        assert_eq!(context.pitch_label(PitchClass::from_value(3)), "EB");
+        assert_eq!(context.pitch_label(PitchClass::from_value(8)), "AB");
+        assert_eq!(context.pitch_label(PitchClass::from_value(10)), "BB");
+    }
+
+    #[test]
+    fn context_midi_note_labels_include_octave() {
+        let context = TonalContext {
+            tonic: PitchClass::from_value(0),
+            mode: ScaleMode::Ionian,
+        };
+
+        assert_eq!(context.midi_note_label(60), "C4");
+        assert_eq!(context.midi_note_label(68), "AB4");
     }
 
     #[test]
