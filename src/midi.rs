@@ -1,5 +1,6 @@
 //! Four-channel MIDI output.
 
+use crate::voice::VoiceRender;
 use midir::os::unix::VirtualOutput;
 use midir::{MidiOutput, MidiOutputConnection};
 
@@ -27,33 +28,29 @@ impl MidiEngine {
         })
     }
 
-    /// Plays one monophonic note per MIDI channel 1..=4.
-    ///
-    /// `active` allows Density to suppress individual voices on this chord
-    /// attack while preserving the four-channel architecture.
+    /// Sends a complete four-voice realization.
     ///
     /// # Errors
     ///
     /// Returns an error if a MIDI message cannot be sent.
-    pub fn play_voicing(
-        &mut self,
-        notes: [u8; 4],
-        velocities: [u8; 4],
-        active: [bool; 4],
-    ) -> Result<(), String> {
+    pub fn play_render(&mut self, render: VoiceRender) -> Result<(), String> {
         self.stop_all()?;
 
         for index in 0..4 {
-            if !active[index] {
+            if !render.active[index] {
                 continue;
             }
 
             let channel = index as u8;
             let status = 0x90 | channel;
             self.connection
-                .send(&[status, notes[index], velocities[index]])
+                .send(&[
+                    status,
+                    render.voicing.notes[index],
+                    render.velocities[index],
+                ])
                 .map_err(|error| error.to_string())?;
-            self.active_notes[index] = Some(notes[index]);
+            self.active_notes[index] = Some(render.voicing.notes[index]);
         }
 
         Ok(())

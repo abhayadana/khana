@@ -1,34 +1,32 @@
-//! Khaṇa v0.5 desktop prototype.
+//! Khaṇa v0.6 desktop prototype.
 //!
-//! This build establishes the intended MVP architecture:
-//! chord recommendations -> smooth four-voice realization -> MIDI ->
-//! quantized semantic phrase capture -> phrase chord editing.
+//! v0.6 adds transport, editable tonal/metric settings, visible voicing,
+//! semantic phrase playback/queueing, and an explicit chord -> voice-engine
+//! boundary while retaining the two-screen MVP.
 
-mod clock;
 mod input;
 mod midi;
 mod music;
 mod phrase;
+mod transport;
 mod ui;
 mod voice;
 
 use std::thread;
 use std::time::Duration;
 
-use clock::BeatClock;
 use input::{InputAction, map_key};
 use midi::MidiEngine;
-use music::chord::{Chord, ChordExtension, ChordQuality, PitchClass};
+use music::chord::Chord;
 use music::recommendation::{
     HarmonicDirection, RecommendationClass, RecommendationEngine, RecommendationSet,
 };
-use music::voicing::{Voicing, VoicingEngine};
-use phrase::{Phrase, PhraseRecorder};
+use music::settings::{MusicalSettings, SettingField};
+use phrase::{Phrase, PhrasePlayer, PhraseRecorder};
 use sdl2::event::Event;
+use transport::Transport;
 use ui::Ui;
-use voice::{
-    MacroKind, Voice, VoiceScope, adjust_macro, average_color, average_spread, default_voices,
-};
+use voice::{MacroKind, Voice, VoiceEngine, VoiceRender, VoiceScope, adjust_macro, default_voices};
 
 const WINDOW_WIDTH: u32 = 1024;
 const WINDOW_HEIGHT: u32 = 768;
@@ -41,20 +39,22 @@ enum Screen {
 
 struct App {
     screen: Screen,
+    settings: MusicalSettings,
+    setting_focus: Option<SettingField>,
     current_chord: Chord,
     chord_started_beat: f64,
-    current_voicing: Option<Voicing>,
-    transition_counter: u64,
+    current_render: VoiceRender,
     recommendation_engine: RecommendationEngine,
     recommendations: RecommendationSet,
     selected_class: RecommendationClass,
     selected_row: usize,
     direction: HarmonicDirection,
     surprise: bool,
-    voicing_engine: VoicingEngine,
+    voice_engine: VoiceEngine,
     voices: [Voice; 4],
     scope: VoiceScope,
     recorder: PhraseRecorder,
+    phrase_player: PhrasePlayer,
     phrases: Vec<Phrase>,
     editor_phrase_index: usize,
     editor_event_index: usize,
@@ -63,27 +63,34 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let current_chord = Chord::new(PitchClass::C, ChordQuality::Major, ChordExtension::Seventh);
+        let settings = MusicalSettings::default();
+        let current_chord = settings.tonal.tonic_chord();
         let recommendation_engine = RecommendationEngine::new();
         let direction = HarmonicDirection::Neutral;
-        let recommendations = recommendation_engine.recommend(current_chord, direction, false);
+        let recommendations =
+            recommendation_engine.recommend(current_chord, settings.tonal, direction, false);
+        let voices = default_voices();
+        let mut voice_engine = VoiceEngine::new();
+        let current_render = voice_engine.harmonic_change(current_chord, &voices);
 
         Self {
             screen: Screen::Performance,
+            settings,
+            setting_focus: None,
             current_chord,
             chord_started_beat: 0.0,
-            current_voicing: None,
-            transition_counter: 0,
+            current_render,
             recommendation_engine,
             recommendations,
             selected_class: RecommendationClass::Safe,
             selected_row: 0,
             direction,
             surprise: false,
-            voicing_engine: VoicingEngine::new(),
-            voices: default_voices(),
+            voice_engine,
+            voices,
             scope: VoiceScope::All,
             recorder: PhraseRecorder::new(),
+            phrase_player: PhrasePlayer::new(),
             phrases: Vec::new(),
             editor_phrase_index: 0,
             editor_event_index: 0,
@@ -92,9 +99,12 @@ impl App {
     }
 
     fn refresh_recommendations(&mut self) {
-        self.recommendations =
-            self.recommendation_engine
-                .recommend(self.current_chord, self.direction, self.surprise);
+        self.recommendations = self.recommendation_engine.recommend(
+            self.current_chord,
+            self.settings.tonal,
+            self.direction,
+            self.surprise,
+        );
         self.selected_row = 0;
     }
 
@@ -103,69 +113,49 @@ impl App {
             .get(self.selected_class, self.selected_row)
     }
 
-    fn commit_chord(
+    fn set_harmony(
         &mut self,
         chord: Chord,
         now_beat: f64,
         midi: &mut MidiEngine,
+        transport_running: bool,
+        record: bool,
     ) -> Result<(), String> {
         self.current_chord = chord;
         self.chord_started_beat = now_beat;
-        self.transition_counter = self.transition_counter.wrapping_add(1);
+        self.current_render = self.voice_engine.harmonic_change(chord, &self.voices);
 
-        let color = average_color(&self.voices);
-        let spread = average_spread(&self.voices);
-        let realized_chord = chord.colored(color);
-        let voicing = self
-            .voicing_engine
-            .realize(realized_chord, self.current_voicing, spread);
+        if transport_running {
+            midi.play_render(self.current_render)?;
+        }
 
-        let velocities = std::array::from_fn(|index| {
-            velocity_from_dynamics(self.voices[index].parameters.dynamics)
-        });
-        let active = std::array::from_fn(|index| {
-            density_gate(
-                self.voices[index].parameters.density,
-                self.transition_counter,
-                index,
-            )
-        });
+        if record {
+            self.recorder.chord_changed(now_beat, chord);
+        }
 
-        midi.play_voicing(voicing.notes, velocities, active)?;
-        self.current_voicing = Some(voicing);
-        self.recorder.chord_changed(now_beat, chord);
         self.refresh_recommendations();
 
         println!(
-            "CHORD {} -> MIDI {:?}",
+            "CHORD {} / {} -> {:?}",
             self.current_chord.symbol(),
-            voicing.notes
+            self.current_render.realized_chord.symbol(),
+            self.current_render.voicing.notes
         );
 
         Ok(())
     }
 
-    fn revoice_current(&mut self, midi: &mut MidiEngine) -> Result<(), String> {
-        let color = average_color(&self.voices);
-        let spread = average_spread(&self.voices);
-        let realized_chord = self.current_chord.colored(color);
-        let voicing = self
-            .voicing_engine
-            .realize(realized_chord, self.current_voicing, spread);
+    fn revoice_current(
+        &mut self,
+        midi: &mut MidiEngine,
+        transport_running: bool,
+    ) -> Result<(), String> {
+        self.current_render = self.voice_engine.revoice(self.current_chord, &self.voices);
 
-        let velocities = std::array::from_fn(|index| {
-            velocity_from_dynamics(self.voices[index].parameters.dynamics)
-        });
-        let active = std::array::from_fn(|index| {
-            density_gate(
-                self.voices[index].parameters.density,
-                self.transition_counter,
-                index,
-            )
-        });
+        if transport_running {
+            midi.play_render(self.current_render)?;
+        }
 
-        midi.play_voicing(voicing.notes, velocities, active)?;
-        self.current_voicing = Some(voicing);
         Ok(())
     }
 
@@ -194,9 +184,24 @@ impl App {
             self.editor_event_index = self.editor_event_index.min(event_count - 1);
         }
     }
+
+    fn reset_harmony_for_context(
+        &mut self,
+        now_beat: f64,
+        midi: &mut MidiEngine,
+    ) -> Result<(), String> {
+        self.current_chord = self.settings.tonal.tonic_chord();
+        self.chord_started_beat = now_beat;
+        self.current_render = self
+            .voice_engine
+            .harmonic_change(self.current_chord, &self.voices);
+        midi.stop_all()?;
+        self.refresh_recommendations();
+        Ok(())
+    }
 }
 
-/// Runs Khaṇa v0.5.
+/// Runs Khaṇa v0.6.
 ///
 /// # Errors
 ///
@@ -206,7 +211,7 @@ fn main() -> Result<(), String> {
     let video = sdl_context.video()?;
     let window = video
         .window(
-            "Khaṇa v0.5 — chords, four voices, phrase capture",
+            "Khaṇa v0.6 — transport, phrase playback, editable context",
             WINDOW_WIDTH,
             WINDOW_HEIGHT,
         )
@@ -220,27 +225,38 @@ fn main() -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let mut event_pump = sdl_context.event_pump()?;
 
-    let ui = Ui::new(WINDOW_WIDTH, WINDOW_HEIGHT);
-    let clock = BeatClock::new(120.0);
-    let mut midi = MidiEngine::new_virtual("Khana MIDI")?;
+    let ui = Ui::new(WINDOW_WIDTH);
     let mut app = App::new();
+    let mut transport = Transport::new(app.settings.tempo_bpm);
+    let mut midi = MidiEngine::new_virtual("Khana MIDI")?;
 
-    app.commit_chord(app.current_chord, 0.0, &mut midi)?;
     print_controls();
 
     'running: loop {
-        let now_beat = clock.beat();
+        let now_beat = transport.beat();
 
-        if let Some(phrase) = app.recorder.update(now_beat, app.current_chord) {
-            println!(
-                "CAPTURED P{:02}: {} events, {:.1} beats",
-                phrase.id,
-                phrase.events.len(),
-                phrase.duration_beats()
-            );
-            app.phrases.push(phrase);
-            app.editor_phrase_index = app.phrases.len().saturating_sub(1);
-            app.editor_event_index = 0;
+        if transport.is_running() {
+            if let Some(phrase) = app.recorder.update(now_beat, app.current_chord) {
+                println!(
+                    "CAPTURED P{:02}: {} events, {:.1} beats",
+                    phrase.id,
+                    phrase.events.len(),
+                    phrase.duration_beats()
+                );
+                app.phrases.push(phrase);
+                app.editor_phrase_index = app.phrases.len().saturating_sub(1);
+                app.editor_event_index = 0;
+            }
+
+            let playback = app.phrase_player.update(&app.phrases, now_beat);
+
+            if let Some(chord) = playback.chord {
+                app.set_harmony(chord, now_beat, &mut midi, true, false)?;
+            }
+
+            if playback.ended && app.phrase_player.queued_phrase().is_none() {
+                midi.stop_all()?;
+            }
         }
 
         for event in event_pump.poll_iter() {
@@ -259,12 +275,17 @@ fn main() -> Result<(), String> {
                         break 'running;
                     }
 
+                    if action == InputAction::ToggleTransport {
+                        toggle_transport(&mut app, &mut transport, &mut midi)?;
+                        continue;
+                    }
+
                     match app.screen {
                         Screen::Performance => {
-                            handle_performance_action(action, &mut app, now_beat, &mut midi)?;
+                            handle_performance_action(action, &mut app, &mut transport, &mut midi)?;
                         }
                         Screen::PhraseEditor => {
-                            handle_editor_action(action, &mut app);
+                            handle_editor_action(action, &mut app, &mut transport)?;
                         }
                     }
                 }
@@ -272,12 +293,18 @@ fn main() -> Result<(), String> {
             }
         }
 
+        let now_beat = transport.beat();
+
         match app.screen {
             Screen::Performance => {
                 ui.draw_performance(
                     &mut canvas,
+                    app.settings,
+                    app.setting_focus,
+                    transport.is_running(),
                     app.current_chord,
                     now_beat - app.chord_started_beat,
+                    app.current_render,
                     &app.recommendations,
                     app.selected_class,
                     app.selected_row,
@@ -293,11 +320,15 @@ fn main() -> Result<(), String> {
             Screen::PhraseEditor => {
                 ui.draw_phrase_editor(
                     &mut canvas,
+                    app.settings,
+                    transport.is_running(),
                     app.selected_phrase(),
                     app.editor_phrase_index,
                     app.phrases.len(),
                     app.editor_event_index,
                     app.editor_zoom,
+                    app.phrase_player.playing_phrase(),
+                    app.phrase_player.queued_phrase(),
                 )?;
             }
         }
@@ -311,12 +342,37 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
+fn toggle_transport(
+    app: &mut App,
+    transport: &mut Transport,
+    midi: &mut MidiEngine,
+) -> Result<(), String> {
+    if transport.is_running() {
+        transport.stop();
+        app.phrase_player.stop();
+        midi.stop_all()?;
+    } else {
+        app.setting_focus = None;
+        transport.start();
+        app.chord_started_beat = transport.beat();
+        midi.play_render(app.current_render)?;
+    }
+
+    Ok(())
+}
+
 fn handle_performance_action(
     action: InputAction,
     app: &mut App,
-    now_beat: f64,
+    transport: &mut Transport,
     midi: &mut MidiEngine,
 ) -> Result<(), String> {
+    if let Some(field) = app.setting_focus {
+        return handle_setting_action(action, field, app, transport, midi);
+    }
+
+    let now_beat = transport.beat();
+
     match action {
         InputAction::NavigateLeft => {
             let index = (app.selected_class.index() + RecommendationClass::ALL.len() - 1)
@@ -333,14 +389,21 @@ fn handle_performance_action(
             app.selected_row = (app.selected_row + 1) % 3;
         }
         InputAction::Primary => {
-            app.commit_chord(app.chosen_chord(), now_beat, midi)?;
+            app.phrase_player.stop();
+            app.set_harmony(
+                app.chosen_chord(),
+                now_beat,
+                midi,
+                transport.is_running(),
+                true,
+            )?;
         }
-        InputAction::Reroll => {
+        InputAction::Secondary => {
             app.recommendation_engine.reroll();
             app.surprise = false;
             app.refresh_recommendations();
         }
-        InputAction::Surprise => {
+        InputAction::Tertiary => {
             app.recommendation_engine.reroll();
             app.surprise = true;
             app.refresh_recommendations();
@@ -366,15 +429,19 @@ fn handle_performance_action(
         InputAction::AdjustMacro { kind, delta } => {
             adjust_macro(&mut app.voices, app.scope, kind, delta);
 
-            // Spread and Color revoice the current harmony immediately.
-            // This is a timbral/voicing gesture, not a new harmonic event, so
-            // it must not reset chord duration or split a recorded phrase.
             if matches!(kind, MacroKind::Spread | MacroKind::Color) {
-                app.revoice_current(midi)?;
+                app.revoice_current(midi, transport.is_running())?;
             }
         }
         InputAction::ToggleRecord => {
-            app.recorder.toggle(now_beat);
+            if !transport.is_running() {
+                transport.start();
+                app.chord_started_beat = transport.beat();
+                midi.play_render(app.current_render)?;
+            }
+
+            app.recorder
+                .toggle(transport.beat(), app.settings.meter.beats_per_bar());
         }
         InputAction::ArmNextRecording => {
             app.recorder.toggle_arm_next();
@@ -383,13 +450,90 @@ fn handle_performance_action(
             app.screen = Screen::PhraseEditor;
             app.clamp_editor_selection();
         }
+        InputAction::ToggleSettings => {
+            if !transport.is_running() {
+                app.setting_focus = Some(SettingField::Tonic);
+            }
+        }
         _ => {}
     }
 
     Ok(())
 }
 
-fn handle_editor_action(action: InputAction, app: &mut App) {
+fn handle_setting_action(
+    action: InputAction,
+    field: SettingField,
+    app: &mut App,
+    transport: &mut Transport,
+    midi: &mut MidiEngine,
+) -> Result<(), String> {
+    match action {
+        InputAction::ToggleSettings | InputAction::Primary => {
+            app.setting_focus = None;
+        }
+        InputAction::NavigateLeft => {
+            app.setting_focus = Some(field.previous());
+        }
+        InputAction::NavigateRight => {
+            app.setting_focus = Some(field.next());
+        }
+        InputAction::NavigateUp => {
+            adjust_setting(1, field, app, transport, midi)?;
+        }
+        InputAction::NavigateDown => {
+            adjust_setting(-1, field, app, transport, midi)?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn adjust_setting(
+    direction: i32,
+    field: SettingField,
+    app: &mut App,
+    transport: &mut Transport,
+    midi: &mut MidiEngine,
+) -> Result<(), String> {
+    match field {
+        SettingField::Tonic => {
+            let current = i32::from(app.settings.tonal.tonic.value());
+            let next = (current + direction).rem_euclid(12) as u8;
+            app.settings.tonal.tonic = music::chord::PitchClass::from_value(next);
+            app.reset_harmony_for_context(transport.beat(), midi)?;
+        }
+        SettingField::Mode => {
+            app.settings.tonal.mode = if direction > 0 {
+                app.settings.tonal.mode.next()
+            } else {
+                app.settings.tonal.mode.previous()
+            };
+            app.reset_harmony_for_context(transport.beat(), midi)?;
+        }
+        SettingField::Tempo => {
+            app.settings.tempo_bpm =
+                (app.settings.tempo_bpm + f64::from(direction)).clamp(30.0, 300.0);
+            transport.set_bpm(app.settings.tempo_bpm);
+        }
+        SettingField::Meter => {
+            app.settings.meter = if direction > 0 {
+                app.settings.meter.next()
+            } else {
+                app.settings.meter.previous()
+            };
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_editor_action(
+    action: InputAction,
+    app: &mut App,
+    transport: &mut Transport,
+) -> Result<(), String> {
     match action {
         InputAction::ToggleScreen => {
             app.screen = Screen::Performance;
@@ -415,6 +559,19 @@ fn handle_editor_action(action: InputAction, app: &mut App) {
             }
         }
         InputAction::Primary => {
+            if app.selected_phrase().is_some() {
+                if !transport.is_running() {
+                    transport.start();
+                }
+
+                app.phrase_player.request(
+                    app.editor_phrase_index,
+                    transport.beat(),
+                    app.settings.meter.beats_per_bar(),
+                );
+            }
+        }
+        InputAction::Secondary => {
             replace_selected_with_safe_choice(app);
         }
         InputAction::EditDuplicate => {
@@ -450,8 +607,16 @@ fn handle_editor_action(action: InputAction, app: &mut App) {
         InputAction::ZoomIn => {
             app.editor_zoom = (app.editor_zoom + 12.0).min(180.0);
         }
+        InputAction::ToggleSettings => {
+            if !transport.is_running() {
+                app.screen = Screen::Performance;
+                app.setting_focus = Some(SettingField::Tonic);
+            }
+        }
         _ => {}
     }
+
+    Ok(())
 }
 
 fn replace_selected_with_safe_choice(app: &mut App) {
@@ -471,9 +636,12 @@ fn replace_selected_with_safe_choice(app: &mut App) {
         event.chord
     };
 
-    let set = app
-        .recommendation_engine
-        .recommend(context_chord, HarmonicDirection::Neutral, false);
+    let set = app.recommendation_engine.recommend(
+        context_chord,
+        app.settings.tonal,
+        HarmonicDirection::Neutral,
+        false,
+    );
     let replacement = set.get(RecommendationClass::Safe, 0);
 
     if let Some(phrase) = app.phrases.get_mut(phrase_index) {
@@ -481,26 +649,16 @@ fn replace_selected_with_safe_choice(app: &mut App) {
     }
 }
 
-fn velocity_from_dynamics(dynamics: f32) -> u8 {
-    (35.0 + dynamics.clamp(0.0, 1.0) * 92.0).round() as u8
-}
-
-fn density_gate(density: f32, transition: u64, voice_index: usize) -> bool {
-    let mixed = transition
-        .wrapping_mul(1_103_515_245)
-        .wrapping_add((voice_index as u64 + 1) * 12_345);
-    let value = ((mixed >> 8) & 0xFFFF) as f32 / 65_535.0;
-
-    value <= density.clamp(0.0, 1.0)
-}
-
 fn print_controls() {
-    println!("Khaṇa v0.5.0");
+    println!("Khaṇa v0.6.0");
+    println!("GLOBAL:");
+    println!("  Space   transport start/stop");
+    println!("  Tab     Performance / Phrase Editor");
     println!("PERFORMANCE:");
     println!("  arrows  browse Safe / Colorful / Bold");
     println!("  Z       commit highlighted chord");
-    println!("  X       reroll");
-    println!("  S       surprise");
+    println!("  X       reroll same vocabulary");
+    println!("  S       surprise / broaden vocabulary");
     println!("  Q/E/W   Resolve / Neutral / Tension bias");
     println!("  C/V     previous / next voice scope");
     println!("  T/G     density -/+");
@@ -509,14 +667,16 @@ fn print_controls() {
     println!("  I/K     color -/+");
     println!("  P       quantized record start/stop");
     println!("  N       arm next phrase");
-    println!("  Tab     Phrase Editor");
+    println!("  M       edit tonic/mode/tempo/meter (stopped)");
+    println!("SETTINGS:");
+    println!("  Left/Right field   Up/Down value   Z/M exit");
     println!("PHRASE EDITOR:");
-    println!("  Left/Right select chord event");
     println!("  A/L        previous/next phrase");
-    println!("  Z          replace selected chord with Safe suggestion");
+    println!("  Z          play selected / queue at next bar");
+    println!("  X          change selected chord");
+    println!("  Left/Right select chord event");
     println!("  D          duplicate event");
     println!("  Backspace  delete event");
     println!("  F/R        shorter/longer by one beat");
     println!("  -/+        zoom");
-    println!("  Tab        Performance");
 }

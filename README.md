@@ -1,184 +1,140 @@
-# Khaṇa v0.5.1
+# Khaṇa v0.6.0
 
-This prototype is the architectural reset discussed after reviewing the original
-Norns **Chorder** project.
+v0.6 turns the v0.5 architecture test into a more complete playable MVP
+skeleton for the TrimUI Brick Pro's 1024×768 display.
 
-It proves the intended Khaṇa MVP skeleton:
+## Major changes
+
+### Real transport
+`Space` starts/stops a shared musical transport. Stopping sends MIDI Note Off,
+cancels phrase playback, and preserves beat position. Starting sounds the current
+four-voice realization.
+
+### Editable musical context
+While transport is stopped, press `M` to edit the top bar:
+
+- tonic/root: all 12 pitch classes,
+- mode: Ionian, Dorian, Phrygian, Lydian, Mixolydian, Aeolian, Locrian,
+- tempo: 30–300 BPM,
+- meter presets: 2/4, 3/4, 4/4, 5/4, 6/8, 7/8, 9/8, 12/8.
+
+Left/Right selects a setting. Up/Down changes it. `Z` or `M` exits.
+
+The recommendation engine is now key/mode-aware rather than fixed to C major.
+
+### Reroll versus Surprise
+- **Reroll** changes ranking inside the ordinary harmonic vocabulary.
+- **Surprise** additionally broadens the Colorful/Bold candidate pools before
+  ranking them.
+
+### Visible chord realization
+The Performance screen now distinguishes:
 
 ```text
-Safe / Colorful / Bold chord recommendation
-                    ↓
-              chord identity
-                    ↓
-        smooth four-voice voicing
-                    ↓
-          MIDI channels 1–4
-                    ↓
-       quantized phrase capture
-                    ↓
-          Phrase Editor timeline
+CURRENT C
+VOICED CMAJ7
+C2 E3 G3 B3
 ```
 
-## What changed from v0.4
+Each voice row also shows its current MIDI note.
 
-v0.4 centered the application on a scale degree and a candidate mode. v0.5 makes
-the central object a real `Chord`, separates chord identity from voicing, and
-introduces four performer voices and semantic phrase events.
+### Voice-engine boundary
+Harmonic state no longer talks directly to MIDI. The path is:
 
-The prototype borrows these proven concepts from Chorder:
+```text
+Chord state
+    ↓
+VoiceEngine
+    ↓
+VoiceRender
+    ↓
+MidiEngine
+```
 
-- triad / seventh / ninth chord construction,
-- chord identity separate from voicing,
-- nearest/smooth voice-leading as the default voicing behavior,
-- chord context feeding downstream voices.
+This makes the next rhythmic-performer build possible without rewriting harmony
+or phrase playback.
 
-Chorder's richer voicing vocabulary (Drop-2, Drop-3, open, wide, quartal,
-quintal, etc.) is intentionally *not* all ported yet. The Rust architecture leaves
-room for those to become Khaṇa's Spread/Color vocabulary later.
+### Macro MIDI behavior
+- Spread: recomputes voicing immediately.
+- Color: recomputes the realized chord/voicing immediately.
+- Density: changes participation on the next harmonic attack; no immediate
+  retrigger.
+- Dynamics: changes velocity on the next harmonic attack; no immediate
+  retrigger.
 
-Reference: https://github.com/abhayadana/chorder
+Spread/Color update the displayed realization even while stopped. MIDI is resent
+only if the transport is running.
 
-## Performance screen
+### Semantic phrase playback
+Screen 2 can now play a selected phrase.
 
-The Performance screen contains:
+- `Z` when idle: starts the selected phrase immediately.
+- `Z` while another phrase is playing: queues the selected phrase for the next
+  bar boundary.
+- Screen 2 displays PLAY and QUEUE state.
 
-- current chord and elapsed harmonic time,
-- three Safe / Colorful / Bold recommendation columns,
-- Resolve / Neutral / Tension bias,
-- four voice rows,
-- Density / Dynamics / Spread / Color values,
-- voice scope (ALL or one voice),
-- phrase capture status.
+Phrase playback feeds stored `ChordEvent`s back through the *current* VoiceEngine,
+so a phrase can sound different after changing Spread/Color.
 
-Chord duration is not programmed. A chord lasts until you commit another chord.
+### Recording follows meter
+Phrase recording still has no predetermined length. `P` toggles quantized
+recording, with quantization set to one current bar. In 6/8, for example, the
+bar is 3 quarter-note beats.
 
-### Desktop controls
+## Desktop controls
+
+### Global
 
 | Key | Action |
 |---|---|
-| Left / Right | Move between Safe / Colorful / Bold |
-| Up / Down | Move within a recommendation category |
+| Space | Transport start/stop |
+| Tab | Performance / Phrase Editor |
+| Esc | Quit |
+
+### Performance
+
+| Key | Action |
+|---|---|
+| Left/Right | Safe / Colorful / Bold |
+| Up/Down | Candidate within category |
 | Z | Commit highlighted chord |
-| X | Reroll recommendations |
-| S | Surprise / broaden randomness |
-| Q | Resolve bias |
-| E | Neutral bias |
-| W | Tension bias |
+| X | Reroll |
+| S | Surprise |
+| Q / E / W | Resolve / Neutral / Tension |
 | C / V | Previous / next voice scope |
 | T / G | Density - / + |
 | Y / H | Dynamics - / + |
 | U / J | Spread - / + |
 | I / K | Color - / + |
 | P | Quantized phrase record start/stop |
-| N | Arm next phrase recording |
-| Tab | Phrase Editor |
-| Esc | Quit |
+| N | Arm next phrase |
+| M | Edit musical settings when stopped |
 
-These are desktop emulation controls, not final Brick Pro bindings.
+### Phrase Editor
 
-## Four voices
-
-Voices use MIDI channels 1–4:
-
-1. Bass
-2. Inner
-3. Texture
-4. Melody
-
-For v0.5:
-
-- **Dynamics** controls MIDI velocity.
-- **Spread** changes the target register spacing used by the smooth voicing engine.
-- **Color** can enrich a triad/seventh realization to a seventh/ninth without
-  changing the semantic chord stored in a phrase.
-- **Density** determines whether that voice participates on a chord attack.
-
-Later prototypes will replace the simple Density gate with real role-aware rhythm
-generation, including ideas borrowed from Chorder's pattern library.
-
-## Chord recommendations
-
-v0.5 uses transparent prototype pools:
-
-### Safe
-Diatonic seventh chords in C major.
-
-### Colorful
-Diatonic ninths plus secondary dominants.
-
-### Bold
-Borrowed/chromatic colors.
-
-Resolve/Neutral/Tension changes ranking independently of Safe/Colorful/Bold.
-
-Reroll adds controlled deterministic variation. Surprise increases the weight of
-random/novel candidates. This is deliberately simple; the API is ready for a more
-contextual recommendation/scoring engine later.
-
-## Phrase recording
-
-Phrase recording is semantic, not frozen MIDI.
-
-The recorder stores:
-
-```text
-ChordEvent {
-    chord
-    start_beat
-    duration_beats
-}
-```
-
-Recording start and stop are quantized to a 4-beat bar for this MVP.
-
-`N` arms one additional phrase so that when the current phrase ends, the next
-phrase begins at the same quantized boundary.
-
-Phrases are auto-numbered `P01`, `P02`, etc.
-
-## Phrase Editor
-
-Press `Tab` to enter Screen 2.
-
-The phrase browser is deliberately tiny. Most of the 1024×768 screen is reserved
-for a horizontally zoomable chord timeline.
-
-| Key | Phrase Editor action |
+| Key | Action |
 |---|---|
-| Left / Right | Select previous/next chord event |
-| A / L | Previous/next phrase |
-| Z | Replace selected chord with a Safe suggestion |
-| D | Duplicate selected chord |
-| Backspace | Delete selected chord |
-| F / R | Shorten/extend by 1 beat |
-| - / + | Timeline zoom |
-| Tab | Return to Performance |
+| A / L | Previous / next phrase |
+| Z | Play selected / queue selected |
+| X | Change selected chord using Safe suggestion |
+| Left/Right | Previous/next chord event |
+| D | Duplicate event |
+| Backspace | Delete event |
+| F / R | Shorten/extend by one beat |
+| - / + | Zoom |
 
-No phrase names, sections, or song arranger are included in the MVP.
+## What remains intentionally primitive
 
-## Code organization
+The four MIDI voices still sustain one note each per harmonic attack. Density is
+still a participation gate rather than a rhythmic density generator.
 
-```text
-src/
-├── main.rs
-├── clock.rs
-├── input.rs
-├── midi.rs
-├── phrase.rs
-├── ui.rs
-├── voice.rs
-└── music/
-    ├── mod.rs
-    ├── chord.rs
-    ├── recommendation.rs
-    └── voicing.rs
-```
-
-The music and phrase domain code has no dependency on SDL, ALSA, or NextUI.
+The next musical milestone should therefore be role-aware voice behavior:
+Euclidean/patterned attacks, rests, passing tones, arpeggiation, and melody
+behavior—built *behind* the new VoiceEngine interface.
 
 ## Quality checks
 
-On Xubuntu:
+Run on Xubuntu:
 
 ```bash
 cargo fmt
@@ -186,34 +142,3 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo run
 ```
-
-This artifact environment does not contain Rust, so your Xubuntu machine is the
-authoritative compiler/Clippy test.
-
-## What to evaluate
-
-The goal of v0.5 is architecture and interaction, not final theory.
-
-Please pay attention to:
-
-1. Does choosing chords from Safe / Colorful / Bold feel faster than v0.4?
-2. Does Resolve / Neutral / Tension feel useful as an independent bias?
-3. Do the four smoothly moving MIDI voices feel like one harmonic ensemble?
-4. Does `P` quantized capture match how you imagine phrase recording?
-5. Is the simplified Phrase Editor sufficient for navigating and correcting a
-   captured progression?
-6. Do Density / Dynamics / Spread / Color feel like the right four voice
-   dimensions, even though rhythmic Density is still primitive?
-
-
-## v0.5.1 Clippy cleanup
-
-This maintenance revision addresses the first strict `cargo clippy -- -D warnings`
-run on Rust 1.98:
-
-- exercises the `Triad` extension in the runtime Safe vocabulary,
-- removes the unused `VoiceParameters::normalized()` helper,
-- adopts Clippy's collapsed conditional form in recorder/editor navigation,
-- removes an unnecessary integer cast in the bitmap-font renderer.
-
-No architecture or interaction model changed.

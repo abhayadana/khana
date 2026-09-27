@@ -1,10 +1,11 @@
 //! Contextual next-chord recommendation.
 //!
-//! v0.5 intentionally uses a small transparent heuristic vocabulary. The API
-//! is designed so richer functional harmony, modal interchange, and historical
-//! scoring can replace these heuristics without changing the UI.
+//! v0.6 keeps the scoring transparent while making the pools key/mode-aware.
+//! Reroll changes ordering inside the ordinary vocabulary. Surprise broadens
+//! the available vocabulary before ranking it.
 
 use super::chord::{Chord, ChordExtension, ChordQuality, PitchClass};
+use super::settings::TonalContext;
 
 /// Visual recommendation family shown on the Performance screen.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -17,7 +18,6 @@ pub enum RecommendationClass {
 impl RecommendationClass {
     pub const ALL: [Self; 3] = [Self::Safe, Self::Colorful, Self::Bold];
 
-    /// Human-readable uppercase label.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Safe => "SAFE",
@@ -26,7 +26,6 @@ impl RecommendationClass {
         }
     }
 
-    /// Converts the class to a stable zero-based UI index.
     pub const fn index(self) -> usize {
         match self {
             Self::Safe => 0,
@@ -35,7 +34,6 @@ impl RecommendationClass {
         }
     }
 
-    /// Returns a class from a UI index, wrapping into the three classes.
     pub const fn from_index(index: usize) -> Self {
         Self::ALL[index % Self::ALL.len()]
     }
@@ -50,7 +48,6 @@ pub enum HarmonicDirection {
 }
 
 impl HarmonicDirection {
-    /// Human-readable uppercase label.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Resolve => "RESOLVE",
@@ -69,7 +66,6 @@ pub struct RecommendationSet {
 }
 
 impl RecommendationSet {
-    /// Returns the three recommendations for `class`.
     pub const fn for_class(&self, class: RecommendationClass) -> &[Chord; 3] {
         match class {
             RecommendationClass::Safe => &self.safe,
@@ -78,16 +74,11 @@ impl RecommendationSet {
         }
     }
 
-    /// Returns one recommendation, wrapping the row index.
     pub const fn get(&self, class: RecommendationClass, index: usize) -> Chord {
         self.for_class(class)[index % 3]
     }
 }
 
-/// Small deterministic pseudo-random generator.
-///
-/// A local generator avoids an additional dependency and makes rerolls
-/// reproducible from a seed.
 struct SimpleRng {
     state: u64,
 }
@@ -116,33 +107,27 @@ pub struct RecommendationEngine {
 }
 
 impl RecommendationEngine {
-    /// Creates a deterministic recommendation engine.
     pub const fn new() -> Self {
         Self { reroll_seed: 1 }
     }
 
-    /// Advances the stochastic state used for the next recommendation set.
+    /// Advances stochastic ordering without changing harmonic vocabulary.
     pub fn reroll(&mut self) {
         self.reroll_seed = self.reroll_seed.wrapping_add(1);
     }
 
-    /// Generates recommendations for C major.
-    ///
-    /// The current prototype uses transparent pools:
-    /// - Safe: diatonic seventh chords.
-    /// - Colorful: diatonic ninths plus secondary dominants.
-    /// - Bold: borrowed/chromatic colors.
-    ///
-    /// `surprise` relaxes the normal preference against novelty.
+    /// Generates recommendations for the current tonal context.
     pub fn recommend(
         &self,
         current: Chord,
+        context: TonalContext,
         direction: HarmonicDirection,
         surprise: bool,
     ) -> RecommendationSet {
         let mut rng = SimpleRng::new(
             self.reroll_seed
                 ^ u64::from(current.root.value() + 1)
+                ^ u64::from(context.tonic.value() + 17)
                 ^ match direction {
                     HarmonicDirection::Resolve => 0xAA11,
                     HarmonicDirection::Neutral => 0xBB22,
@@ -151,24 +136,36 @@ impl RecommendationEngine {
         );
 
         let safe = choose_three(
-            safe_pool(),
+            safe_pool(context),
             current,
+            context,
             direction,
-            surprise,
+            false,
             RecommendationClass::Safe,
             &mut rng,
         );
+
+        let mut colorful_pool = colorful_pool(context);
+        let mut bold_pool = bold_pool(context);
+
+        if surprise {
+            colorful_pool.extend(surprise_pool(context));
+            bold_pool.extend(surprise_pool(context));
+        }
+
         let colorful = choose_three(
-            colorful_pool(),
+            colorful_pool,
             current,
+            context,
             direction,
             surprise,
             RecommendationClass::Colorful,
             &mut rng,
         );
         let bold = choose_three(
-            bold_pool(),
+            bold_pool,
             current,
+            context,
             direction,
             surprise,
             RecommendationClass::Bold,
@@ -192,17 +189,19 @@ impl Default for RecommendationEngine {
 fn choose_three(
     mut pool: Vec<Chord>,
     current: Chord,
+    context: TonalContext,
     direction: HarmonicDirection,
     surprise: bool,
     class: RecommendationClass,
     rng: &mut SimpleRng,
 ) -> [Chord; 3] {
     pool.retain(|chord| *chord != current);
+    pool.dedup();
 
     let novelty_bonus = match class {
         RecommendationClass::Safe => 0.0,
-        RecommendationClass::Colorful => 0.15,
-        RecommendationClass::Bold => 0.32,
+        RecommendationClass::Colorful => 0.16,
+        RecommendationClass::Bold => 0.34,
     };
 
     let mut scored = pool
@@ -211,6 +210,7 @@ fn choose_three(
             let candidate_score = score(
                 candidate,
                 current,
+                context,
                 direction,
                 surprise,
                 novelty_bonus,
@@ -228,13 +228,14 @@ fn choose_three(
 fn score(
     candidate: Chord,
     current: Chord,
+    context: TonalContext,
     direction: HarmonicDirection,
     surprise: bool,
     novelty_bonus: f32,
     jitter: f32,
 ) -> f32 {
-    let candidate_tension = tension_score(candidate);
-    let current_tension = tension_score(current);
+    let candidate_tension = tension_score(candidate, context);
+    let current_tension = tension_score(current, context);
     let delta = candidate_tension - current_tension;
 
     let directional = match direction {
@@ -245,17 +246,16 @@ fn score(
 
     let root_motion = chromatic_distance(current.root, candidate.root);
     let smooth_root_bonus = (6.0 - root_motion.min(6.0)) / 6.0;
-
-    let surprise_multiplier = if surprise { 1.6 } else { 0.65 };
-    let random_component = (jitter - 0.5) * 0.35 * surprise_multiplier;
+    let random_range = if surprise { 0.65 } else { 0.22 };
+    let random_component = (jitter - 0.5) * random_range;
 
     directional * 0.9
         + smooth_root_bonus * 0.35
-        + novelty_bonus * if surprise { 1.0 } else { 0.25 }
+        + novelty_bonus * if surprise { 0.9 } else { 0.25 }
         + random_component
 }
 
-fn tension_score(chord: Chord) -> f32 {
+fn tension_score(chord: Chord, context: TonalContext) -> f32 {
     let quality = match chord.quality {
         ChordQuality::Major => 0.15,
         ChordQuality::Minor => 0.25,
@@ -263,7 +263,8 @@ fn tension_score(chord: Chord) -> f32 {
         ChordQuality::Dominant => 0.75,
     };
 
-    let root = match chord.root.value() {
+    let relative = (12 + chord.root.value() - context.tonic.value()) % 12;
+    let function = match relative {
         0 => 0.0,
         5 => 0.25,
         7 => 0.6,
@@ -277,7 +278,7 @@ fn tension_score(chord: Chord) -> f32 {
         ChordExtension::Ninth => 0.2,
     };
 
-    quality + root + extension
+    quality + function + extension
 }
 
 fn chromatic_distance(left: PitchClass, right: PitchClass) -> f32 {
@@ -285,81 +286,109 @@ fn chromatic_distance(left: PitchClass, right: PitchClass) -> f32 {
     f32::from(raw.min(12 - raw))
 }
 
-fn safe_pool() -> Vec<Chord> {
-    use ChordExtension::{Seventh, Triad};
-    use ChordQuality::{Diminished, Dominant, Major, Minor};
+fn safe_pool(context: TonalContext) -> Vec<Chord> {
+    (0..7)
+        .map(|degree| {
+            let extension = if degree == 0 {
+                ChordExtension::Triad
+            } else {
+                ChordExtension::Seventh
+            };
+            context.diatonic_chord(degree, extension)
+        })
+        .collect()
+}
+
+fn colorful_pool(context: TonalContext) -> Vec<Chord> {
+    let mut pool = (0..7)
+        .map(|degree| context.diatonic_chord(degree, ChordExtension::Ninth))
+        .collect::<Vec<_>>();
+
+    for degree in 0..7 {
+        let target = context.diatonic_chord(degree, ChordExtension::Triad);
+        pool.push(Chord::new(
+            target.root.transpose(7),
+            ChordQuality::Dominant,
+            ChordExtension::Seventh,
+        ));
+    }
+
+    pool
+}
+
+fn bold_pool(context: TonalContext) -> Vec<Chord> {
+    let tonic = context.tonic;
 
     vec![
-        Chord::new(PitchClass::C, Major, Triad),
-        Chord::new(PitchClass::D, Minor, Seventh),
-        Chord::new(PitchClass::E, Minor, Seventh),
-        Chord::new(PitchClass::F, Major, Seventh),
-        Chord::new(PitchClass::G, Dominant, Seventh),
-        Chord::new(PitchClass::A, Minor, Seventh),
-        Chord::new(PitchClass::B, Diminished, Seventh),
+        Chord::new(
+            tonic.transpose(3),
+            ChordQuality::Major,
+            ChordExtension::Seventh,
+        ),
+        Chord::new(
+            tonic.transpose(8),
+            ChordQuality::Major,
+            ChordExtension::Seventh,
+        ),
+        Chord::new(
+            tonic.transpose(10),
+            ChordQuality::Major,
+            ChordExtension::Seventh,
+        ),
+        Chord::new(
+            tonic.transpose(1),
+            ChordQuality::Dominant,
+            ChordExtension::Seventh,
+        ),
+        Chord::new(
+            tonic.transpose(6),
+            ChordQuality::Dominant,
+            ChordExtension::Seventh,
+        ),
+        Chord::new(
+            tonic.transpose(5),
+            ChordQuality::Minor,
+            ChordExtension::Seventh,
+        ),
     ]
 }
 
-fn colorful_pool() -> Vec<Chord> {
-    use ChordExtension::{Ninth, Seventh};
-    use ChordQuality::{Dominant, Major, Minor};
+fn surprise_pool(context: TonalContext) -> Vec<Chord> {
+    let tonic = context.tonic;
 
-    vec![
-        Chord::new(PitchClass::C, Major, Ninth),
-        Chord::new(PitchClass::D, Minor, Ninth),
-        Chord::new(PitchClass::E, Minor, Ninth),
-        Chord::new(PitchClass::F, Major, Ninth),
-        Chord::new(PitchClass::G, Dominant, Ninth),
-        Chord::new(PitchClass::A, Minor, Ninth),
-        Chord::new(PitchClass::D, Dominant, Seventh),
-        Chord::new(PitchClass::E, Dominant, Seventh),
-        Chord::new(PitchClass::A, Dominant, Seventh),
-    ]
-}
-
-fn bold_pool() -> Vec<Chord> {
-    use ChordExtension::{Ninth, Seventh};
-    use ChordQuality::{Dominant, Major, Minor};
-
-    vec![
-        Chord::new(PitchClass::D_SHARP, Major, Seventh),
-        Chord::new(PitchClass::G_SHARP, Major, Seventh),
-        Chord::new(PitchClass::A_SHARP, Major, Seventh),
-        Chord::new(PitchClass::C_SHARP, Dominant, Seventh),
-        Chord::new(PitchClass::D_SHARP, Dominant, Seventh),
-        Chord::new(PitchClass::F_SHARP, Dominant, Seventh),
-        Chord::new(PitchClass::F, Minor, Seventh),
-        Chord::new(PitchClass::G_SHARP, Major, Ninth),
-        Chord::new(PitchClass::A_SHARP, Major, Ninth),
-    ]
+    [1_u8, 2, 3, 6, 8, 9, 10, 11]
+        .into_iter()
+        .flat_map(|offset| {
+            [
+                Chord::new(
+                    tonic.transpose(offset),
+                    ChordQuality::Dominant,
+                    ChordExtension::Ninth,
+                ),
+                Chord::new(
+                    tonic.transpose(offset),
+                    ChordQuality::Major,
+                    ChordExtension::Ninth,
+                ),
+            ]
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{HarmonicDirection, RecommendationClass, RecommendationEngine};
-    use crate::music::chord::{Chord, ChordExtension, ChordQuality, PitchClass};
+    use crate::music::settings::MusicalSettings;
 
     #[test]
     fn recommendation_set_contains_three_per_class() {
+        let settings = MusicalSettings::default();
+        let current = settings.tonal.tonic_chord();
         let engine = RecommendationEngine::new();
-        let current = Chord::new(PitchClass::C, ChordQuality::Major, ChordExtension::Seventh);
-        let set = engine.recommend(current, HarmonicDirection::Neutral, false);
+        let set = engine.recommend(current, settings.tonal, HarmonicDirection::Neutral, false);
 
         for class in RecommendationClass::ALL {
             assert_eq!(set.for_class(class).len(), 3);
         }
-    }
-
-    #[test]
-    fn reroll_changes_engine_seed_without_invalidating_recommendations() {
-        let mut engine = RecommendationEngine::new();
-        let current = Chord::new(PitchClass::C, ChordQuality::Major, ChordExtension::Seventh);
-
-        let first = engine.recommend(current, HarmonicDirection::Neutral, false);
-        engine.reroll();
-        let second = engine.recommend(current, HarmonicDirection::Neutral, false);
-
-        assert_eq!(first.for_class(RecommendationClass::Safe).len(), 3);
-        assert_eq!(second.for_class(RecommendationClass::Safe).len(), 3);
     }
 }

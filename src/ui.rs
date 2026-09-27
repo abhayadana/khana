@@ -1,30 +1,33 @@
-//! SDL rendering for Khaṇa's two MVP screens.
+//! SDL rendering for Khaṇa's two 1024×768 MVP screens.
 
-use crate::music::chord::Chord;
+use crate::music::chord::{Chord, midi_note_label};
 use crate::music::recommendation::{HarmonicDirection, RecommendationClass, RecommendationSet};
+use crate::music::settings::{MusicalSettings, SettingField};
 use crate::phrase::{Phrase, RecorderStatus};
-use crate::voice::{Voice, VoiceScope};
+use crate::voice::{Voice, VoiceRender, VoiceScope};
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 
-/// Stateless 1024x768 renderer.
+/// Stateless 1024×768 renderer.
 pub struct Ui {
     width: u32,
 }
 
 impl Ui {
-    /// Creates the UI renderer.
-    pub const fn new(width: u32, _height: u32) -> Self {
+    pub const fn new(width: u32) -> Self {
         Self { width }
     }
 
-    /// Draws the Performance screen.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_performance(
         &self,
         canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+        settings: MusicalSettings,
+        setting_focus: Option<SettingField>,
+        transport_running: bool,
         current_chord: Chord,
         chord_elapsed_beats: f64,
+        current_render: VoiceRender,
         recommendations: &RecommendationSet,
         selected_class: RecommendationClass,
         selected_row: usize,
@@ -39,22 +42,35 @@ impl Ui {
         canvas.set_draw_color(background());
         canvas.clear();
 
-        draw_text(canvas, 36, 24, "KHANA", 5, text_color())?;
-        draw_text(canvas, 210, 28, "C MAJOR", 3, dim_text())?;
-        draw_text(canvas, 410, 28, "120 BPM", 3, dim_text())?;
-        draw_text(canvas, 600, 28, "4/4", 3, dim_text())?;
+        draw_header(
+            canvas,
+            settings,
+            setting_focus,
+            transport_running,
+            "PERFORMANCE",
+        )?;
 
         draw_panel(canvas, Rect::new(32, 82, 250, 220), panel())?;
         draw_text(canvas, 54, 100, "CURRENT", 2, dim_text())?;
-        draw_text(canvas, 54, 145, &current_chord.symbol(), 7, text_color())?;
+        draw_text(canvas, 54, 140, &current_chord.symbol(), 5, text_color())?;
         draw_text(
             canvas,
             54,
-            235,
-            &format!("{:.1} BEATS", chord_elapsed_beats),
+            190,
+            &format!("VOICED {}", current_render.realized_chord.symbol()),
             2,
             accent(),
         )?;
+
+        let note_line = current_render.voicing.notes.map(midi_note_label).join(" ");
+        draw_text(canvas, 54, 225, &note_line, 2, text_color())?;
+
+        let elapsed = if transport_running {
+            format!("{:.1} BEATS", chord_elapsed_beats.max(0.0))
+        } else {
+            "TRANSPORT STOPPED".to_owned()
+        };
+        draw_text(canvas, 54, 263, &elapsed, 2, dim_text())?;
 
         draw_text(canvas, 315, 88, "NEXT", 2, dim_text())?;
         draw_recommendations(canvas, recommendations, selected_class, selected_row)?;
@@ -65,7 +81,7 @@ impl Ui {
         draw_text(canvas, 800, 194, "SCOPE", 2, dim_text())?;
         draw_text(canvas, 800, 230, &scope.label(), 4, text_color())?;
 
-        draw_voice_rows(canvas, voices, scope)?;
+        draw_voice_rows(canvas, voices, scope, current_render)?;
 
         draw_panel(canvas, Rect::new(32, 660, 960, 82), panel())?;
         draw_recording_strip(
@@ -79,23 +95,24 @@ impl Ui {
         Ok(())
     }
 
-    /// Draws the Phrase Editor screen.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_phrase_editor(
         &self,
         canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+        settings: MusicalSettings,
+        transport_running: bool,
         phrase: Option<&Phrase>,
         phrase_index: usize,
         phrase_count: usize,
         selected_event: usize,
         pixels_per_beat: f32,
+        playing_phrase: Option<usize>,
+        queued_phrase: Option<usize>,
     ) -> Result<(), String> {
         canvas.set_draw_color(background());
         canvas.clear();
 
-        draw_text(canvas, 36, 24, "KHANA", 5, text_color())?;
-        draw_text(canvas, 210, 28, "PHRASE EDITOR", 3, accent())?;
-        draw_text(canvas, 760, 28, "TAB PERFORMANCE", 2, dim_text())?;
+        draw_header(canvas, settings, None, transport_running, "PHRASE EDITOR")?;
 
         let Some(phrase) = phrase else {
             draw_text(canvas, 360, 310, "NO PHRASES YET", 4, dim_text())?;
@@ -122,15 +139,19 @@ impl Ui {
             "--".to_owned()
         };
 
-        draw_text(canvas, 42, 92, &previous, 3, dim_text())?;
-        draw_text(canvas, 130, 92, &format!("[{}]", current), 3, text_color())?;
-        draw_text(canvas, 260, 92, &next, 3, dim_text())?;
+        draw_text(canvas, 42, 90, &previous, 3, dim_text())?;
+        draw_text(canvas, 130, 90, &format!("[{}]", current), 3, text_color())?;
+        draw_text(canvas, 260, 90, &next, 3, dim_text())?;
+
+        let playback = playback_label(playing_phrase, queued_phrase);
+        draw_text(canvas, 430, 90, &playback, 2, accent())?;
+
         draw_text(
             canvas,
-            720,
-            92,
+            790,
+            90,
             &format!("{:.1} BEATS", phrase.duration_beats()),
-            3,
+            2,
             dim_text(),
         )?;
 
@@ -158,17 +179,25 @@ impl Ui {
             )?;
             draw_text(
                 canvas,
-                550,
-                642,
-                "Z CHANGE  D DUP  BACKSPACE DELETE",
+                535,
+                635,
+                "Z PLAY/QUEUE   X CHANGE   D DUP",
                 2,
                 accent(),
             )?;
             draw_text(
                 canvas,
-                550,
-                680,
-                "F SHORTER  R LONGER  -/+ ZOOM",
+                535,
+                670,
+                "BACKSPACE DELETE  F/R SIZE  -/+ ZOOM",
+                2,
+                dim_text(),
+            )?;
+            draw_text(
+                canvas,
+                535,
+                700,
+                "A/L PHRASE   SPACE TRANSPORT",
                 2,
                 dim_text(),
             )?;
@@ -176,6 +205,78 @@ impl Ui {
 
         Ok(())
     }
+}
+
+fn draw_header(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    settings: MusicalSettings,
+    focus: Option<SettingField>,
+    transport_running: bool,
+    screen_label: &str,
+) -> Result<(), String> {
+    draw_text(canvas, 24, 20, "KHANA", 4, text_color())?;
+    draw_text(canvas, 150, 23, screen_label, 2, dim_text())?;
+
+    let tonic_color = field_color(focus, SettingField::Tonic);
+    let mode_color = field_color(focus, SettingField::Mode);
+    let tempo_color = field_color(focus, SettingField::Tempo);
+    let meter_color = field_color(focus, SettingField::Meter);
+
+    draw_text(
+        canvas,
+        360,
+        23,
+        settings.tonal.tonic.label(),
+        2,
+        tonic_color,
+    )?;
+    draw_text(canvas, 405, 23, settings.tonal.mode.label(), 2, mode_color)?;
+    draw_text(
+        canvas,
+        600,
+        23,
+        &format!("{:.0} BPM", settings.tempo_bpm),
+        2,
+        tempo_color,
+    )?;
+    draw_text(canvas, 745, 23, &settings.meter.label(), 2, meter_color)?;
+    draw_text(
+        canvas,
+        860,
+        23,
+        if transport_running { "PLAY" } else { "STOP" },
+        2,
+        if transport_running {
+            accent()
+        } else {
+            dim_text()
+        },
+    )?;
+
+    if focus.is_some() {
+        draw_text(canvas, 360, 52, "SETTINGS", 1, accent())?;
+    }
+
+    Ok(())
+}
+
+fn field_color(focus: Option<SettingField>, field: SettingField) -> Color {
+    if focus == Some(field) {
+        accent()
+    } else {
+        dim_text()
+    }
+}
+
+fn playback_label(playing_phrase: Option<usize>, queued_phrase: Option<usize>) -> String {
+    let playing = playing_phrase
+        .map(|index| format!("PLAY P{:02}", index + 1))
+        .unwrap_or_else(|| "PLAY --".to_owned());
+    let queued = queued_phrase
+        .map(|index| format!("QUEUE P{:02}", index + 1))
+        .unwrap_or_else(|| "QUEUE --".to_owned());
+
+    format!("{playing}  {queued}")
 }
 
 fn draw_recommendations(
@@ -222,6 +323,7 @@ fn draw_voice_rows(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
     voices: &[Voice; 4],
     scope: VoiceScope,
+    render: VoiceRender,
 ) -> Result<(), String> {
     draw_text(canvas, 36, 330, "VOICES", 2, dim_text())?;
     draw_text(canvas, 260, 330, "DENS", 2, dim_text())?;
@@ -242,7 +344,12 @@ fn draw_voice_rows(
             canvas,
             52,
             y + 6,
-            &format!("{} {}", index + 1, voice.role.label()),
+            &format!(
+                "{} {} {}",
+                index + 1,
+                voice.role.label(),
+                midi_note_label(render.voicing.notes[index])
+            ),
             2,
             text_color(),
         )?;
@@ -282,13 +389,13 @@ fn draw_recording_strip(
         canvas,
         610,
         678,
-        &format!("Q {:.0} BEATS", quantize_beats),
+        &format!("Q {:.1} BEATS", quantize_beats),
         2,
         dim_text(),
     )?;
     draw_text(
         canvas,
-        805,
+        820,
         678,
         &format!("SAVED {}", phrase_count),
         2,
@@ -298,7 +405,14 @@ fn draw_recording_strip(
     if next_armed {
         draw_text(canvas, 180, 712, "NEXT PHRASE ARMED", 2, text_color())?;
     } else {
-        draw_text(canvas, 180, 712, "P RECORD   N ARM NEXT", 2, dim_text())?;
+        draw_text(
+            canvas,
+            180,
+            712,
+            "P RECORD  N ARM NEXT  SPACE TRANSPORT  M SETTINGS",
+            2,
+            dim_text(),
+        )?;
     }
 
     Ok(())
@@ -481,7 +595,7 @@ fn glyph(character: char) -> Option<[u8; 7]> {
         'S' => Some([15, 16, 16, 14, 1, 1, 30]),
         'T' => Some([31, 4, 4, 4, 4, 4, 4]),
         'U' => Some([17, 17, 17, 17, 17, 17, 14]),
-        'V' => Some([17, 17, 17, 17, 17, 10, 4]),
+        'V' => Some([17, 17, 10, 4, 10, 17, 17]),
         'W' => Some([17, 17, 17, 21, 21, 21, 10]),
         'X' => Some([17, 17, 10, 4, 10, 17, 17]),
         'Y' => Some([17, 17, 10, 4, 4, 4, 4]),

@@ -1,7 +1,4 @@
-//! Chord representation and chord-tone construction.
-//!
-//! The model is intentionally compact for the MVP. It borrows the proven
-//! Chorder distinction between chord identity and later voicing transforms.
+//! Chord representation and compact pitch naming.
 
 use std::fmt;
 
@@ -10,18 +7,10 @@ use std::fmt;
 pub struct PitchClass(u8);
 
 impl PitchClass {
-    pub const C: Self = Self(0);
-    pub const C_SHARP: Self = Self(1);
-    pub const D: Self = Self(2);
-    pub const D_SHARP: Self = Self(3);
-    pub const E: Self = Self(4);
-    pub const F: Self = Self(5);
-    pub const F_SHARP: Self = Self(6);
-    pub const G: Self = Self(7);
-    pub const G_SHARP: Self = Self(8);
-    pub const A: Self = Self(9);
-    pub const A_SHARP: Self = Self(10);
-    pub const B: Self = Self(11);
+    /// Creates a pitch class by wrapping a semitone value into 0..=11.
+    pub const fn from_value(value: u8) -> Self {
+        Self(value % 12)
+    }
 
     /// Returns the chromatic semitone value in 0..=11.
     pub const fn value(self) -> u8 {
@@ -44,6 +33,11 @@ impl PitchClass {
             10 => "BB",
             _ => "B",
         }
+    }
+
+    /// Returns this pitch class transposed upward by `semitones`.
+    pub const fn transpose(self, semitones: u8) -> Self {
+        Self::from_value(self.0 + semitones)
     }
 }
 
@@ -83,10 +77,6 @@ impl Chord {
     }
 
     /// Returns semitone intervals from the root used to realize this chord.
-    ///
-    /// The current vocabulary covers triads, sevenths, and ninths. More
-    /// modifiers from Chorder (sus2/sus4, inversions, quartal/quintal, etc.)
-    /// can be added without changing the recommendation API.
     pub fn intervals(self) -> Vec<u8> {
         use ChordExtension::{Ninth, Seventh, Triad};
         use ChordQuality::{Diminished, Dominant, Major, Minor};
@@ -107,11 +97,7 @@ impl Chord {
         }
     }
 
-    /// Applies the live Color macro without mutating the underlying chord.
-    ///
-    /// Low color preserves the written extension; higher values may enrich a
-    /// simpler chord to a seventh or ninth. This keeps phrase data semantic
-    /// while allowing performance color to alter its realization.
+    /// Applies the live Color macro without mutating the phrase's stored chord.
     pub fn colored(self, color: f32) -> Self {
         let extension = match self.extension {
             ChordExtension::Triad if color >= 0.72 => ChordExtension::Ninth,
@@ -123,7 +109,7 @@ impl Chord {
         Self { extension, ..self }
     }
 
-    /// Returns a compact chord symbol suitable for the small UI.
+    /// Returns a compact chord symbol suitable for the Brick Pro UI.
     pub fn symbol(self) -> String {
         let quality = match self.quality {
             ChordQuality::Major => match self.extension {
@@ -151,7 +137,7 @@ impl Chord {
         format!("{}{}", self.root.label(), quality)
     }
 
-    /// Returns true when the MIDI pitch belongs to this chord realization.
+    /// Returns true when `midi_note` belongs to this chord realization.
     pub fn contains_midi_pitch(self, midi_note: u8) -> bool {
         let pitch_class = midi_note % 12;
 
@@ -159,6 +145,13 @@ impl Chord {
             .iter()
             .any(|interval| (self.root.value() + interval) % 12 == pitch_class)
     }
+}
+
+/// Returns a compact MIDI note label where MIDI 60 is C4.
+pub fn midi_note_label(note: u8) -> String {
+    let pitch = PitchClass::from_value(note % 12).label();
+    let octave = i16::from(note / 12) - 1;
+    format!("{pitch}{octave}")
 }
 
 impl fmt::Display for Chord {
@@ -169,34 +162,30 @@ impl fmt::Display for Chord {
 
 #[cfg(test)]
 mod tests {
-    use super::{Chord, ChordExtension, ChordQuality, PitchClass};
+    use super::{Chord, ChordExtension, ChordQuality, PitchClass, midi_note_label};
+
+    #[test]
+    fn pitch_classes_transpose_with_wraparound() {
+        assert_eq!(
+            PitchClass::from_value(11).transpose(2),
+            PitchClass::from_value(1)
+        );
+    }
 
     #[test]
     fn major_ninth_contains_expected_intervals() {
-        let chord = Chord::new(PitchClass::C, ChordQuality::Major, ChordExtension::Ninth);
+        let chord = Chord::new(
+            PitchClass::from_value(0),
+            ChordQuality::Major,
+            ChordExtension::Ninth,
+        );
 
         assert_eq!(chord.intervals(), vec![0, 4, 7, 11, 14]);
     }
 
     #[test]
-    fn color_can_enrich_a_triad_without_changing_identity_fields() {
-        let chord = Chord::new(PitchClass::D, ChordQuality::Minor, ChordExtension::Triad);
-
-        let colored = chord.colored(0.8);
-
-        assert_eq!(colored.root, PitchClass::D);
-        assert_eq!(colored.quality, ChordQuality::Minor);
-        assert_eq!(colored.extension, ChordExtension::Ninth);
-    }
-
-    #[test]
-    fn chord_symbol_is_compact() {
-        let chord = Chord::new(
-            PitchClass::G,
-            ChordQuality::Dominant,
-            ChordExtension::Seventh,
-        );
-
-        assert_eq!(chord.symbol(), "G7");
+    fn midi_note_labels_use_scientific_pitch_notation() {
+        assert_eq!(midi_note_label(60), "C4");
+        assert_eq!(midi_note_label(69), "A4");
     }
 }

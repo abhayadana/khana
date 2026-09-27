@@ -3,7 +3,7 @@
 use crate::voice::MacroKind;
 use sdl2::keyboard::Keycode;
 
-/// Application-level action independent of physical keyboard layout.
+/// Application-level action independent of screen-specific meaning.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InputAction {
     NavigateLeft,
@@ -11,8 +11,8 @@ pub enum InputAction {
     NavigateUp,
     NavigateDown,
     Primary,
-    Reroll,
-    Surprise,
+    Secondary,
+    Tertiary,
     BiasResolve,
     BiasNeutral,
     BiasTension,
@@ -22,6 +22,8 @@ pub enum InputAction {
     ToggleRecord,
     ArmNextRecording,
     ToggleScreen,
+    ToggleTransport,
+    ToggleSettings,
     EditDuplicate,
     EditDelete,
     EditShorten,
@@ -43,8 +45,8 @@ pub fn map_key(keycode: Keycode) -> Option<InputAction> {
         Keycode::Up => Some(NavigateUp),
         Keycode::Down => Some(NavigateDown),
         Keycode::Z => Some(Primary),
-        Keycode::X => Some(Reroll),
-        Keycode::S => Some(Surprise),
+        Keycode::X => Some(Secondary),
+        Keycode::S => Some(Tertiary),
         Keycode::Q => Some(BiasResolve),
         Keycode::E => Some(BiasNeutral),
         Keycode::W => Some(BiasTension),
@@ -85,6 +87,8 @@ pub fn map_key(keycode: Keycode) -> Option<InputAction> {
         Keycode::P => Some(ToggleRecord),
         Keycode::N => Some(ArmNextRecording),
         Keycode::Tab => Some(ToggleScreen),
+        Keycode::Space => Some(ToggleTransport),
+        Keycode::M => Some(ToggleSettings),
         Keycode::D => Some(EditDuplicate),
         Keycode::Backspace => Some(EditDelete),
         Keycode::F => Some(EditShorten),

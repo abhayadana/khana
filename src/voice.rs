@@ -1,4 +1,7 @@
-//! Four performer states and macro handling.
+//! Four performer states, macro handling, and MIDI realization.
+
+use crate::music::chord::Chord;
+use crate::music::voicing::{Voicing, VoicingEngine};
 
 /// One of Khaṇa's four performer roles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10,7 +13,6 @@ pub enum VoiceRole {
 }
 
 impl VoiceRole {
-    /// Compact uppercase label.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Bass => "BASS",
@@ -45,7 +47,6 @@ pub enum VoiceScope {
 }
 
 impl VoiceScope {
-    /// Compact label for the performance UI.
     pub fn label(self) -> String {
         match self {
             Self::All => "ALL".to_owned(),
@@ -53,7 +54,6 @@ impl VoiceScope {
         }
     }
 
-    /// Moves to the next scope in ALL -> 1 -> 2 -> 3 -> 4 -> ALL order.
     pub const fn next(self) -> Self {
         match self {
             Self::All => Self::One(0),
@@ -64,7 +64,6 @@ impl VoiceScope {
         }
     }
 
-    /// Moves to the previous scope.
     pub const fn previous(self) -> Self {
         match self {
             Self::All => Self::One(3),
@@ -83,6 +82,77 @@ pub enum MacroKind {
     Dynamics,
     Spread,
     Color,
+}
+
+/// Fully realized voice state ready for MIDI output and display.
+#[derive(Clone, Copy, Debug)]
+pub struct VoiceRender {
+    pub realized_chord: Chord,
+    pub voicing: Voicing,
+    pub velocities: [u8; 4],
+    pub active: [bool; 4],
+}
+
+/// Converts harmonic state into four performer outputs.
+pub struct VoiceEngine {
+    voicing_engine: VoicingEngine,
+    current_voicing: Option<Voicing>,
+    transition_counter: u64,
+}
+
+impl VoiceEngine {
+    pub const fn new() -> Self {
+        Self {
+            voicing_engine: VoicingEngine::new(),
+            current_voicing: None,
+            transition_counter: 0,
+        }
+    }
+
+    /// Realizes a new harmonic event and advances Density's attack state.
+    pub fn harmonic_change(&mut self, chord: Chord, voices: &[Voice; 4]) -> VoiceRender {
+        self.transition_counter = self.transition_counter.wrapping_add(1);
+        self.render(chord, voices)
+    }
+
+    /// Revoices the current harmony without creating a new harmonic event.
+    pub fn revoice(&mut self, chord: Chord, voices: &[Voice; 4]) -> VoiceRender {
+        self.render(chord, voices)
+    }
+
+    fn render(&mut self, chord: Chord, voices: &[Voice; 4]) -> VoiceRender {
+        let color = average_color(voices);
+        let spread = average_spread(voices);
+        let realized_chord = chord.colored(color);
+        let voicing = self
+            .voicing_engine
+            .realize(realized_chord, self.current_voicing, spread);
+
+        let velocities =
+            std::array::from_fn(|index| velocity_from_dynamics(voices[index].parameters.dynamics));
+        let active = std::array::from_fn(|index| {
+            density_gate(
+                voices[index].parameters.density,
+                self.transition_counter,
+                index,
+            )
+        });
+
+        self.current_voicing = Some(voicing);
+
+        VoiceRender {
+            realized_chord,
+            voicing,
+            velocities,
+            active,
+        }
+    }
+}
+
+impl Default for VoiceEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Creates the four default performer profiles.
@@ -154,8 +224,7 @@ fn adjust_one(voice: &mut Voice, kind: MacroKind, delta: f32) {
     *value = (*value + delta).clamp(0.0, 1.0);
 }
 
-/// Returns the average spread across the ensemble.
-pub fn average_spread(voices: &[Voice; 4]) -> f32 {
+fn average_spread(voices: &[Voice; 4]) -> f32 {
     voices
         .iter()
         .map(|voice| voice.parameters.spread)
@@ -163,11 +232,23 @@ pub fn average_spread(voices: &[Voice; 4]) -> f32 {
         / voices.len() as f32
 }
 
-/// Returns the average color across the ensemble.
-pub fn average_color(voices: &[Voice; 4]) -> f32 {
+fn average_color(voices: &[Voice; 4]) -> f32 {
     voices
         .iter()
         .map(|voice| voice.parameters.color)
         .sum::<f32>()
         / voices.len() as f32
+}
+
+fn velocity_from_dynamics(dynamics: f32) -> u8 {
+    (35.0 + dynamics.clamp(0.0, 1.0) * 92.0).round() as u8
+}
+
+fn density_gate(density: f32, transition: u64, voice_index: usize) -> bool {
+    let mixed = transition
+        .wrapping_mul(1_103_515_245)
+        .wrapping_add((voice_index as u64 + 1) * 12_345);
+    let value = ((mixed >> 8) & 0xFFFF) as f32 / 65_535.0;
+
+    value <= density.clamp(0.0, 1.0)
 }
