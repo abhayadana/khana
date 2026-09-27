@@ -4,6 +4,7 @@ use crate::music::chord::{Chord, midi_note_label};
 use crate::music::recommendation::{HarmonicDirection, RecommendationClass, RecommendationSet};
 use crate::music::settings::{MusicalSettings, SettingField};
 use crate::phrase::{Phrase, RecorderStatus};
+use crate::sync::{SyncMode, SyncStatus};
 use crate::voice::{Voice, VoiceRender, VoiceScope};
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
@@ -24,7 +25,7 @@ impl Ui {
         canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
         settings: MusicalSettings,
         setting_focus: Option<SettingField>,
-        transport_running: bool,
+        sync_status: SyncStatus,
         current_chord: Chord,
         chord_elapsed_beats: f64,
         current_render: VoiceRender,
@@ -42,13 +43,7 @@ impl Ui {
         canvas.set_draw_color(background());
         canvas.clear();
 
-        draw_header(
-            canvas,
-            settings,
-            setting_focus,
-            transport_running,
-            "PERFORMANCE",
-        )?;
+        draw_header(canvas, settings, setting_focus, sync_status, "PERFORMANCE")?;
 
         draw_panel(canvas, Rect::new(32, 82, 250, 220), panel())?;
         draw_text(canvas, 54, 100, "CURRENT", 2, dim_text())?;
@@ -65,7 +60,7 @@ impl Ui {
         let note_line = current_render.voicing.notes.map(midi_note_label).join(" ");
         draw_text(canvas, 54, 225, &note_line, 2, text_color())?;
 
-        let elapsed = if transport_running {
+        let elapsed = if sync_status.running {
             format!("{:.1} BEATS", chord_elapsed_beats.max(0.0))
         } else {
             "TRANSPORT STOPPED".to_owned()
@@ -100,7 +95,7 @@ impl Ui {
         &self,
         canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
         settings: MusicalSettings,
-        transport_running: bool,
+        sync_status: SyncStatus,
         phrase: Option<&Phrase>,
         phrase_index: usize,
         phrase_count: usize,
@@ -112,7 +107,7 @@ impl Ui {
         canvas.set_draw_color(background());
         canvas.clear();
 
-        draw_header(canvas, settings, None, transport_running, "PHRASE EDITOR")?;
+        draw_header(canvas, settings, None, sync_status, "PHRASE EDITOR")?;
 
         let Some(phrase) = phrase else {
             draw_text(canvas, 360, 310, "NO PHRASES YET", 4, dim_text())?;
@@ -211,7 +206,7 @@ fn draw_header(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
     settings: MusicalSettings,
     focus: Option<SettingField>,
-    transport_running: bool,
+    sync_status: SyncStatus,
     screen_label: &str,
 ) -> Result<(), String> {
     draw_text(canvas, 24, 20, "KHANA", 4, text_color())?;
@@ -240,13 +235,26 @@ fn draw_header(
         tempo_color,
     )?;
     draw_text(canvas, 745, 23, &settings.meter.label(), 2, meter_color)?;
+
+    let sync_label = match sync_status.mode {
+        SyncMode::Internal => "INT".to_owned(),
+        SyncMode::Link => format!("LINK {}", sync_status.link_peers),
+    };
     draw_text(
         canvas,
-        860,
+        820,
         23,
-        if transport_running { "PLAY" } else { "STOP" },
+        &sync_label,
         2,
-        if transport_running {
+        field_color(focus, SettingField::Sync),
+    )?;
+    draw_text(
+        canvas,
+        930,
+        23,
+        if sync_status.running { "PLAY" } else { "STOP" },
+        2,
+        if sync_status.running {
             accent()
         } else {
             dim_text()
@@ -254,7 +262,19 @@ fn draw_header(
     )?;
 
     if focus.is_some() {
-        draw_text(canvas, 360, 52, "SETTINGS", 1, accent())?;
+        let link_text = if sync_status.link_available {
+            format!(
+                "SETTINGS  STARTSYNC {}",
+                if sync_status.link_start_stop_sync {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+            )
+        } else {
+            "SETTINGS  LINK NOT BUILT".to_owned()
+        };
+        draw_text(canvas, 360, 52, &link_text, 1, accent())?;
     }
 
     Ok(())
@@ -595,7 +615,7 @@ fn glyph(character: char) -> Option<[u8; 7]> {
         'S' => Some([15, 16, 16, 14, 1, 1, 30]),
         'T' => Some([31, 4, 4, 4, 4, 4, 4]),
         'U' => Some([17, 17, 17, 17, 17, 17, 14]),
-        'V' => Some([17, 17, 10, 4, 10, 17, 17]),
+        'V' => Some([17, 17, 17, 17, 17, 10, 4]),
         'W' => Some([17, 17, 17, 21, 21, 21, 10]),
         'X' => Some([17, 17, 10, 4, 10, 17, 17]),
         'Y' => Some([17, 17, 10, 4, 4, 4, 4]),

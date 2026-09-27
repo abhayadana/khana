@@ -260,6 +260,7 @@ fn tension_score(chord: Chord, context: TonalContext) -> f32 {
         ChordQuality::Major => 0.15,
         ChordQuality::Minor => 0.25,
         ChordQuality::Diminished => 0.9,
+        ChordQuality::HalfDiminished => 0.72,
         ChordQuality::Dominant => 0.75,
     };
 
@@ -301,7 +302,19 @@ fn safe_pool(context: TonalContext) -> Vec<Chord> {
 
 fn colorful_pool(context: TonalContext) -> Vec<Chord> {
     let mut pool = (0..7)
-        .map(|degree| context.diatonic_chord(degree, ChordExtension::Ninth))
+        .map(|degree| {
+            let seventh = context.diatonic_chord(degree, ChordExtension::Seventh);
+            let extension = if matches!(
+                seventh.quality,
+                ChordQuality::Diminished | ChordQuality::HalfDiminished
+            ) {
+                ChordExtension::Seventh
+            } else {
+                ChordExtension::Ninth
+            };
+
+            context.diatonic_chord(degree, extension)
+        })
         .collect::<Vec<_>>();
 
     for degree in 0..7 {

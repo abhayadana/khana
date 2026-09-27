@@ -47,6 +47,7 @@ pub enum ChordQuality {
     Major,
     Minor,
     Diminished,
+    HalfDiminished,
     Dominant,
 }
 
@@ -79,7 +80,7 @@ impl Chord {
     /// Returns semitone intervals from the root used to realize this chord.
     pub fn intervals(self) -> Vec<u8> {
         use ChordExtension::{Ninth, Seventh, Triad};
-        use ChordQuality::{Diminished, Dominant, Major, Minor};
+        use ChordQuality::{Diminished, Dominant, HalfDiminished, Major, Minor};
 
         match (self.quality, self.extension) {
             (Major, Triad) => vec![0, 4, 7],
@@ -94,15 +95,23 @@ impl Chord {
             (Diminished, Triad) => vec![0, 3, 6],
             (Diminished, Seventh) => vec![0, 3, 6, 9],
             (Diminished, Ninth) => vec![0, 3, 6, 9, 14],
+            (HalfDiminished, Triad) => vec![0, 3, 6],
+            (HalfDiminished, Seventh) => vec![0, 3, 6, 10],
+            (HalfDiminished, Ninth) => vec![0, 3, 6, 10, 14],
         }
     }
 
     /// Applies the live Color macro without mutating the phrase's stored chord.
     pub fn colored(self, color: f32) -> Self {
+        let diminished_family = matches!(
+            self.quality,
+            ChordQuality::Diminished | ChordQuality::HalfDiminished
+        );
+
         let extension = match self.extension {
-            ChordExtension::Triad if color >= 0.72 => ChordExtension::Ninth,
+            ChordExtension::Triad if color >= 0.72 && !diminished_family => ChordExtension::Ninth,
             ChordExtension::Triad if color >= 0.34 => ChordExtension::Seventh,
-            ChordExtension::Seventh if color >= 0.68 => ChordExtension::Ninth,
+            ChordExtension::Seventh if color >= 0.68 && !diminished_family => ChordExtension::Ninth,
             other => other,
         };
 
@@ -132,6 +141,11 @@ impl Chord {
                 ChordExtension::Seventh => "DIM7",
                 ChordExtension::Ninth => "DIM9",
             },
+            ChordQuality::HalfDiminished => match self.extension {
+                ChordExtension::Triad => "DIM",
+                ChordExtension::Seventh => "M7B5",
+                ChordExtension::Ninth => "M9B5",
+            },
         };
 
         format!("{}{}", self.root.label(), quality)
@@ -144,6 +158,28 @@ impl Chord {
         self.intervals()
             .iter()
             .any(|interval| (self.root.value() + interval) % 12 == pitch_class)
+    }
+
+    /// Returns the pitch classes that a four-voice realization must contain.
+    ///
+    /// Triads retain root/third/fifth and may double one tone. Sevenths retain
+    /// all four chord tones. Ninth chords retain root/third/seventh/ninth and
+    /// omit the fifth by default, a conventional four-voice reduction.
+    pub fn essential_pitch_classes(self) -> Vec<u8> {
+        let intervals = self.intervals();
+
+        let essential_intervals: Vec<u8> = match self.extension {
+            ChordExtension::Triad => intervals[..3].to_vec(),
+            ChordExtension::Seventh => intervals[..4].to_vec(),
+            ChordExtension::Ninth => {
+                vec![intervals[0], intervals[1], intervals[3], intervals[4]]
+            }
+        };
+
+        essential_intervals
+            .into_iter()
+            .map(|interval| (self.root.value() + interval) % 12)
+            .collect()
     }
 }
 
@@ -187,5 +223,16 @@ mod tests {
     fn midi_note_labels_use_scientific_pitch_notation() {
         assert_eq!(midi_note_label(60), "C4");
         assert_eq!(midi_note_label(69), "A4");
+    }
+
+    #[test]
+    fn half_diminished_seventh_has_minor_seventh_not_diminished_seventh() {
+        let chord = Chord::new(
+            PitchClass::from_value(11),
+            ChordQuality::HalfDiminished,
+            ChordExtension::Seventh,
+        );
+
+        assert_eq!(chord.intervals(), vec![0, 3, 6, 10]);
     }
 }

@@ -40,6 +40,11 @@ impl VoicingEngine {
                         }
 
                         let notes = [a, b, c, d];
+
+                        if !covers_essential_tones(chord, notes) {
+                            continue;
+                        }
+
                         let score = score_voicing(notes, previous, targets);
 
                         if score < best_score {
@@ -65,6 +70,15 @@ fn candidate_notes(chord: Chord) -> Vec<u8> {
     (36_u8..=88)
         .filter(|note| chord.contains_midi_pitch(*note))
         .collect()
+}
+
+fn covers_essential_tones(chord: Chord, notes: [u8; 4]) -> bool {
+    let pitch_classes = notes.map(|note| note % 12);
+
+    chord
+        .essential_pitch_classes()
+        .into_iter()
+        .all(|required| pitch_classes.contains(&required))
 }
 
 fn target_registers(spread: f32) -> [f32; 4] {
@@ -98,4 +112,41 @@ fn score_voicing(notes: [u8; 4], previous: Option<Voicing>, targets: [f32; 4]) -
     movement_cost * if previous.is_some() { 2.4 } else { 0.0 }
         + target_cost
         + f32::from(largest_gap.saturating_sub(24)) * 2.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VoicingEngine;
+    use crate::music::chord::{Chord, ChordExtension, ChordQuality, PitchClass};
+
+    #[test]
+    fn major_seventh_voicing_contains_all_four_chord_tones() {
+        let chord = Chord::new(
+            PitchClass::from_value(0),
+            ChordQuality::Major,
+            ChordExtension::Seventh,
+        );
+        let voicing = VoicingEngine::new().realize(chord, None, 0.5);
+        let pcs = voicing.notes.map(|note| note % 12);
+
+        for essential in chord.essential_pitch_classes() {
+            assert!(pcs.contains(&essential));
+        }
+    }
+
+    #[test]
+    fn dominant_ninth_four_voice_reduction_omits_fifth_not_essential_colors() {
+        let chord = Chord::new(
+            PitchClass::from_value(7),
+            ChordQuality::Dominant,
+            ChordExtension::Ninth,
+        );
+        let voicing = VoicingEngine::new().realize(chord, None, 0.5);
+        let pcs = voicing.notes.map(|note| note % 12);
+
+        // G9 -> essential G, B, F, A in four voices.
+        for required in [7_u8, 11, 5, 9] {
+            assert!(pcs.contains(&required));
+        }
+    }
 }

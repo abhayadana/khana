@@ -150,7 +150,8 @@ impl TonalContext {
         let quality = match (third, fifth, seventh) {
             (4, 7, 10) => ChordQuality::Dominant,
             (4, 7, _) => ChordQuality::Major,
-            (3, 6, _) => ChordQuality::Diminished,
+            (3, 6, 10) => ChordQuality::HalfDiminished,
+            (3, 6, 9) => ChordQuality::Diminished,
             _ => ChordQuality::Minor,
         };
 
@@ -200,10 +201,19 @@ pub enum SettingField {
     Mode,
     Tempo,
     Meter,
+    Sync,
+    StartStopSync,
 }
 
 impl SettingField {
-    pub const ALL: [Self; 4] = [Self::Tonic, Self::Mode, Self::Tempo, Self::Meter];
+    pub const ALL: [Self; 6] = [
+        Self::Tonic,
+        Self::Mode,
+        Self::Tempo,
+        Self::Meter,
+        Self::Sync,
+        Self::StartStopSync,
+    ];
 
     /// Moves focus one field to the right.
     pub fn next(self) -> Self {
@@ -244,5 +254,43 @@ mod tests {
     #[test]
     fn six_eight_is_three_quarter_note_beats_per_bar() {
         assert_eq!(TimeSignature::new(6, 8).beats_per_bar(), 3.0);
+    }
+
+    #[test]
+    fn every_modal_diatonic_seventh_matches_stacked_scale_tones() {
+        for mode in ScaleMode::ALL {
+            let context = TonalContext {
+                tonic: PitchClass::from_value(0),
+                mode,
+            };
+            let scale = mode.intervals();
+
+            for degree in 0..7 {
+                let chord = context.diatonic_chord(degree, ChordExtension::Seventh);
+                let root = scale[degree];
+
+                let expected = [0_usize, 2, 4, 6].map(|offset| {
+                    let index = degree + offset;
+                    let wrapped_note = scale[index % 7] + if index >= 7 { 12 } else { 0 };
+                    (wrapped_note - root) % 12
+                });
+
+                let actual = chord
+                    .intervals()
+                    .into_iter()
+                    .take(4)
+                    .map(|interval| interval % 12)
+                    .collect::<Vec<_>>();
+
+                assert_eq!(
+                    actual,
+                    expected.to_vec(),
+                    "mode {:?}, degree {} produced {}",
+                    mode,
+                    degree + 1,
+                    chord.symbol()
+                );
+            }
+        }
     }
 }

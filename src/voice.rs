@@ -90,14 +90,12 @@ pub struct VoiceRender {
     pub realized_chord: Chord,
     pub voicing: Voicing,
     pub velocities: [u8; 4],
-    pub active: [bool; 4],
 }
 
 /// Converts harmonic state into four performer outputs.
 pub struct VoiceEngine {
     voicing_engine: VoicingEngine,
     current_voicing: Option<Voicing>,
-    transition_counter: u64,
 }
 
 impl VoiceEngine {
@@ -105,13 +103,15 @@ impl VoiceEngine {
         Self {
             voicing_engine: VoicingEngine::new(),
             current_voicing: None,
-            transition_counter: 0,
         }
     }
 
-    /// Realizes a new harmonic event and advances Density's attack state.
+    /// Realizes a new harmonic event.
+    ///
+    /// In the sustained-chord prototype all four performers remain present.
+    /// Density is reserved for the upcoming rhythmic performer engine and does
+    /// not mute a voice at chord boundaries.
     pub fn harmonic_change(&mut self, chord: Chord, voices: &[Voice; 4]) -> VoiceRender {
-        self.transition_counter = self.transition_counter.wrapping_add(1);
         self.render(chord, voices)
     }
 
@@ -130,13 +130,6 @@ impl VoiceEngine {
 
         let velocities =
             std::array::from_fn(|index| velocity_from_dynamics(voices[index].parameters.dynamics));
-        let active = std::array::from_fn(|index| {
-            density_gate(
-                voices[index].parameters.density,
-                self.transition_counter,
-                index,
-            )
-        });
 
         self.current_voicing = Some(voicing);
 
@@ -144,7 +137,6 @@ impl VoiceEngine {
             realized_chord,
             voicing,
             velocities,
-            active,
         }
     }
 }
@@ -242,13 +234,4 @@ fn average_color(voices: &[Voice; 4]) -> f32 {
 
 fn velocity_from_dynamics(dynamics: f32) -> u8 {
     (35.0 + dynamics.clamp(0.0, 1.0) * 92.0).round() as u8
-}
-
-fn density_gate(density: f32, transition: u64, voice_index: usize) -> bool {
-    let mixed = transition
-        .wrapping_mul(1_103_515_245)
-        .wrapping_add((voice_index as u64 + 1) * 12_345);
-    let value = ((mixed >> 8) & 0xFFFF) as f32 / 65_535.0;
-
-    value <= density.clamp(0.0, 1.0)
 }

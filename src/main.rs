@@ -8,7 +8,7 @@ mod input;
 mod midi;
 mod music;
 mod phrase;
-mod transport;
+mod sync;
 mod ui;
 mod voice;
 
@@ -24,7 +24,7 @@ use music::recommendation::{
 use music::settings::{MusicalSettings, SettingField};
 use phrase::{Phrase, PhrasePlayer, PhraseRecorder};
 use sdl2::event::Event;
-use transport::Transport;
+use sync::{SyncMode, SyncTransport};
 use ui::Ui;
 use voice::{MacroKind, Voice, VoiceEngine, VoiceRender, VoiceScope, adjust_macro, default_voices};
 
@@ -211,7 +211,7 @@ fn main() -> Result<(), String> {
     let video = sdl_context.video()?;
     let window = video
         .window(
-            "Khaṇa v0.6 — transport, phrase playback, editable context",
+            "Khaṇa v0.6.5 — corrected harmony and voicing",
             WINDOW_WIDTH,
             WINDOW_HEIGHT,
         )
@@ -227,15 +227,28 @@ fn main() -> Result<(), String> {
 
     let ui = Ui::new(WINDOW_WIDTH);
     let mut app = App::new();
-    let mut transport = Transport::new(app.settings.tempo_bpm);
+    let mut transport = SyncTransport::new(app.settings.tempo_bpm);
     let mut midi = MidiEngine::new_virtual("Khana MIDI")?;
+    let mut was_running = false;
 
     print_controls();
 
     'running: loop {
-        let now_beat = transport.beat();
+        let now_beat = transport.beat(app.settings.meter.beats_per_bar());
+        let running_now = transport.is_running();
 
-        if transport.is_running() {
+        if running_now != was_running {
+            if running_now {
+                app.chord_started_beat = now_beat;
+                midi.play_render(app.current_render)?;
+            } else {
+                app.phrase_player.stop();
+                midi.stop_all()?;
+            }
+            was_running = running_now;
+        }
+
+        if running_now {
             if let Some(phrase) = app.recorder.update(now_beat, app.current_chord) {
                 println!(
                     "CAPTURED P{:02}: {} events, {:.1} beats",
@@ -276,7 +289,7 @@ fn main() -> Result<(), String> {
                     }
 
                     if action == InputAction::ToggleTransport {
-                        toggle_transport(&mut app, &mut transport, &mut midi)?;
+                        toggle_transport(&mut app, &mut transport);
                         continue;
                     }
 
@@ -293,15 +306,18 @@ fn main() -> Result<(), String> {
             }
         }
 
-        let now_beat = transport.beat();
+        let now_beat = transport.beat(app.settings.meter.beats_per_bar());
 
         match app.screen {
             Screen::Performance => {
+                let sync_status = transport.status();
+                app.settings.tempo_bpm = sync_status.tempo_bpm;
+
                 ui.draw_performance(
                     &mut canvas,
                     app.settings,
                     app.setting_focus,
-                    transport.is_running(),
+                    sync_status,
                     app.current_chord,
                     now_beat - app.chord_started_beat,
                     app.current_render,
@@ -318,10 +334,13 @@ fn main() -> Result<(), String> {
                 )?;
             }
             Screen::PhraseEditor => {
+                let sync_status = transport.status();
+                app.settings.tempo_bpm = sync_status.tempo_bpm;
+
                 ui.draw_phrase_editor(
                     &mut canvas,
                     app.settings,
-                    transport.is_running(),
+                    sync_status,
                     app.selected_phrase(),
                     app.editor_phrase_index,
                     app.phrases.len(),
@@ -342,36 +361,26 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-fn toggle_transport(
-    app: &mut App,
-    transport: &mut Transport,
-    midi: &mut MidiEngine,
-) -> Result<(), String> {
+fn toggle_transport(app: &mut App, transport: &mut SyncTransport) {
     if transport.is_running() {
         transport.stop();
-        app.phrase_player.stop();
-        midi.stop_all()?;
     } else {
         app.setting_focus = None;
         transport.start();
-        app.chord_started_beat = transport.beat();
-        midi.play_render(app.current_render)?;
     }
-
-    Ok(())
 }
 
 fn handle_performance_action(
     action: InputAction,
     app: &mut App,
-    transport: &mut Transport,
+    transport: &mut SyncTransport,
     midi: &mut MidiEngine,
 ) -> Result<(), String> {
     if let Some(field) = app.setting_focus {
         return handle_setting_action(action, field, app, transport, midi);
     }
 
-    let now_beat = transport.beat();
+    let now_beat = transport.beat(app.settings.meter.beats_per_bar());
 
     match action {
         InputAction::NavigateLeft => {
@@ -436,12 +445,12 @@ fn handle_performance_action(
         InputAction::ToggleRecord => {
             if !transport.is_running() {
                 transport.start();
-                app.chord_started_beat = transport.beat();
-                midi.play_render(app.current_render)?;
             }
 
-            app.recorder
-                .toggle(transport.beat(), app.settings.meter.beats_per_bar());
+            app.recorder.toggle(
+                transport.beat(app.settings.meter.beats_per_bar()),
+                app.settings.meter.beats_per_bar(),
+            );
         }
         InputAction::ArmNextRecording => {
             app.recorder.toggle_arm_next();
@@ -450,11 +459,10 @@ fn handle_performance_action(
             app.screen = Screen::PhraseEditor;
             app.clamp_editor_selection();
         }
-        InputAction::ToggleSettings => {
-            if !transport.is_running() {
-                app.setting_focus = Some(SettingField::Tonic);
-            }
+        InputAction::ToggleSettings if !transport.is_running() => {
+            app.setting_focus = Some(SettingField::Tonic);
         }
+        InputAction::ToggleSettings => {}
         _ => {}
     }
 
@@ -465,7 +473,7 @@ fn handle_setting_action(
     action: InputAction,
     field: SettingField,
     app: &mut App,
-    transport: &mut Transport,
+    transport: &mut SyncTransport,
     midi: &mut MidiEngine,
 ) -> Result<(), String> {
     match action {
@@ -494,7 +502,7 @@ fn adjust_setting(
     direction: i32,
     field: SettingField,
     app: &mut App,
-    transport: &mut Transport,
+    transport: &mut SyncTransport,
     midi: &mut MidiEngine,
 ) -> Result<(), String> {
     match field {
@@ -502,7 +510,10 @@ fn adjust_setting(
             let current = i32::from(app.settings.tonal.tonic.value());
             let next = (current + direction).rem_euclid(12) as u8;
             app.settings.tonal.tonic = music::chord::PitchClass::from_value(next);
-            app.reset_harmony_for_context(transport.beat(), midi)?;
+            app.reset_harmony_for_context(
+                transport.beat(app.settings.meter.beats_per_bar()),
+                midi,
+            )?;
         }
         SettingField::Mode => {
             app.settings.tonal.mode = if direction > 0 {
@@ -510,12 +521,15 @@ fn adjust_setting(
             } else {
                 app.settings.tonal.mode.previous()
             };
-            app.reset_harmony_for_context(transport.beat(), midi)?;
+            app.reset_harmony_for_context(
+                transport.beat(app.settings.meter.beats_per_bar()),
+                midi,
+            )?;
         }
         SettingField::Tempo => {
             app.settings.tempo_bpm =
                 (app.settings.tempo_bpm + f64::from(direction)).clamp(30.0, 300.0);
-            transport.set_bpm(app.settings.tempo_bpm);
+            transport.set_tempo(app.settings.tempo_bpm);
         }
         SettingField::Meter => {
             app.settings.meter = if direction > 0 {
@@ -523,6 +537,22 @@ fn adjust_setting(
             } else {
                 app.settings.meter.previous()
             };
+        }
+        SettingField::Sync => {
+            let next_mode = match transport.mode() {
+                SyncMode::Internal => SyncMode::Link,
+                SyncMode::Link => SyncMode::Internal,
+            };
+
+            if !transport.set_mode(next_mode, app.settings.meter.beats_per_bar()) {
+                eprintln!("Ableton Link is not compiled in. Rebuild with --features ableton-link");
+            }
+
+            app.settings.tempo_bpm = transport.tempo();
+        }
+        SettingField::StartStopSync => {
+            let status = transport.status();
+            transport.set_link_start_stop_sync(!status.link_start_stop_sync);
         }
     }
 
@@ -532,7 +562,7 @@ fn adjust_setting(
 fn handle_editor_action(
     action: InputAction,
     app: &mut App,
-    transport: &mut Transport,
+    transport: &mut SyncTransport,
 ) -> Result<(), String> {
     match action {
         InputAction::ToggleScreen => {
@@ -566,7 +596,7 @@ fn handle_editor_action(
 
                 app.phrase_player.request(
                     app.editor_phrase_index,
-                    transport.beat(),
+                    transport.beat(app.settings.meter.beats_per_bar()),
                     app.settings.meter.beats_per_bar(),
                 );
             }
@@ -607,12 +637,11 @@ fn handle_editor_action(
         InputAction::ZoomIn => {
             app.editor_zoom = (app.editor_zoom + 12.0).min(180.0);
         }
-        InputAction::ToggleSettings => {
-            if !transport.is_running() {
-                app.screen = Screen::Performance;
-                app.setting_focus = Some(SettingField::Tonic);
-            }
+        InputAction::ToggleSettings if !transport.is_running() => {
+            app.screen = Screen::Performance;
+            app.setting_focus = Some(SettingField::Tonic);
         }
+        InputAction::ToggleSettings => {}
         _ => {}
     }
 
@@ -650,7 +679,7 @@ fn replace_selected_with_safe_choice(app: &mut App) {
 }
 
 fn print_controls() {
-    println!("Khaṇa v0.6.0");
+    println!("Khaṇa v0.6.5");
     println!("GLOBAL:");
     println!("  Space   transport start/stop");
     println!("  Tab     Performance / Phrase Editor");
@@ -667,9 +696,10 @@ fn print_controls() {
     println!("  I/K     color -/+");
     println!("  P       quantized record start/stop");
     println!("  N       arm next phrase");
-    println!("  M       edit tonic/mode/tempo/meter (stopped)");
+    println!("  M       edit tonic/mode/tempo/meter/sync (stopped)");
     println!("SETTINGS:");
     println!("  Left/Right field   Up/Down value   Z/M exit");
+    println!("  SYNC INTERNAL/LINK; STARTSYNC OFF/ON");
     println!("PHRASE EDITOR:");
     println!("  A/L        previous/next phrase");
     println!("  Z          play selected / queue at next bar");
