@@ -10,6 +10,81 @@ pub struct ChordEvent {
     pub duration_beats: f64,
 }
 
+/// Phrase Editor duration grid.
+///
+/// Note-value grids are expressed in quarter-note beats. `Beat` is
+/// meter-aware: compound x/8 meters divisible by three use a dotted-quarter
+/// beat, while other meters use the denominator note. `Bar` always uses the
+/// full current measure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditGrid {
+    Sixteenth,
+    Eighth,
+    Quarter,
+    Half,
+    Beat,
+    Bar,
+}
+
+impl EditGrid {
+    pub const ALL: [Self; 6] = [
+        Self::Sixteenth,
+        Self::Eighth,
+        Self::Quarter,
+        Self::Half,
+        Self::Beat,
+        Self::Bar,
+    ];
+
+    /// Compact UI label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Sixteenth => "1/16",
+            Self::Eighth => "1/8",
+            Self::Quarter => "1/4",
+            Self::Half => "1/2",
+            Self::Beat => "BEAT",
+            Self::Bar => "BAR",
+        }
+    }
+
+    /// Selects the next edit grid.
+    pub fn next(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(2);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    /// Selects the previous edit grid.
+    pub fn previous(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(2);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// Returns the grid duration in quarter-note beats.
+    pub fn beats(self, numerator: u8, denominator: u8) -> f64 {
+        match self {
+            Self::Sixteenth => 0.25,
+            Self::Eighth => 0.5,
+            Self::Quarter => 1.0,
+            Self::Half => 2.0,
+            Self::Beat => {
+                if denominator == 8 && numerator >= 6 && numerator.is_multiple_of(3) {
+                    1.5
+                } else {
+                    4.0 / f64::from(denominator.max(1))
+                }
+            }
+            Self::Bar => f64::from(numerator) * 4.0 / f64::from(denominator.max(1)),
+        }
+    }
+}
+
 /// Auto-numbered phrase containing semantic chord events.
 #[derive(Clone, Debug)]
 pub struct Phrase {
@@ -49,12 +124,30 @@ impl Phrase {
         self.reflow();
     }
 
-    pub fn resize_event(&mut self, index: usize, delta_beats: f64) {
+    /// Snaps a chord duration to the adjacent edit-grid boundary.
+    ///
+    /// Off-grid performed durations are preserved until edited. Extending an
+    /// off-grid event snaps upward; shortening snaps downward. If already on a
+    /// grid boundary, the duration moves by exactly one grid unit.
+    pub fn snap_resize_event(&mut self, index: usize, grid_beats: f64, extend: bool) {
         let Some(event) = self.events.get_mut(index) else {
             return;
         };
 
-        event.duration_beats = (event.duration_beats + delta_beats).max(0.25);
+        let grid = grid_beats.max(0.25);
+        let units = event.duration_beats / grid;
+        let nearest = units.round();
+        let on_grid = (units - nearest).abs() < 1.0e-6;
+
+        let snapped_units = if extend {
+            if on_grid { nearest + 1.0 } else { units.ceil() }
+        } else if on_grid {
+            nearest - 1.0
+        } else {
+            units.floor()
+        };
+
+        event.duration_beats = (snapped_units * grid).max(0.25);
         self.reflow();
     }
 
@@ -244,6 +337,8 @@ struct ScheduledPhrase {
 #[derive(Debug, Default)]
 pub struct PhrasePlaybackUpdate {
     pub chord: Option<Chord>,
+    pub next_chord: Option<Chord>,
+    pub next_chord_beat: Option<f64>,
     pub ended: bool,
 }
 
@@ -310,6 +405,8 @@ impl PhrasePlayer {
             self.playing = None;
             return PhrasePlaybackUpdate {
                 chord: None,
+                next_chord: None,
+                next_chord_beat: None,
                 ended: true,
             };
         };
@@ -328,13 +425,26 @@ impl PhrasePlayer {
 
         let ended = relative_beat >= phrase.duration_beats();
 
+        let next_event = if ended {
+            None
+        } else {
+            phrase.events.get(playing.next_event_index)
+        };
+        let next_chord = next_event.map(|event| event.chord);
+        let next_chord_beat = next_event.map(|event| playing.started_beat + event.start_beat);
+
         if ended {
             self.playing = None;
         } else {
             self.playing = Some(playing);
         }
 
-        PhrasePlaybackUpdate { chord, ended }
+        PhrasePlaybackUpdate {
+            chord,
+            next_chord,
+            next_chord_beat,
+            ended,
+        }
     }
 }
 
@@ -375,7 +485,7 @@ fn next_strict_boundary(now_beat: f64, quantum: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChordEvent, Phrase, PhrasePlayer, PhraseRecorder, RecorderStatus};
+    use super::{ChordEvent, EditGrid, Phrase, PhrasePlayer, PhraseRecorder, RecorderStatus};
     use crate::music::chord::{Chord, ChordExtension, ChordQuality, PitchClass};
 
     fn c_major() -> Chord {
@@ -423,8 +533,51 @@ mod tests {
         let mut player = PhrasePlayer::new();
         player.request(0, 0.0, 4.0);
 
-        assert_eq!(player.update(&phrases, 0.0).chord, Some(c_major()));
-        assert_eq!(player.update(&phrases, 2.0).chord, Some(d_minor()));
+        let first = player.update(&phrases, 0.0);
+        assert_eq!(first.chord, Some(c_major()));
+        assert_eq!(first.next_chord, Some(d_minor()));
+        assert_eq!(first.next_chord_beat, Some(2.0));
+
+        let second = player.update(&phrases, 2.0);
+        assert_eq!(second.chord, Some(d_minor()));
+        assert_eq!(second.next_chord, None);
+        assert_eq!(second.next_chord_beat, None);
         assert!(player.update(&phrases, 4.0).ended);
+    }
+
+    #[test]
+    fn off_grid_duration_snaps_to_adjacent_boundary() {
+        let chord = crate::music::settings::MusicalSettings::default()
+            .tonal
+            .tonic_chord();
+        let mut phrase = Phrase {
+            id: 1,
+            events: vec![ChordEvent {
+                chord,
+                start_beat: 0.0,
+                duration_beats: 4.1,
+            }],
+        };
+
+        phrase.snap_resize_event(0, 1.0, true);
+        assert!((phrase.events[0].duration_beats - 5.0).abs() < 1.0e-9);
+
+        phrase.events[0].duration_beats = 4.1;
+        phrase.snap_resize_event(0, 1.0, false);
+        assert!((phrase.events[0].duration_beats - 4.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn compound_meter_beat_grid_is_dotted_quarter() {
+        assert!((EditGrid::Beat.beats(6, 8) - 1.5).abs() < 1.0e-9);
+        assert!((EditGrid::Beat.beats(9, 8) - 1.5).abs() < 1.0e-9);
+        assert!((EditGrid::Beat.beats(12, 8) - 1.5).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn bar_grid_tracks_meter() {
+        assert!((EditGrid::Bar.beats(4, 4) - 4.0).abs() < 1.0e-9);
+        assert!((EditGrid::Bar.beats(3, 4) - 3.0).abs() < 1.0e-9);
+        assert!((EditGrid::Bar.beats(6, 8) - 3.0).abs() < 1.0e-9);
     }
 }

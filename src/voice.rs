@@ -1,4 +1,4 @@
-//! Four performer states, macro handling, and chord-voicing realization.
+//! Four performer states, macro handling, and complete chord realization.
 
 use crate::music::chord::Chord;
 use crate::music::voicing::{Voicing, VoicingEngine};
@@ -88,7 +88,7 @@ pub enum MacroKind {
     Color,
 }
 
-/// Smooth polyphonic voicing used by the Chords performer and as a register
+/// Complete semantic-chord voicing used by Chords and as a register
 /// reference for the other performers.
 #[derive(Clone, Copy, Debug)]
 pub struct VoiceRender {
@@ -122,13 +122,9 @@ impl VoiceEngine {
 
     fn render(&mut self, chord: Chord, voices: &[Voice; 4]) -> VoiceRender {
         let chord_spread = voices[1].parameters.spread;
-        let bass_present = voices[0].parameters.density > 0.01;
-        let voicing = self.voicing_engine.realize_with_bass(
-            chord,
-            self.current_voicing,
-            chord_spread,
-            bass_present,
-        );
+        let voicing = self
+            .voicing_engine
+            .realize(chord, self.current_voicing, chord_spread);
 
         self.current_voicing = Some(voicing);
         VoiceRender { voicing }

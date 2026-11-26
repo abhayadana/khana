@@ -1,9 +1,7 @@
-//! Khaṇa v0.9.1 desktop prototype.
+//! Khaṇa v0.11.1 Brick foundation.
 //!
-//! v0.9 replaces Inner with a genuinely polyphonic Chords performer and
-//! separates pattern family selection from exact rhythmic variants. Density
-//! chooses a behavior region; continuity, age, history, and deterministic
-//! variation let each performer develop related patterns over time.
+//! v0.11 adds complete semantic chord voicings, rhythmic/gated Melody phrases,
+//! persistent cyclic Texture, and lightweight performer-to-performer awareness.
 
 mod input;
 mod midi;
@@ -15,9 +13,9 @@ mod ui;
 mod voice;
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use input::{InputAction, map_key};
+use input::{HandheldInput, InputAction, InputPage, desktop_event, open_input_devices};
 use midi::MidiEngine;
 use music::chord::Chord;
 use music::recommendation::{
@@ -25,7 +23,7 @@ use music::recommendation::{
 };
 use music::settings::{MusicalSettings, SettingField};
 use performer::PerformerEngine;
-use phrase::{Phrase, PhrasePlayer, PhraseRecorder};
+use phrase::{EditGrid, Phrase, PhrasePlayer, PhraseRecorder};
 use sdl2::event::Event;
 use sync::{SyncMode, SyncTransport};
 use ui::{PerformanceView, PhraseEditorView, Ui};
@@ -64,9 +62,20 @@ struct App {
     editor_phrase_index: usize,
     editor_event_index: usize,
     editor_zoom: f32,
+    editor_grid: EditGrid,
 }
 
 impl App {
+    fn input_page(&self) -> InputPage {
+        if self.setting_focus.is_some() {
+            InputPage::Settings
+        } else if self.screen == Screen::Performance {
+            InputPage::Performance
+        } else {
+            InputPage::Editor
+        }
+    }
+
     fn new() -> Self {
         let settings = MusicalSettings::default();
         let current_chord = settings.tonal.tonic_chord();
@@ -105,6 +114,7 @@ impl App {
             editor_phrase_index: 0,
             editor_event_index: 0,
             editor_zoom: 82.0,
+            editor_grid: EditGrid::Quarter,
         }
     }
 
@@ -123,21 +133,11 @@ impl App {
             .get(self.selected_class, self.selected_row)
     }
 
-    fn set_harmony(
-        &mut self,
-        chord: Chord,
-        now_beat: f64,
-        midi: &mut MidiEngine,
-        transport_running: bool,
-        record: bool,
-    ) -> Result<(), String> {
+    fn set_harmony(&mut self, chord: Chord, now_beat: f64, transport_running: bool, record: bool) {
         self.current_chord = chord;
         self.chord_started_beat = now_beat;
         self.current_render = self.voice_engine.harmonic_change(chord, &self.voices);
 
-        if transport_running {
-            midi.stop_all()?;
-        }
         self.performer_engine.harmony_changed(
             chord,
             self.settings.tonal,
@@ -163,15 +163,16 @@ impl App {
         let note_names = self
             .current_render
             .voicing
-            .notes
-            .map(|note| self.settings.tonal.midi_note_label(note));
+            .iter()
+            .map(|note| self.settings.tonal.midi_note_label(note))
+            .collect::<Vec<_>>();
 
         println!(
             "CHORD {} | CHORDS VOICING {:?} MIDI {:?}",
-            chord_name, note_names, self.current_render.voicing.notes
+            chord_name,
+            note_names,
+            self.current_render.voicing.as_slice()
         );
-
-        Ok(())
     }
 
     fn revoice_current(&mut self) {
@@ -245,39 +246,114 @@ impl App {
     }
 }
 
-/// Runs Khaṇa v0.9.1.
+/// Runs Khaṇa v0.11.0.
 ///
 /// # Errors
 ///
 /// Returns an error if SDL or MIDI initialization/output fails.
+fn ui_period(value: Option<&str>) -> Result<Duration, String> {
+    match value.unwrap_or("30") {
+        "30" => Ok(Duration::from_secs_f64(1.0 / 30.0)),
+        "60" => Ok(Duration::from_secs_f64(1.0 / 60.0)),
+        _ => Err("BRICK_UI_FPS must be 30 or 60".to_owned()),
+    }
+}
+
 fn main() -> Result<(), String> {
+    let brick = std::env::var("KHANA_BRICK").as_deref() == Ok("1")
+        || std::env::var("PLATFORM").as_deref() == Ok("tg5040");
+    let frame_period = ui_period(std::env::var("BRICK_UI_FPS").ok().as_deref())?;
+    let input_log = std::env::var("KHANA_INPUT_LOG").as_deref() == Ok("1");
     let sdl_context = sdl2::init()?;
     let video = sdl_context.video()?;
-    let window = video
-        .window(
-            "Khaṇa v0.9.1 — polyphonic chords + evolving patterns",
-            WINDOW_WIDTH,
-            WINDOW_HEIGHT,
-        )
-        .position_centered()
-        .build()
-        .map_err(|error| error.to_string())?;
+    let title = format!("Khana v{}", env!("CARGO_PKG_VERSION"));
+    let mut builder = video.window(&title, WINDOW_WIDTH, WINDOW_HEIGHT);
+    builder.position_centered();
+    if brick {
+        builder.fullscreen_desktop();
+    }
+    let window = builder.build().map_err(|error| error.to_string())?;
+    // No vsync wait in the musical/control polling loop. Presentation may
+    // still block on a device driver; measure that rather than assuming RT.
     let mut canvas = window
         .into_canvas()
-        .present_vsync()
         .build()
         .map_err(|error| error.to_string())?;
+    canvas
+        .set_logical_size(WINDOW_WIDTH, WINDOW_HEIGHT)
+        .map_err(|error| error.to_string())?;
     let mut event_pump = sdl_context.event_pump()?;
+    let (controllers, joysticks) = open_input_devices(&sdl_context, brick)?;
+    let joystick = if let Ok(index) = std::env::var("KHANA_JOYSTICK_INDEX") {
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| "KHANA_JOYSTICK_INDEX must be an integer".to_owned())?;
+        Some(
+            joysticks
+                .get(index)
+                .ok_or_else(|| "KHANA_JOYSTICK_INDEX not found".to_owned())?,
+        )
+    } else {
+        joysticks
+            .iter()
+            .find(|joystick| joystick.num_axes() >= 6 && joystick.num_buttons() >= 9)
+            .or_else(|| joysticks.first())
+    };
+    let mut handheld = HandheldInput::new(
+        joystick.map(sdl2::joystick::Joystick::instance_id),
+        Instant::now(),
+    );
+    println!(
+        "BUILD {} | brick={brick} | SDL driver={} | output={:?} | UI FPS={:.0}",
+        title,
+        video.current_video_driver(),
+        canvas.output_size(),
+        1.0 / frame_period.as_secs_f64()
+    );
+    if brick {
+        println!(
+            "INPUT: selected raw joystick {:?}",
+            joystick.map(sdl2::joystick::Joystick::instance_id)
+        );
+    }
 
-    let ui = Ui::new(WINDOW_WIDTH);
+    let ui = Ui::new(WINDOW_WIDTH, brick);
     let mut app = App::new();
     let mut transport = SyncTransport::new(app.settings.tempo_bpm);
-    let mut midi = MidiEngine::new_virtual("Khana MIDI")?;
+    let mut midi = if std::env::var("KHANA_MIDI_DRY_RUN").as_deref() == Ok("1") {
+        MidiEngine::dry_run()
+    } else {
+        match MidiEngine::new_auto("Khana MIDI") {
+            Ok(midi) => midi,
+            Err(error) if brick => {
+                eprintln!("MIDI unavailable: {error}; starting UI-only dry run");
+                MidiEngine::dry_run()
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let midi_destination = midi.destination_name().to_owned();
     let mut was_running = false;
 
     print_controls();
+    let mut next_render = Instant::now();
+    let mut last_poll = next_render;
+    let mut last_report = next_render;
+    let mut max_gap = Duration::ZERO;
 
     'running: loop {
+        let poll = Instant::now();
+        max_gap = max_gap.max(poll.duration_since(last_poll));
+        last_poll = poll;
+        if poll.duration_since(last_report) >= Duration::from_secs(5) {
+            println!(
+                "DIAG max poll gap {:.2} ms | active MIDI notes {:?}",
+                max_gap.as_secs_f64() * 1000.0,
+                midi.active_counts()
+            );
+            max_gap = Duration::ZERO;
+            last_report = poll;
+        }
         let now_beat = transport.beat(app.settings.meter.beats_per_bar());
         let running_now = transport.is_running();
 
@@ -309,8 +385,10 @@ fn main() -> Result<(), String> {
             let playback = app.phrase_player.update(&app.phrases, now_beat);
 
             if let Some(chord) = playback.chord {
-                app.set_harmony(chord, now_beat, &mut midi, true, false)?;
+                app.set_harmony(chord, now_beat, true, false);
             }
+            app.performer_engine
+                .set_next_chord_target(playback.next_chord, playback.next_chord_beat);
 
             if playback.ended && app.phrase_player.queued_phrase().is_none() {
                 app.performer_engine.set_enabled(false);
@@ -321,38 +399,52 @@ fn main() -> Result<(), String> {
         }
 
         for event in event_pump.poll_iter() {
-            match event {
-                Event::Quit { .. } => break 'running,
-                Event::KeyDown {
-                    keycode: Some(keycode),
-                    repeat: false,
-                    ..
-                } => {
-                    let Some(action) = map_key(keycode) else {
-                        continue;
-                    };
-
-                    if action == InputAction::Quit {
-                        break 'running;
-                    }
-
-                    if action == InputAction::ToggleTransport {
-                        toggle_transport(&mut app, &mut transport);
-                        continue;
-                    }
-
-                    match app.screen {
-                        Screen::Performance => {
-                            handle_performance_action(action, &mut app, &mut transport, &mut midi)?;
-                        }
-                        Screen::PhraseEditor => {
-                            handle_editor_action(action, &mut app, &mut transport)?;
-                        }
-                    }
-                }
-                _ => {}
+            if matches!(event, Event::Quit { .. }) {
+                break 'running;
+            }
+            if input_log
+                && matches!(
+                    event,
+                    Event::JoyButtonDown { .. }
+                        | Event::JoyButtonUp { .. }
+                        | Event::JoyAxisMotion { .. }
+                        | Event::JoyHatMotion { .. }
+                        | Event::ControllerButtonDown { .. }
+                        | Event::KeyDown { .. }
+                )
+            {
+                println!("INPUT {event:?}");
+            }
+            let action = if brick {
+                handheld.event(&event, app.input_page(), Instant::now())
+            } else {
+                desktop_event(&event, &controllers)
+            };
+            if let Some(action) = action
+                && dispatch_action(action, &mut app, &mut transport, &mut midi)?
+            {
+                break 'running;
             }
         }
+        if brick {
+            for action in handheld
+                .tick(app.input_page(), Instant::now())
+                .into_iter()
+                .flatten()
+            {
+                if dispatch_action(action, &mut app, &mut transport, &mut midi)? {
+                    break 'running;
+                }
+            }
+        }
+
+        // Render only when due; do not sleep for the entire UI frame budget.
+        let render_now = Instant::now();
+        if render_now < next_render {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        next_render = render_now + frame_period;
 
         let now_beat = transport.beat(app.settings.meter.beats_per_bar());
 
@@ -381,6 +473,7 @@ fn main() -> Result<(), String> {
                         next_recording_armed: app.recorder.next_is_armed(),
                         quantize_beats: app.recorder.quantize_beats(),
                         phrase_count: app.phrases.len(),
+                        midi_destination: &midi_destination,
                     },
                 )?;
             }
@@ -400,6 +493,7 @@ fn main() -> Result<(), String> {
                         pixels_per_beat: app.editor_zoom,
                         playing_phrase: app.phrase_player.playing_phrase(),
                         queued_phrase: app.phrase_player.queued_phrase(),
+                        edit_grid: app.editor_grid,
                     },
                 )?;
             }
@@ -412,6 +506,34 @@ fn main() -> Result<(), String> {
     midi.stop_all()?;
     println!("Khaṇa exited cleanly.");
     Ok(())
+}
+
+/// Returns true for a clean application exit, regardless of input source.
+fn dispatch_action(
+    mut action: InputAction,
+    app: &mut App,
+    transport: &mut SyncTransport,
+    midi: &mut MidiEngine,
+) -> Result<bool, String> {
+    if action == InputAction::Quit {
+        return Ok(true);
+    }
+    if action == InputAction::MenuTap {
+        action = if app.setting_focus.is_some() {
+            InputAction::ToggleSettings
+        } else {
+            InputAction::ToggleScreen
+        };
+    }
+    if action == InputAction::ToggleTransport {
+        toggle_transport(app, transport);
+    } else {
+        match app.screen {
+            Screen::Performance => handle_performance_action(action, app, transport, midi)?,
+            Screen::PhraseEditor => handle_editor_action(action, app, transport)?,
+        }
+    }
+    Ok(false)
 }
 
 fn toggle_transport(app: &mut App, transport: &mut SyncTransport) {
@@ -452,13 +574,7 @@ fn handle_performance_action(
         }
         InputAction::Primary => {
             app.phrase_player.stop();
-            app.set_harmony(
-                app.chosen_chord(),
-                now_beat,
-                midi,
-                transport.is_running(),
-                true,
-            )?;
+            app.set_harmony(app.chosen_chord(), now_beat, transport.is_running(), true);
         }
         InputAction::Secondary => {
             app.recommendation_engine.reroll();
@@ -677,15 +793,27 @@ fn handle_editor_action(
         }
         InputAction::EditShorten => {
             let index = app.editor_event_index;
+            let grid = app
+                .editor_grid
+                .beats(app.settings.meter.numerator, app.settings.meter.denominator);
             if let Some(phrase) = app.selected_phrase_mut() {
-                phrase.resize_event(index, -1.0);
+                phrase.snap_resize_event(index, grid, false);
             }
         }
         InputAction::EditExtend => {
             let index = app.editor_event_index;
+            let grid = app
+                .editor_grid
+                .beats(app.settings.meter.numerator, app.settings.meter.denominator);
             if let Some(phrase) = app.selected_phrase_mut() {
-                phrase.resize_event(index, 1.0);
+                phrase.snap_resize_event(index, grid, true);
             }
+        }
+        InputAction::GridPrevious | InputAction::NavigateUp => {
+            app.editor_grid = app.editor_grid.previous();
+        }
+        InputAction::GridNext | InputAction::NavigateDown => {
+            app.editor_grid = app.editor_grid.next();
         }
         InputAction::ZoomOut => {
             app.editor_zoom = (app.editor_zoom - 12.0).max(24.0);
@@ -738,7 +866,7 @@ fn replace_selected_with_safe_choice(app: &mut App) {
 }
 
 fn print_controls() {
-    println!("Khaṇa v0.9.1");
+    println!("Khana v{}", env!("CARGO_PKG_VERSION"));
     println!("GLOBAL:");
     println!("  Space   transport start/stop");
     println!("  Tab     Performance / Phrase Editor");
@@ -768,6 +896,28 @@ fn print_controls() {
     println!("  Left/Right select chord event");
     println!("  D          duplicate event");
     println!("  Backspace  delete event");
-    println!("  F/R        shorter/longer by one beat");
+    println!("  F/R        snap shorter/longer to edit grid");
+    println!("  Up/Down    previous/next edit grid");
+    println!("  [/]        previous/next edit grid");
     println!("  -/+        zoom");
+    println!("BRICK BRING-UP:");
+    println!("  MENU tap: page, hold: exit; never SELECT+MENU");
+    println!("  Performance: A commit B reroll X surprise Y neutral L/R1 scope L/R2 bias");
+    println!("  SELECT+A record, SELECT+B arm next, SELECT+X settings (stopped)");
+    println!("  Sticks: left X/Y density/dynamics, right X/Y spread/color");
+    println!("  Editor: A play B change X duplicate Y back; SELECT+Y delete");
+    println!("  L/R1 phrase, L/R2 duration, SELECT+L/R1 zoom, D-pad grid/event");
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::ui_period;
+
+    #[test]
+    fn ui_period_accepts_only_supported_frame_rates() {
+        assert_eq!(ui_period(None), ui_period(Some("30")));
+        assert!(ui_period(Some("60")).unwrap() < ui_period(None).unwrap());
+        assert!(ui_period(Some("0")).is_err());
+        assert!(ui_period(Some("120")).is_err());
+    }
 }

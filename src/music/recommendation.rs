@@ -784,7 +784,12 @@ fn chord_choice_voice_leading_hint(current: Chord, candidate: Chord) -> f32 {
         .filter(|pitch| candidate_pitch_classes.contains(pitch))
         .count();
 
-    common as f32 / 4.0
+    let denominator = current_pitch_classes
+        .len()
+        .max(candidate_pitch_classes.len())
+        .max(1);
+
+    common as f32 / denominator as f32
 }
 
 fn contextual_novelty(

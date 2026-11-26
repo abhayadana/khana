@@ -44,8 +44,10 @@ impl NoteOwnership {
 
 /// MIDI transport for the four Khaṇa performers.
 pub struct MidiEngine {
-    connection: MidiOutputConnection,
+    connection: Option<MidiOutputConnection>,
     ownership: NoteOwnership,
+    destination_name: String,
+    trace: bool,
 }
 
 impl MidiEngine {
@@ -61,9 +63,100 @@ impl MidiEngine {
             .map_err(|error| error.to_string())?;
 
         Ok(Self {
-            connection,
+            connection: Some(connection),
             ownership: NoteOwnership::new(),
+            destination_name: format!("VIRTUAL: {port_name}"),
+            trace: trace_enabled(),
         })
+    }
+
+    /// Connects to an ALSA MIDI destination when available, otherwise creates
+    /// the desktop-compatible virtual ALSA port.
+    ///
+    /// `KHANA_MIDI_PORT` can contain a case-insensitive substring used to
+    /// select among multiple physical destinations.
+    pub fn new_auto(virtual_port_name: &str) -> Result<Self, String> {
+        let midi_output = MidiOutput::new("Khana").map_err(|error| error.to_string())?;
+        let ports = midi_output.ports();
+        let requested = std::env::var("KHANA_MIDI_PORT")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+
+        let names: Vec<String> = ports
+            .iter()
+            .enumerate()
+            .map(|(index, port)| {
+                midi_output
+                    .port_name(port)
+                    .unwrap_or_else(|_| format!("MIDI PORT {}", index + 1))
+            })
+            .collect();
+        for (index, name) in names.iter().enumerate() {
+            println!("MIDI port {index}: {name}");
+        }
+        let selected_index = if let Some(needle) = requested {
+            let needle = needle.to_lowercase();
+            let mut matches = names
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| name.to_lowercase().contains(&needle));
+            let index = matches.next().map(|(index, _)| index).ok_or_else(|| {
+                format!("KHANA_MIDI_PORT did not match any destination: {needle}")
+            })?;
+            if matches.next().is_some() {
+                return Err(format!(
+                    "KHANA_MIDI_PORT matches multiple destinations: {needle}"
+                ));
+            }
+            Some(index)
+        } else {
+            // ALSA's Midi Through is not evidence of an attached USB synth.
+            names
+                .iter()
+                .position(|name| !name.to_lowercase().contains("midi through"))
+        };
+
+        if let Some(index) = selected_index {
+            let port = &ports[index];
+            let name = names[index].clone();
+            let connection = midi_output
+                .connect(port, "Khana")
+                .map_err(|error| error.to_string())?;
+
+            println!("MIDI: connected to destination: {name}");
+            return Ok(Self {
+                connection: Some(connection),
+                ownership: NoteOwnership::new(),
+                destination_name: name,
+                trace: trace_enabled(),
+            });
+        }
+
+        println!(
+            "MIDI: no non-through destination found; creating virtual port {virtual_port_name}"
+        );
+        Self::new_virtual(virtual_port_name)
+    }
+
+    /// UI/control bring-up without an ALSA sequencer or attached synth.
+    /// Still exercises note ownership but never sends external MIDI.
+    pub fn dry_run() -> Self {
+        println!("MIDI: DRY RUN - no output");
+        Self {
+            connection: None,
+            ownership: NoteOwnership::new(),
+            destination_name: "DRY RUN - NO OUTPUT".to_owned(),
+            trace: trace_enabled(),
+        }
+    }
+
+    pub fn active_counts(&self) -> [u32; VOICE_COUNT] {
+        self.ownership.active.map(u128::count_ones)
+    }
+
+    /// Human-readable connected MIDI destination.
+    pub fn destination_name(&self) -> &str {
+        &self.destination_name
     }
 
     /// Applies one performer event while preserving per-note ownership.
@@ -118,23 +211,50 @@ impl MidiEngine {
     ///
     /// Returns an error if a MIDI message cannot be sent.
     pub fn stop_all(&mut self) -> Result<(), String> {
+        let mut first_error = None;
         for voice_index in 0..VOICE_COUNT {
             for note in 0_u8..=127 {
                 if self.ownership.contains(voice_index, note) {
-                    self.send(note_off_message(voice_index, note))?;
-                    self.ownership.remove(voice_index, note);
+                    match self.send(note_off_message(voice_index, note)) {
+                        Ok(()) => self.ownership.remove(voice_index, note),
+                        Err(error) => {
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
+                    }
                 }
             }
         }
-
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     fn send(&mut self, message: [u8; 3]) -> Result<(), String> {
-        self.connection
-            .send(&message)
-            .map_err(|error| error.to_string())
+        if self.trace {
+            println!(
+                "MIDI {:02X} {:02X} {:02X}",
+                message[0], message[1], message[2]
+            );
+        }
+        if let Some(connection) = &mut self.connection {
+            connection.send(&message).map_err(|error| error.to_string())
+        } else {
+            Ok(())
+        }
     }
+}
+
+// Error returns from the event/render loop must also attempt owned Note Offs.
+impl Drop for MidiEngine {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop_all() {
+            eprintln!("MIDI cleanup: {error}");
+        }
+    }
+}
+
+fn trace_enabled() -> bool {
+    std::env::var("KHANA_MIDI_TRACE").as_deref() == Ok("1")
 }
 
 fn note_bit(note: u8) -> u128 {
@@ -210,5 +330,22 @@ mod tests {
 
         assert!(!ownership.contains(2, 60));
         assert!(ownership.contains(2, 64));
+    }
+
+    #[test]
+    fn dry_run_tracks_polyphony_and_cleans_up() {
+        use crate::performer::VoiceEvent;
+        let mut midi = super::MidiEngine::dry_run();
+        for note in [52, 55, 59, 62, 65] {
+            midi.apply_event(VoiceEvent::NoteOn {
+                voice_index: 1,
+                note,
+                velocity: 90,
+            })
+            .unwrap();
+        }
+        assert_eq!(midi.active_counts(), [0, 5, 0, 0]);
+        midi.stop_all().unwrap();
+        assert_eq!(midi.active_counts(), [0; 4]);
     }
 }

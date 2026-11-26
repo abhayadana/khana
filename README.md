@@ -1,370 +1,448 @@
-# Khaṇa v0.9.1
+# Khaṇa v0.11.1
 
-v0.9 changes the four-performer architecture to:
+Khaṇa is a performance-oriented MIDI harmony/phrase instrument for the TrimUI
+Brick Pro and desktop development. Its core workflow is:
 
 ```text
-Bass | Chords | Texture | Melody
+hear possibilities → choose → shape → capture → revisit → vary
 ```
 
-and changes pattern selection from:
+v0.11.0 is the first build where the four generators begin behaving like a
+small ensemble rather than four independent parts reacting to the same chord.
 
-```text
-Density -> one fixed pattern
+## v0.11.1 — Brick foundation
+
+This cumulative upgrade applies directly to **v0.9.1** at GitHub commit
+`ad880bdfb6714f7c552ed81813a25420ad0d5202` (20261126 baseline). It includes
+the v0.10 editor and performer changes, audited v0.11 ensemble changes,
+and v0.11.1 Brick foundation. No intermediate patches are required. See [Brick setup and controls](docs/BRICK_V0.11.1.md)
+for the complete handheld mapping, build/deploy workflow and hardware test plan.
+
+```sh
+./scripts/package-khana.sh
+BRICK_HOST=user@brick-ip ./scripts/deploy-khana.sh
 ```
 
-to:
+The package is `dist/Khana.pak.zip`; deployment always rebuilds first. The first
+hardware pass may use `KHANA_MIDI_DRY_RUN=1` to validate controls without MIDI.
+
+## v0.11 musical foundation
 
 ```text
-Density -> behavior family
-        -> eligible sibling variants
-        -> continuity / age / history / deterministic variation
-        -> one evolving pattern
+Bass      foundation / line / destination
+Chords    complete harmonic statement
+Texture   regular cyclic motion / atmosphere
+Melody    phrase / motif / expressive rhythm
+
+                    ↕
+             EnsembleContext
+                    ↕
+       rhythmic + melodic coordination
 ```
 
-The v0.7 progression recommendation engine is otherwise retained so harmony
-recommendation can continue to be tuned independently from performer behavior.
+The harmonic recommendation engine, Phrase Editor grid, Brick/NextUI
+scaffolding, and physical MIDI discovery from v0.10 remain in place.
 
-## Why this build exists
+## Chords: play the chord that is displayed
 
-The previous `Inner` role was too abstract. A basic progression should be
-clearly audible from **Bass + Chords alone**. Texture and Melody should enrich
-that foundation rather than being required to reconstruct the harmony.
-
-The new architecture is:
+The Chords performer no longer forces every harmony into a four-note voicing.
 
 ```text
-progression engine
-      ↓
-selected active harmony
-      ↓
-upper chord voicing
-      ↓
-┌────────┬────────┬─────────┬────────┐
-│ Bass   │ Chords │ Texture │ Melody │
-│ mono   │ poly   │ mono    │ mono   │
-└────────┴────────┴─────────┴────────┘
-      ↓
-polyphonic-safe MIDI ownership
+C          C E G             3 notes
+Cm         C Eb G            3 notes
+
+Cmaj7      C E G B           4 notes
+Cm7        C Eb G Bb         4 notes
+G7         G B D F           4 notes
+
+Cmaj9      C E G B D         5 notes
+G9         G B D F A         5 notes
 ```
 
-## Four performers
+Every semantic chord tone appears exactly once in the Chords performer.
 
-### Bass — MIDI channel 1
+Bass presence does not remove the root from Chords and does not change the
+chord's note count. Spread changes inversion/register width while preserving
+membership.
 
-Bass remains the harmonic foundation. Density moves it among three families:
+The real-time voicing container remains fixed-capacity and allocation-free.
+Seven slots are reserved so future 11th/13th chord support does not require
+another storage redesign.
 
-```text
-FOUNDATION  < 0.32
-MOVING      0.32–0.72
-CONNECT     >= 0.72
-```
+## Chords Density
 
-Sibling variants include:
-
-```text
-FOUNDATION
-- root hold
-- root pulse
-- root octave
-
-MOVING
-- root/fifth
-- root/fifth/octave
-- broken bass
-
-CONNECT
-- scale approach
-- chromatic approach
-- walking fragment
-```
-
-Bass strongly acknowledges chord changes and is forced to state the new harmony
-when a chord is selected.
-
-### Chords — MIDI channel 2, polyphonic
-
-Chords now **actually plays the selected chord** as a simultaneous four-note
-voicing. Density moves it among:
+The v0.10 continuum remains:
 
 ```text
-SUSTAIN  < 0.30
-COMP     0.30–0.75
-ACTIVE   >= 0.75
-```
-
-Sibling variants include:
-
-```text
-SUSTAIN
-- sustained chord
-- single pulse
-- two-pulse support
-
+SILENT
+  ↓
+LONG SUSTAIN
+  ↓
+BAR SUSTAIN
+  ↓
+PULSE
+  ↓
 COMP
-- backbeat
-- offbeat
-- Charleston-type syncopation
-- anticipation/response
-
+  ↓
 ACTIVE
-- syncopated A
-- syncopated B
-- active stabs
 ```
 
-The rhythmic pattern and the chord voicing are separate systems. A COMP rhythm
-can therefore keep its identity while the voicing engine smoothly changes the
-actual chord tones.
+LONG SUSTAIN includes two- and four-bar holds. A real harmony change always
+interrupts the prior chord immediately.
 
-A newly selected chord forces a Chords attack even if the currently selected
-comp pattern would otherwise wait until later in the bar. This keeps harmonic
-feedback immediate during improvisation.
+## Melody: phrase rhythm is now part of the idea
 
-### Texture — MIDI channel 3
+Melody is still generated as two-bar phrases, but v0.11 no longer treats phrase
+events as mostly equal-length sequencer notes.
 
-Texture is deliberately more spacious. Density selects:
+Each Melody step carries:
 
 ```text
-SPARSE  < 0.38
-MOTION  0.38–0.75
-ACTIVE  >= 0.75
+intent
+gate length
+articulation
 ```
 
-Sibling variants include:
+Current intents:
 
 ```text
+Skeleton
+Fill
+Neighbor
+Suspension
+Modal Tension
+Chromatic Approach
+Rest
+```
+
+Current articulation states:
+
+```text
+Short
+Normal
+Legato
+Held
+```
+
+Typical duration behavior:
+
+```text
+passing / neighbor / chromatic approach   short
+ordinary fill                            short–medium
+structural skeleton                      medium
+suspension / modal tension               longer / legato
+phrase peak                              longer
+cadential arrival                        longest / held
+```
+
+A phrase can therefore sound more like:
+
+```text
+G──────  A B  C────────
+```
+
+rather than a stream of equal eighth notes.
+
+### Melody rhythmic identities
+
+The existing user-facing families remain:
+
+```text
+MOTIF → PHRASE → ORNAMENT
+```
+
+Their internal variants now carry more recognizable rhythmic behavior:
+
+```text
+MOTIF
+Call
+Pulse
+Sparse Arch
+
+PHRASE
+Arch
+Motif Development / Wave
+Answer
+
+ORNAMENT
+Flourish
+Passing-dense
+Chromatic phrase
+```
+
+Density still controls overall activity. The hidden phrase identity determines
+where that activity tends to occur.
+
+### A → A′ continuity
+
+When repetition/continuity is strong, a new phrase can retain the previous
+rhythmic skeleton, rests, gates, and articulation while altering a small
+non-structural event.
+
+```text
+A  →  A′
+```
+
+This is intentionally preferred over redrawing an unrelated melody every two
+bars.
+
+Chromatic approaches still carry an explicit resolution target. Suspensions and
+modal tensions are allowed to persist rather than being mechanically resolved
+on the next note.
+
+## Texture: regularity is intentional
+
+Texture is now the performer most comfortable with persistent, regular cyclic
+rhythm.
+
+Its Density continuum is:
+
+```text
+SILENT
+  ↓
+DRONE
+  ↓
 SPARSE
-- isolated upper tone
-- delayed echo
-- chord sparkle
+  ↓
+PULSE
+  ↓
+MOTION
+  ↓
+ACTIVE
+```
+
+Current pattern vocabulary includes:
+
+```text
+DRONE
+long drone
+bar drone
+
+SPARSE
+isolated upper tone
+delayed echo
+
+PULSE
+half-note pulse
+quarter-note pulse
 
 MOTION
-- two-note response
-- slow arpeggio
-- staggered extensions
+continuous three-step arpeggio
+slow arpeggio
+extension figure
 
 ACTIVE
-- shimmer
-- repeating arpeggio
-- extension figure
+shimmer
+repeating arpeggio with a gap
+continuous rotating three-note figure
 ```
 
-Unlike Bass and Chords, Texture can deterministically omit some candidate hits.
-This preserves its role as atmosphere/color rather than another constant rhythm
-section.
+### Texture phase continues through the music
 
-### Melody — MIDI channel 4
+Texture uses its own absolute pattern phase.
 
-Melody remains phrase-generated rather than mask-generated. Density selects:
+A three-step cell can therefore rotate across a 4/4 bar rather than restarting
+at beat one every measure:
 
 ```text
-MOTIF     < 0.30
-PHRASE    0.30–0.76
-ORNAMENT  >= 0.76
+E G B | E G B | E G B | ...
 ```
 
-Each family contains sibling phrase behaviors, including sparse motifs,
-developed/answering phrases, ornamented phrases, denser passing motion, and
-chromatic phrase variants.
+When harmony changes, the rhythm normally keeps running and the pitch mapping
+adapts to the new chord.
 
-Melody still uses structural tones, phrase contour, a peak, fills, neighbors,
-and resolving chromatic approaches.
-
-## Pattern family vs pattern variant
-
-The Performance screen shows only the **family**:
+This deliberately separates Texture from Chords:
 
 ```text
-BASS     MOVING
-CHORDS   COMP
-TEXTURE  MOTION
-MELODY   PHRASE
+Chords   articulate harmonic events
+Texture  maintain a continuing patterned stream
 ```
 
-Internally each family contains several variants.
+### Texture articulation belongs to the pattern
 
-This is intentional: Khaṇa should expose a small number of playable musical
-controls while retaining richer behavior internally.
-
-## How a variant is chosen
-
-At a natural renewal boundary, each eligible sibling receives a score based on:
+Texture does not randomly change gate shape note by note.
 
 ```text
-density fit
-+ continuity with current pattern
-+ repeat tendency
-+ pattern age
-- immediate-history penalty
-+ small seeded variation
+drone     very long
+pulse     medium
+arp       more legato
+shimmer   short
 ```
 
-Continuity is strong. A newly selected pattern usually survives long enough to
-become recognizable. As it ages, Khaṇa gradually becomes more willing to move
-to a sibling variant.
+That makes the cyclic identity audible and repeatable.
 
-The deterministic variation term is seeded. Repeated runs are therefore
-inspectable/testable rather than depending on opaque random state.
+## First relationship modes
 
-## Renewal boundaries
-
-Pattern identity is reconsidered at different musical rates:
+Texture now has two internal relationship behaviors:
 
 ```text
-Bass     one chord-relative bar
-Chords   one bar
-Texture  two bars
-Melody   two-bar phrase
+INDEPENDENT
+COMPLEMENT
 ```
 
-A large Density move can change family immediately, but otherwise pattern
-identity develops at these musical boundaries rather than being reconsidered on
-every note.
+Independent Texture maintains its own cycle.
 
-## Coherent patterns rather than punched masks
+Complementary Texture can leave a subdivision open when Melody has just
+attacked, creating simple rhythmic interlock without random omission.
 
-Bass and Chords now play a selected variant as a coherent rhythm. Space no
-longer randomly deletes their defining hits.
-
-Texture retains deterministic thinning because leaving air is central to that
-role.
-
-Melody creates rests at phrase-planning time.
-
-## Chord voicing theory
-
-The Chords performer uses the existing voice-leading engine in a more natural
-place: it now answers **how should the selected harmony be voiced upstairs?**
-
-When Bass is active, the Chords voicing is allowed to omit the root and instead
-prioritize the tones that define chord quality and extension.
-
-### Triad with Bass
-
-At minimum, upper Chords must preserve:
+Future builds can extend this architecture with:
 
 ```text
-third + fifth
+SHADOW
+IMITATE
+COUNTERLINE
 ```
 
-The fourth Chords note may be a root or a doubling chosen by the voicing engine.
+## EnsembleContext and soft counterpoint
 
-### Seventh chord with Bass
-
-Upper Chords must preserve:
+Each performer can now consult a small shared snapshot:
 
 ```text
-third + fifth + seventh
+currently active representative notes
+recent attack times
+recent melodic motion direction
 ```
 
-### Ninth chord with Bass
+This is advisory. It does not centrally compose all four parts.
 
-Upper Chords must preserve:
+v0.11 uses it for the first counterpoint preferences, primarily:
 
 ```text
-third + seventh + ninth
+Melody ↔ Texture
+Melody ↔ Bass
 ```
 
-The fifth and/or root are more expendable upstairs because Bass supplies the
-foundation.
+Candidate-note scoring can:
 
-If Bass Density is zero, the Chords voicing again requires the root so the
-harmony remains self-sufficient.
+- penalize very close same-register collisions,
+- modestly prefer contrary motion,
+- allow oblique motion naturally,
+- mildly discourage repeated same-direction perfect-interval motion,
+- reduce dissonance penalties as Color increases.
 
-The voicing engine favors smooth motion from the prior chord and keeps the
-Chords register above the Bass range.
+These are soft preferences, never textbook species-counterpoint prohibitions.
 
-## Chords Color
+Low Color favors clearer separation and stable intervals. Higher Color permits
+more seconds, sevenths, tritone/modal friction, and unresolved color.
 
-Color still does **not** change semantic chord identity.
+## Bass
 
-In v0.9, the Chords performer primarily states the selected chord itself. Future
-builds can use Chords Color for suspensions, transient add-tones, and resolving
-upper tensions without changing the stored chord name.
-
-This restraint is deliberate for the first polyphonic Chords implementation.
-
-## Polyphonic MIDI ownership
-
-The MIDI layer no longer assumes one note per channel.
-
-Each channel owns a 128-note bitset. Chords can therefore own several notes at
-once:
+The v0.10 Bass continuum remains:
 
 ```text
-ch 1 Bass      { C2 }
-ch 2 Chords    { E3, G3, B3, C4 }
-ch 3 Texture   { D5 }
-ch 4 Melody    { G5 }
+SILENT
+  ↓
+ANCHOR
+  ↓
+FOUNDATION
+  ↓
+MOVING
+  ↓
+CONNECT
 ```
 
-A Note Off only clears the exact note it owns. Rearticulating one Chords pitch
-cannot accidentally erase the other chord tones.
-
-The current Chords pattern still rearticulates its full chord on a rhythmic
-attack. Common-tone carry across harmony changes is a future refinement rather
-than being mixed into this first polyphonic build.
-
-## Performance display
-
-Each row now shows the family, not the hidden exact variant:
+Vocabulary still includes:
 
 ```text
-1 BASS C2       RST CHD   MOVING
-2 CHORDS 4N     RST BAR   COMP
-3 TEXTURE D5    RST 2BAR  MOTION
-4 MELODY G5     RST PHR   PHRASE
+root sustain / pedal
+root–fifth
+root–octave
+root bounce
+broken bass
+chord-tone ostinato
+scale approach
+chromatic approach
+walking fragment
 ```
 
-`4N` means four chord notes are currently sounding on the Chords channel.
+### Known-next-chord targeting
 
-The upper `ANCHOR` display is now best understood as the current Chords voicing
-and register reference used by the other performers.
+v0.11 adds one important CONNECT refinement.
 
-## Defaults
+During semantic Phrase playback, the next chord is genuinely known. Khaṇa now
+passes that destination to the Bass performer so CONNECT patterns can prepare
+the actual next root with diatonic or chromatic approaches.
 
-The new defaults intentionally start in moderate regions:
+During live improvisation no future harmony is invented:
 
 ```text
-Bass     Density 0.56 -> MOVING
-Chords   Density 0.52 -> COMP
-Texture  Density 0.40 -> MOTION
-Melody   Density 0.62 -> PHRASE
+future chord unknown → stay local to current harmony
+future chord known   → connector may target it
 ```
 
-This should make the initial sound recognizably harmonic without being a static
-pad or an overly dense ensemble.
+## Density-change boundaries
 
-## What this build does not yet do
+The v0.10 behavior remains:
 
-- Chords does not yet preserve common tones across chord changes; the current
-  harmony change safely releases prior notes and states the new chord.
-- Bass connecting patterns cannot truly target an *unknown future chord* yet.
-  Once a next chord is queued/known, that context can be added to bass-pattern
-  scoring.
-- Pattern selection does not yet inspect cadence/function directly. The family
-  architecture is designed so harmonic-context scoring can be added without
-  changing the public control model.
-- Exact pattern browsing is intentionally absent from the performance UI.
+```text
+Bass       next bar or harmony change
+Chords     next bar or harmony change
+Texture    next bar
+Melody     next two-bar phrase
 
-## Tests added/changed
+Density 0  immediate clean mute
+```
 
-v0.9 adds tests for:
+The control value changes immediately; musical behavior changes at an
+appropriate boundary.
 
-- default Bass / Chords / Texture / Melody ordering,
-- Chords-compatible upper voicing requirements,
-- Density selecting a family rather than one fixed pattern,
-- multiple sibling variants existing within COMP,
-- pattern state remaining inside its selected family,
-- four simultaneous Chords Note On events,
-- role-specific renewal/reset periods,
-- polyphonic MIDI ownership on one channel,
-- removing one Chords note without clearing other owned notes,
-- duplicate-frame suppression.
+## Phrase Editor grid
 
-## Build validation
+Unchanged from v0.10:
 
-On the development machine run:
+```text
+1/16 | 1/8 | 1/4 | 1/2 | BEAT | BAR
+```
+
+Shorten/Extend snaps down/up to the adjacent grid boundary instead of adding an
+increment to an already off-grid value.
+
+Example in 4/4:
+
+```text
+duration = 4.1 bars
+grid     = BAR
+
+Shorten → 4.0 bars
+Extend  → 5.0 bars
+```
+
+Literal note-value grids remain literal. `BEAT` is meter-aware; compound
+6/8, 9/8, and 12/8 use dotted-quarter beats.
+
+## MIDI / Brick / NextUI
+
+v0.11.1 keeps MIDI channels 1–4 for Bass / Chords / Texture / Melody and
+polyphonic per-note ownership. See [Brick setup](docs/BRICK_V0.11.1.md) for
+physical-port diagnostics, virtual and dry-run modes, raw joystick handling,
+30/60 FPS rendering, build/package/deploy scripts and device checks.
+
+## Static-audit hardening
+
+Before release handoff, v0.11 received an additional source-level audit. That
+audit made four important corrections:
+
+- Phrase-known Bass CONNECT targets now include the destination's scheduled
+  transport beat; CONNECT only treats that chord as an imminent destination
+  when the arrival is within one beat. Long-held phrase chords therefore do not
+  produce a false approach at the end of every intervening bar.
+- Harmony changes no longer call a global MIDI panic-stop or erase internal
+  Texture/Melody note ownership. Bass and Chords still force the new harmony,
+  while sounding Texture/Melody notes finish through their normal gate/next
+  attack and retain phase/phrase identity.
+- Melody cadential arrivals are placed early enough to make their held gate
+  audible before the next two-bar phrase starts.
+- Voicing candidate validation reuses the already-computed chord pitch classes
+  instead of allocating another vector for every candidate voicing.
+
+Regression tests were added for exhaustive chord membership across all current
+roots/qualities/extensions, phrase-next-chord timing, harmony-change note
+ownership, audible cadence holds, Texture regularity, Texture phase continuity,
+and soft counterpoint motion preference.
+
+## Desktop validation
+
+Run on the Xubuntu development machine:
 
 ```bash
 cargo fmt
@@ -373,24 +451,71 @@ cargo test --all-features
 cargo run --features ableton-link
 ```
 
-This source package is still the desktop-development build. Brick Pro input,
-physical USB-MIDI destination selection, ARM64 cross-compilation, and NextUI Pak
-packaging remain the deployment step after desktop validation.
+The build environment used to prepare this source does not contain Rust, so
+v0.11.1 has **not** been compiled here. Shell syntax and the local mocked
+package/deploy freshness regression have been checked.
+The user's Rust 1.98.1 machine remains the authoritative compile/Clippy/test
+environment.
 
-## Listening priorities
+## Suggested v0.11 listening tests
 
-For this build, listen specifically for:
+### Chords
 
-1. whether Bass + Chords alone clearly communicate the progression,
-2. whether Chords feels like a real comping player rather than one note of a
-   distributed block chord,
-3. whether leaving Density unchanged produces recognizable but evolving rhythm,
-4. whether Density changes feel like movement to a nearby behavior region,
-5. whether Texture leaves enough air,
-6. whether Melody remains phrase-like over the stronger harmonic foundation,
-7. whether Chords voicings stay out of the Bass register,
-8. whether four-note channel-2 MIDI remains reliable during rapid chord changes.
+1. Play a major/minor triad and confirm channel 2 emits three notes.
+2. Play a seventh chord and confirm four notes.
+3. Play a ninth chord and confirm five notes.
+4. Change Spread and confirm chord membership is unchanged.
 
-## v0.9.1 compiler cleanup
+### Melody
 
-v0.9.1 removes the obsolete `VoicingEngine::realize()` wrapper. Production code already uses the canonical `realize_with_bass(...)` API so the Chords performer can distinguish whether the Bass performer is supplying the root. The no-bass voicing unit test now exercises that same API with `bass_present = false`. No musical behavior changes from v0.9.0.
+1. Listen for short passing/neighbor notes versus sustained structural notes.
+2. Confirm cadential/peak notes can sustain over multiple grid steps.
+3. Leave the phrase running and listen for recognizable A → A′ continuity.
+4. Increase Color and verify modal/suspension tension is not always immediately
+   resolved.
+5. Increase Density and verify the phrase becomes more active without losing
+   its contour/rhythmic identity.
+
+### Texture
+
+1. Move Density through DRONE → SPARSE → PULSE → MOTION → ACTIVE.
+2. Listen for regular pulse/arp behavior rather than random holes.
+3. Use a rotating three-step figure and confirm it crosses bar boundaries
+   without restarting.
+4. Change chords and confirm the Texture phase continues.
+5. Listen for complementary Texture occasionally leaving room for Melody.
+
+### Ensemble / counterpoint
+
+1. Run Texture + Melody and listen for fewer same-register collisions.
+2. Listen for a mixture of contrary, oblique, and parallel motion rather than
+   identical line movement.
+3. Increase Color and verify interval friction becomes more permissible rather
+   than being treated as an error.
+4. Mute each performer independently; the remaining ensemble should retain a
+   coherent musical role.
+
+### Bass
+
+During Phrase playback, use high Bass Density and verify CONNECT behavior can
+prepare the actual following chord. During live performance with no queued
+future chord, Bass should never fabricate a harmonic destination.
+
+## Deliberately deferred
+
+v0.11 does not yet implement:
+
+- variable 1-/2-/4-bar Melody phrase lengths,
+- full Texture SHADOW / IMITATE / COUNTERLINE modes,
+- explicit motif locking in the UI,
+- cadence-aware whole-ensemble arrival behavior,
+- user-facing Intensity gesture,
+- Chords common-tone legato versus deliberate comp rearticulation distinction,
+- full 11th/13th chord vocabulary,
+- final verification of the Brick-specific physical button map and ALSA output,
+- independent real-time MIDI scheduler and USB MIDI reconnection.
+
+The guiding test remains:
+
+> Can a small amount of harmonic material stay compelling because four
+> performers retain identity, vary gradually, and listen to one another?

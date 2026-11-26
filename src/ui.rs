@@ -3,8 +3,9 @@
 use crate::music::chord::Chord;
 use crate::music::recommendation::{HarmonicDirection, RecommendationClass, RecommendationSet};
 use crate::music::settings::{MusicalSettings, SettingField};
+use crate::music::voicing::MAX_VOICING_NOTES;
 use crate::performer::PerformerSnapshot;
-use crate::phrase::{Phrase, RecorderStatus};
+use crate::phrase::{EditGrid, Phrase, RecorderStatus};
 use crate::sync::{SyncMode, SyncStatus};
 use crate::voice::{Voice, VoiceRender, VoiceScope};
 use sdl2::pixels::Color;
@@ -29,6 +30,7 @@ pub struct PerformanceView<'a> {
     pub next_recording_armed: bool,
     pub quantize_beats: f64,
     pub phrase_count: usize,
+    pub midi_destination: &'a str,
 }
 
 /// All state needed to render the Phrase Editor screen.
@@ -42,16 +44,18 @@ pub struct PhraseEditorView<'a> {
     pub pixels_per_beat: f32,
     pub playing_phrase: Option<usize>,
     pub queued_phrase: Option<usize>,
+    pub edit_grid: EditGrid,
 }
 
 /// Stateless 1024×768 renderer.
 pub struct Ui {
     width: u32,
+    brick: bool,
 }
 
 impl Ui {
-    pub const fn new(width: u32) -> Self {
-        Self { width }
+    pub const fn new(width: u32, brick: bool) -> Self {
+        Self { width, brick }
     }
 
     pub fn draw_performance(
@@ -77,6 +81,7 @@ impl Ui {
             next_recording_armed,
             quantize_beats,
             phrase_count,
+            midi_destination,
         } = view;
 
         canvas.set_draw_color(background());
@@ -98,8 +103,9 @@ impl Ui {
 
         let note_line = current_render
             .voicing
-            .notes
+            .iter()
             .map(|note| settings.tonal.midi_note_label(note))
+            .collect::<Vec<_>>()
             .join(" ");
         draw_text(canvas, 54, 225, &note_line, 2, text_color())?;
 
@@ -143,7 +149,16 @@ impl Ui {
             next_recording_armed,
             quantize_beats,
             phrase_count,
+            midi_destination,
         )?;
+        if self.brick {
+            let hints = if setting_focus.is_some() {
+                "L/R FIELD  U/D VALUE  A/B/MENU CLOSE  MENU HOLD EXIT"
+            } else {
+                "A COMMIT B REROLL X SURPRISE Y NEUTRAL SEL+A REC SEL+B ARM SEL+X SETUP MENU PAGE/HOLD EXIT"
+            };
+            draw_text(canvas, 32, 746, hints, 1, dim_text())?;
+        }
 
         Ok(())
     }
@@ -163,6 +178,7 @@ impl Ui {
             pixels_per_beat,
             playing_phrase,
             queued_phrase,
+            edit_grid,
         } = view;
 
         canvas.set_draw_color(background());
@@ -176,7 +192,11 @@ impl Ui {
                 canvas,
                 270,
                 370,
-                "RECORD ON PERFORMANCE SCREEN",
+                if self.brick {
+                    "MENU: PERFORMANCE  SEL+A: RECORD"
+                } else {
+                    "RECORD ON PERFORMANCE SCREEN"
+                },
                 2,
                 dim_text(),
             )?;
@@ -204,9 +224,17 @@ impl Ui {
 
         draw_text(
             canvas,
-            790,
+            690,
             90,
-            &format!("{:.1} BEATS", phrase.duration_beats()),
+            &format!("GRID {}", edit_grid.label()),
+            2,
+            accent(),
+        )?;
+        draw_text(
+            canvas,
+            840,
+            90,
+            &format!("{:.1}B", phrase.duration_beats()),
             2,
             dim_text(),
         )?;
@@ -251,7 +279,11 @@ impl Ui {
                 canvas,
                 535,
                 635,
-                "Z PLAY/QUEUE   X CHANGE   D DUP",
+                if self.brick {
+                    "A PLAY  B CHANGE  X DUP"
+                } else {
+                    "Z PLAY/QUEUE   X CHANGE   D DUP"
+                },
                 2,
                 accent(),
             )?;
@@ -259,7 +291,11 @@ impl Ui {
                 canvas,
                 535,
                 670,
-                "BACKSPACE DELETE  F/R SIZE  -/+ ZOOM",
+                if self.brick {
+                    "SEL+Y DELETE  L/R2 SIZE  U/D GRID"
+                } else {
+                    "BACKSPACE DELETE  F/R SIZE  UP/DN GRID"
+                },
                 2,
                 dim_text(),
             )?;
@@ -267,7 +303,11 @@ impl Ui {
                 canvas,
                 535,
                 700,
-                "A/L PHRASE   SPACE TRANSPORT",
+                if self.brick {
+                    "L/R1 PHRASE  SEL+L/R1 ZOOM"
+                } else {
+                    "A/L PHRASE   -/+ ZOOM   SPACE TRANSPORT"
+                },
                 2,
                 dim_text(),
             )?;
@@ -286,6 +326,14 @@ fn draw_header(
 ) -> Result<(), String> {
     draw_text(canvas, 24, 20, "KHANA", 4, text_color())?;
     draw_text(canvas, 150, 23, screen_label, 2, dim_text())?;
+    draw_text(
+        canvas,
+        24,
+        52,
+        concat!("V", env!("CARGO_PKG_VERSION")),
+        1,
+        dim_text(),
+    )?;
 
     let tonic_color = field_color(focus, SettingField::Tonic);
     let mode_color = field_color(focus, SettingField::Mode);
@@ -476,7 +524,7 @@ fn draw_voice_rows(
 
 fn active_note_summary(
     context: crate::music::settings::TonalContext,
-    notes: [Option<u8>; 4],
+    notes: [Option<u8>; MAX_VOICING_NOTES],
 ) -> String {
     let labels = notes
         .into_iter()
@@ -499,6 +547,7 @@ fn draw_recording_strip(
     next_armed: bool,
     quantize_beats: f64,
     phrase_count: usize,
+    midi_destination: &str,
 ) -> Result<(), String> {
     let status_text = match status {
         RecorderStatus::Idle => "IDLE".to_owned(),
@@ -533,18 +582,20 @@ fn draw_recording_strip(
         dim_text(),
     )?;
 
-    if next_armed {
-        draw_text(canvas, 180, 712, "NEXT PHRASE ARMED", 2, text_color())?;
+    let capture_label = if next_armed {
+        "NEXT PHRASE ARMED"
     } else {
-        draw_text(
-            canvas,
-            180,
-            712,
-            "P RECORD  N ARM NEXT  SPACE TRANSPORT  M SETTINGS",
-            2,
-            dim_text(),
-        )?;
-    }
+        "CAPTURE READY"
+    };
+    let midi_label = midi_destination.chars().take(32).collect::<String>();
+    draw_text(
+        canvas,
+        180,
+        712,
+        &format!("{capture_label}   MIDI {midi_label}"),
+        1,
+        dim_text(),
+    )?;
 
     Ok(())
 }

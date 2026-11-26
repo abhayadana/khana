@@ -1,21 +1,19 @@
 //! Role-aware performers with evolving pattern families and variants.
 //!
-//! v0.9 separates Density's high-level musical intent from the exact rhythm:
-//! Density selects a role-specific [`PatternFamily`], while continuity, age,
-//! recent pattern history, and deterministic variation select a sibling
-//! [`PatternVariant`] within that family.
-//!
-//! The four roles are Bass / Chords / Texture / Melody. Chords is genuinely
-//! polyphonic and states the selected harmony on MIDI channel 2. Melody remains
-//! phrase-generated rather than being reduced to a hit mask.
+//! v0.11 turns the four role generators into a lightweight ensemble.
+//! Chords states every semantic chord tone exactly once. Melody phrases carry
+//! rhythmic identity, varied gate lengths, and articulation. Texture uses
+//! persistent cyclic cells that may continue across bar/chord boundaries.
+//! An EnsembleContext gives Bass, Texture, and Melody soft awareness of one
+//! another for rhythmic complement, register separation, and motion scoring.
 
 use crate::music::chord::Chord;
 use crate::music::settings::TonalContext;
-use crate::music::voicing::Voicing;
+use crate::music::voicing::{MAX_VOICING_NOTES, Voicing};
 use crate::voice::{Voice, VoiceRole};
 
 const VOICE_COUNT: usize = 4;
-const MAX_NOTES_PER_VOICE: usize = 4;
+const MAX_NOTES_PER_VOICE: usize = MAX_VOICING_NOTES;
 const MAX_EVENTS_PER_UPDATE: usize = 32;
 const MAX_MELODY_STEPS: usize = 64;
 
@@ -43,13 +41,18 @@ impl ResetRule {
 /// High-level behavior region selected primarily by Density.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PatternFamily {
+    BassAnchor,
     BassFoundation,
     BassMoving,
     BassConnecting,
-    ChordsSustain,
+    ChordsLongSustain,
+    ChordsBarSustain,
+    ChordsPulse,
     ChordsComp,
     ChordsActive,
+    TextureDrone,
     TextureSparse,
+    TexturePulse,
     TextureMotion,
     TextureActive,
     MelodyMotif,
@@ -61,13 +64,18 @@ impl PatternFamily {
     /// Compact family label shown on the Performance screen.
     pub const fn label(self) -> &'static str {
         match self {
+            Self::BassAnchor => "ANCHOR",
             Self::BassFoundation => "FOUND",
             Self::BassMoving => "MOVING",
             Self::BassConnecting => "CONNECT",
-            Self::ChordsSustain => "SUSTAIN",
+            Self::ChordsLongSustain => "LONG",
+            Self::ChordsBarSustain => "BAR",
+            Self::ChordsPulse => "PULSE",
             Self::ChordsComp => "COMP",
             Self::ChordsActive => "ACTIVE",
+            Self::TextureDrone => "DRONE",
             Self::TextureSparse => "SPARSE",
+            Self::TexturePulse => "PULSE",
             Self::TextureMotion => "MOTION",
             Self::TextureActive => "ACTIVE",
             Self::MelodyMotif => "MOTIF",
@@ -81,18 +89,22 @@ impl PatternFamily {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PatternVariant {
     BassRootHold,
-    BassRootPulse,
-    BassRootOctave,
+    BassRootPedal,
     BassRootFifth,
+    BassRootOctave,
+    BassRootBounce,
     BassRootFifthOctave,
     BassBroken,
+    BassChordToneOstinato,
     BassScaleApproach,
     BassChromaticApproach,
     BassWalkingFragment,
 
-    ChordsSustain,
-    ChordsSinglePulse,
+    ChordsFourBarHold,
+    ChordsTwoBarHold,
+    ChordsOneBarHold,
     ChordsTwoPulse,
+    ChordsFourPulse,
     ChordsBackbeat,
     ChordsOffbeat,
     ChordsCharleston,
@@ -101,15 +113,18 @@ enum PatternVariant {
     ChordsSyncopatedB,
     ChordsActiveStabs,
 
+    TextureLongDrone,
+    TextureBarDrone,
     TextureIsolatedUpper,
     TextureDelayedEcho,
-    TextureChordSparkle,
-    TextureTwoNoteResponse,
+    TextureHalfPulse,
+    TextureQuarterPulse,
+    TextureThreeStepArp,
     TextureSlowArp,
-    TextureStaggeredExtensions,
+    TextureExtensionFigure,
     TextureShimmer,
     TextureRepeatingArp,
-    TextureExtensionFigure,
+    TextureRotatingThree,
 
     MelodyMotifA,
     MelodyMotifB,
@@ -122,25 +137,31 @@ enum PatternVariant {
     MelodyChromaticPhrase,
 }
 
+const BASS_ANCHOR: [PatternVariant; 2] =
+    [PatternVariant::BassRootHold, PatternVariant::BassRootPedal];
 const BASS_FOUNDATION: [PatternVariant; 3] = [
-    PatternVariant::BassRootHold,
-    PatternVariant::BassRootPulse,
+    PatternVariant::BassRootFifth,
     PatternVariant::BassRootOctave,
+    PatternVariant::BassRootBounce,
 ];
 const BASS_MOVING: [PatternVariant; 3] = [
-    PatternVariant::BassRootFifth,
     PatternVariant::BassRootFifthOctave,
     PatternVariant::BassBroken,
+    PatternVariant::BassChordToneOstinato,
 ];
 const BASS_CONNECTING: [PatternVariant; 3] = [
     PatternVariant::BassScaleApproach,
     PatternVariant::BassChromaticApproach,
     PatternVariant::BassWalkingFragment,
 ];
-const CHORDS_SUSTAIN: [PatternVariant; 3] = [
-    PatternVariant::ChordsSustain,
-    PatternVariant::ChordsSinglePulse,
+const CHORDS_LONG_SUSTAIN: [PatternVariant; 2] = [
+    PatternVariant::ChordsFourBarHold,
+    PatternVariant::ChordsTwoBarHold,
+];
+const CHORDS_BAR_SUSTAIN: [PatternVariant; 1] = [PatternVariant::ChordsOneBarHold];
+const CHORDS_PULSE: [PatternVariant; 2] = [
     PatternVariant::ChordsTwoPulse,
+    PatternVariant::ChordsFourPulse,
 ];
 const CHORDS_COMP: [PatternVariant; 4] = [
     PatternVariant::ChordsBackbeat,
@@ -153,20 +174,27 @@ const CHORDS_ACTIVE: [PatternVariant; 3] = [
     PatternVariant::ChordsSyncopatedB,
     PatternVariant::ChordsActiveStabs,
 ];
-const TEXTURE_SPARSE: [PatternVariant; 3] = [
+const TEXTURE_DRONE: [PatternVariant; 2] = [
+    PatternVariant::TextureLongDrone,
+    PatternVariant::TextureBarDrone,
+];
+const TEXTURE_SPARSE: [PatternVariant; 2] = [
     PatternVariant::TextureIsolatedUpper,
     PatternVariant::TextureDelayedEcho,
-    PatternVariant::TextureChordSparkle,
+];
+const TEXTURE_PULSE: [PatternVariant; 2] = [
+    PatternVariant::TextureHalfPulse,
+    PatternVariant::TextureQuarterPulse,
 ];
 const TEXTURE_MOTION: [PatternVariant; 3] = [
-    PatternVariant::TextureTwoNoteResponse,
+    PatternVariant::TextureThreeStepArp,
     PatternVariant::TextureSlowArp,
-    PatternVariant::TextureStaggeredExtensions,
+    PatternVariant::TextureExtensionFigure,
 ];
 const TEXTURE_ACTIVE: [PatternVariant; 3] = [
     PatternVariant::TextureShimmer,
     PatternVariant::TextureRepeatingArp,
-    PatternVariant::TextureExtensionFigure,
+    PatternVariant::TextureRotatingThree,
 ];
 const MELODY_MOTIF: [PatternVariant; 3] = [
     PatternVariant::MelodyMotifA,
@@ -233,14 +261,16 @@ struct NoteSet {
 
 impl NoteSet {
     const fn single(note: u8) -> Self {
-        Self {
-            notes: [note, 0, 0, 0],
-            len: 1,
-        }
+        let mut notes = [0_u8; MAX_NOTES_PER_VOICE];
+        notes[0] = note;
+        Self { notes, len: 1 }
     }
 
-    const fn chord(notes: [u8; 4]) -> Self {
-        Self { notes, len: 4 }
+    fn chord(voicing: Voicing) -> Self {
+        Self {
+            notes: voicing.notes,
+            len: voicing.len,
+        }
     }
 
     fn iter(&self) -> impl Iterator<Item = u8> + '_ {
@@ -279,6 +309,12 @@ struct Behavior {
     repeat: f32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextureRelationship {
+    Independent,
+    Complement,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PatternState {
     family: PatternFamily,
@@ -286,6 +322,7 @@ struct PatternState {
     previous_variant: PatternVariant,
     age_cycles: u8,
     last_cycle_index: i64,
+    last_family_boundary: i64,
     seed: u64,
 }
 
@@ -297,50 +334,67 @@ impl PatternState {
             previous_variant: variant,
             age_cycles: 0,
             last_cycle_index: i64::MIN,
+            last_family_boundary: i64::MIN,
             seed,
         }
     }
 
     fn update(
         &mut self,
-        family: PatternFamily,
-        role: VoiceRole,
+        desired_family: PatternFamily,
+        family_boundary: i64,
         cycle_index: i64,
         activity: f32,
         repeat: f32,
-    ) {
-        let family_changed = family != self.family;
-        let cycle_changed = cycle_index != self.last_cycle_index;
-        if !family_changed && !cycle_changed {
-            return;
-        }
+    ) -> bool {
+        let boundary_changed = family_boundary != self.last_family_boundary;
+        let family_changed = desired_family != self.family && boundary_changed;
 
-        let next = choose_variant(VariantRequest {
-            family,
-            role,
-            current: if family_changed {
-                None
-            } else {
-                Some(self.variant)
-            },
-            previous: self.previous_variant,
-            age_cycles: self.age_cycles,
-            cycle_index,
-            activity,
-            repeat,
-            seed: self.seed,
-        });
-
-        if next == self.variant && !family_changed {
-            self.age_cycles = self.age_cycles.saturating_add(1);
-        } else {
+        if family_changed {
             self.previous_variant = self.variant;
-            self.variant = next;
+            self.family = desired_family;
+            self.variant = choose_variant(VariantRequest {
+                family: self.family,
+                current: None,
+                previous: self.previous_variant,
+                age_cycles: 0,
+                cycle_index,
+                activity,
+                repeat,
+                seed: self.seed,
+            });
             self.age_cycles = 0;
+            self.last_cycle_index = cycle_index;
+        } else if cycle_index != self.last_cycle_index
+            || (self.family == PatternFamily::ChordsLongSustain && boundary_changed)
+        {
+            let next = choose_variant(VariantRequest {
+                family: self.family,
+                current: Some(self.variant),
+                previous: self.previous_variant,
+                age_cycles: self.age_cycles,
+                cycle_index,
+                activity,
+                repeat,
+                seed: self.seed,
+            });
+
+            if next == self.variant {
+                self.age_cycles = self.age_cycles.saturating_add(1);
+            } else {
+                self.previous_variant = self.variant;
+                self.variant = next;
+                self.age_cycles = 0;
+            }
+            self.last_cycle_index = cycle_index;
         }
 
-        self.family = family;
-        self.last_cycle_index = cycle_index;
+        self.last_family_boundary = family_boundary;
+        family_changed
+    }
+
+    fn force_next_family_boundary(&mut self) {
+        self.last_family_boundary = i64::MIN;
     }
 }
 
@@ -350,12 +404,45 @@ enum MelodyIntent {
     Skeleton(i8),
     Fill(i8),
     Neighbor(i8),
+    Suspension(i8),
+    ModalTension(i8),
     ChromaticApproach(i8),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MelodyArticulation {
+    Short,
+    Normal,
+    Legato,
+    Held,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MelodyStep {
+    intent: MelodyIntent,
+    gate_steps: u8,
+    articulation: MelodyArticulation,
+}
+
+impl MelodyStep {
+    const REST: Self = Self {
+        intent: MelodyIntent::Rest,
+        gate_steps: 0,
+        articulation: MelodyArticulation::Short,
+    };
+
+    const fn new(intent: MelodyIntent) -> Self {
+        Self {
+            intent,
+            gate_steps: 1,
+            articulation: MelodyArticulation::Normal,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct MelodyPlan {
-    steps: [MelodyIntent; MAX_MELODY_STEPS],
+    steps: [MelodyStep; MAX_MELODY_STEPS],
     len: usize,
     cycle_index: i64,
     generation: u64,
@@ -364,19 +451,23 @@ struct MelodyPlan {
 impl MelodyPlan {
     const fn empty() -> Self {
         Self {
-            steps: [MelodyIntent::Rest; MAX_MELODY_STEPS],
+            steps: [MelodyStep::REST; MAX_MELODY_STEPS],
             len: 0,
             cycle_index: i64::MIN,
             generation: 0,
         }
     }
 
-    fn intent(&self, position: usize) -> MelodyIntent {
+    fn step(&self, position: usize) -> MelodyStep {
         if self.len == 0 {
-            MelodyIntent::Rest
+            MelodyStep::REST
         } else {
             self.steps[position % self.len]
         }
+    }
+
+    fn intent(&self, position: usize) -> MelodyIntent {
+        self.step(position).intent
     }
 }
 
@@ -388,6 +479,8 @@ struct PerformerState {
     previous_note: Option<u8>,
     pending_resolution: Option<u8>,
     force_attack: bool,
+    last_attack_beat: Option<f64>,
+    motion_direction: i8,
     pattern: PatternState,
     melody_plan: MelodyPlan,
 }
@@ -401,6 +494,8 @@ impl PerformerState {
             previous_note: None,
             pending_resolution: None,
             force_attack: false,
+            last_attack_beat: None,
+            motion_direction: 0,
             pattern,
             melody_plan: MelodyPlan::empty(),
         }
@@ -415,12 +510,38 @@ pub struct PerformerSnapshot {
     pub family: PatternFamily,
 }
 
+/// Lightweight snapshot of what the other performers are doing.
+///
+/// This is intentionally advisory rather than a centralized composition engine:
+/// each role preserves its own musical identity, then uses ensemble state as a
+/// soft scoring influence.
+#[derive(Clone, Copy, Debug)]
+struct EnsembleContext {
+    active_notes: [Option<u8>; VOICE_COUNT],
+    last_attack_beat: [Option<f64>; VOICE_COUNT],
+    motion_direction: [i8; VOICE_COUNT],
+}
+
+impl EnsembleContext {
+    fn recent_attack(self, voice_index: usize, now_beat: f64, window: f64) -> bool {
+        self.last_attack_beat[voice_index]
+            .is_some_and(|beat| now_beat - beat <= window && now_beat >= beat)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FutureHarmony {
+    chord: Chord,
+    start_beat: f64,
+}
+
 /// Four independent role-aware performers sharing one active harmony.
 pub struct PerformerEngine {
     chord: Chord,
     tonal: TonalContext,
     chord_voicing: Voicing,
     chord_origin_beat: f64,
+    next_chord_target: Option<FutureHarmony>,
     enabled: bool,
     intensity: f32,
     states: [PerformerState; VOICE_COUNT],
@@ -434,22 +555,23 @@ impl PerformerEngine {
             tonal,
             chord_voicing,
             chord_origin_beat: 0.0,
+            next_chord_target: None,
             enabled: false,
             intensity: 0.0,
             states: [
                 PerformerState::new(PatternState::new(
-                    PatternFamily::BassMoving,
+                    PatternFamily::BassFoundation,
                     PatternVariant::BassRootFifth,
                     0xB455_0001,
                 )),
                 PerformerState::new(PatternState::new(
-                    PatternFamily::ChordsComp,
-                    PatternVariant::ChordsCharleston,
+                    PatternFamily::ChordsBarSustain,
+                    PatternVariant::ChordsOneBarHold,
                     0xC40D_0002,
                 )),
                 PerformerState::new(PatternState::new(
-                    PatternFamily::TextureMotion,
-                    PatternVariant::TextureDelayedEcho,
+                    PatternFamily::TexturePulse,
+                    PatternVariant::TextureHalfPulse,
                     0x7E87_0003,
                 )),
                 PerformerState::new(PatternState::new(
@@ -476,14 +598,21 @@ impl PerformerEngine {
         self.tonal = tonal;
         self.chord_voicing = chord_voicing;
         self.chord_origin_beat = now_beat;
+        self.next_chord_target = None;
 
+        // Keep already-sounding notes owned so the next scheduled attack or
+        // gate release can emit the correct Note Off. This is especially
+        // important for Texture/Melody continuity across harmony changes.
+        // Pending attacks were calculated against the old harmony, so cancel
+        // those before remapping future events to the new chord.
         for state in &mut self.states {
-            state.sounding = None;
             state.pending = None;
             state.pending_resolution = None;
         }
 
         self.states[0].last_step_key = None;
+        self.states[0].pattern.force_next_family_boundary();
+        self.states[1].pattern.force_next_family_boundary();
         self.states[0].force_attack = true;
         self.states[1].force_attack = true;
     }
@@ -492,6 +621,17 @@ impl PerformerEngine {
     pub fn update_anchor(&mut self, tonal: TonalContext, chord_voicing: Voicing) {
         self.tonal = tonal;
         self.chord_voicing = chord_voicing;
+    }
+
+    /// Supplies a future harmony only when it is genuinely known.
+    ///
+    /// Live improvisation normally leaves this `None`; semantic Phrase
+    /// playback can expose its next event so CONNECT Bass patterns may prepare
+    /// a destination without inventing one.
+    pub fn set_next_chord_target(&mut self, chord: Option<Chord>, start_beat: Option<f64>) {
+        self.next_chord_target = chord
+            .zip(start_beat)
+            .map(|(chord, start_beat)| FutureHarmony { chord, start_beat });
     }
 
     /// Enables performer generation at the current transport position.
@@ -559,28 +699,66 @@ impl PerformerEngine {
             return batch;
         }
 
-        for (index, voice) in voices.iter().copied().enumerate() {
+        // First settle every already-scheduled event so EnsembleContext never
+        // observes a note that should have been released this frame.
+        for index in 0..VOICE_COUNT {
             self.release_due_notes(index, now_beat, &mut batch);
             self.start_due_attack(index, now_beat, &mut batch);
+        }
 
+        // Melody is evaluated before Texture so complementary Texture patterns
+        // can respond to a Melody attack on the same transport frame.
+        for index in [0_usize, 1, 3, 2] {
+            let voice = voices[index];
             let role = voice.role;
+
+            if voice.parameters.density <= 0.01 {
+                self.mute_voice(index, &mut batch);
+                continue;
+            }
+
             let behavior = behavior_for(role, voice.parameters.density, self.intensity);
-            let family = family_for(role, behavior.activity);
-            let timing = step_timing(
+            let desired_family = family_for(role, behavior.activity);
+            let family_boundary = family_boundary_index(role, now_beat, beats_per_bar);
+
+            let active_family = self.states[index].pattern.family;
+            let mut timing = step_timing(
                 role,
-                family,
+                active_family,
                 now_beat,
                 beats_per_bar,
                 self.chord_origin_beat,
             );
 
-            self.states[index].pattern.update(
-                family,
-                role,
+            let family_changed = self.states[index].pattern.update(
+                desired_family,
+                family_boundary,
                 timing.cycle_index,
                 behavior.activity,
                 behavior.repeat,
             );
+
+            if family_changed {
+                self.stop_sounding_now(index, &mut batch);
+                self.states[index].pending = None;
+                timing = step_timing(
+                    role,
+                    self.states[index].pattern.family,
+                    now_beat,
+                    beats_per_bar,
+                    self.chord_origin_beat,
+                );
+                self.states[index].pattern.last_cycle_index = timing.cycle_index;
+            } else if self.states[index].pattern.family != active_family {
+                timing = step_timing(
+                    role,
+                    self.states[index].pattern.family,
+                    now_beat,
+                    beats_per_bar,
+                    self.chord_origin_beat,
+                );
+            }
+
             let variant = self.states[index].pattern.variant;
 
             if self.states[index].last_step_key == Some(timing.step_key)
@@ -594,19 +772,25 @@ impl PerformerEngine {
                 self.ensure_melody_plan(timing, voice.parameters.color, behavior, variant);
             }
 
+            let ensemble = self.ensemble_context();
             let forced = self.states[index].force_attack;
             self.states[index].force_attack = false;
             if behavior.activity <= 0.01
-                || (!forced && !self.should_attack(index, role, variant, timing, behavior))
+                || (!forced
+                    && !self
+                        .should_attack(index, role, variant, timing, behavior, ensemble, now_beat))
             {
                 continue;
             }
 
             let notes = match role {
-                VoiceRole::Chords => NoteSet::chord(self.chord_voicing.notes),
-                VoiceRole::Melody => {
-                    NoteSet::single(self.choose_melody_note(index, timing.position, voice))
-                }
+                VoiceRole::Chords => NoteSet::chord(self.chord_voicing),
+                VoiceRole::Melody => NoteSet::single(self.choose_melody_note(
+                    index,
+                    timing.position,
+                    voice,
+                    ensemble,
+                )),
                 VoiceRole::Bass | VoiceRole::Texture => {
                     NoteSet::single(choose_role_note(RoleNoteRequest {
                         voice,
@@ -616,6 +800,9 @@ impl PerformerEngine {
                         position: timing.position,
                         chord_voicing: self.chord_voicing,
                         previous_note: self.states[index].previous_note,
+                        next_chord: self.next_chord_target,
+                        now_beat,
+                        ensemble,
                     }))
                 }
             };
@@ -626,7 +813,14 @@ impl PerformerEngine {
                 timing.position,
                 self.intensity,
             );
-            let gate = gate_beats(role, variant, timing, behavior.space, self.intensity);
+            let gate = if role == VoiceRole::Melody {
+                melody_gate_beats(
+                    self.states[index].melody_plan.step(timing.position),
+                    timing.step_length,
+                )
+            } else {
+                gate_beats(role, variant, timing, behavior.space, self.intensity)
+            };
             let start = now_beat + timing_offset_beats(role);
 
             self.states[index].pending = Some(PendingAttack {
@@ -639,6 +833,41 @@ impl PerformerEngine {
         }
 
         batch
+    }
+
+    fn ensemble_context(&self) -> EnsembleContext {
+        EnsembleContext {
+            active_notes: std::array::from_fn(|index| {
+                self.states[index].sounding.and_then(|sounding| {
+                    if index == 1 {
+                        sounding.notes.iter().last()
+                    } else {
+                        sounding.notes.iter().next()
+                    }
+                })
+            }),
+            last_attack_beat: std::array::from_fn(|index| self.states[index].last_attack_beat),
+            motion_direction: std::array::from_fn(|index| self.states[index].motion_direction),
+        }
+    }
+
+    fn stop_sounding_now(&mut self, index: usize, batch: &mut VoiceEventBatch) {
+        if let Some(active) = self.states[index].sounding.take() {
+            for note in active.notes.iter() {
+                batch.push(VoiceEvent::NoteOff {
+                    voice_index: index,
+                    note,
+                });
+            }
+        }
+    }
+
+    fn mute_voice(&mut self, index: usize, batch: &mut VoiceEventBatch) {
+        self.states[index].pending = None;
+        self.states[index].pending_resolution = None;
+        self.states[index].force_attack = false;
+
+        self.stop_sounding_now(index, batch);
     }
 
     fn release_due_notes(&mut self, index: usize, now_beat: f64, batch: &mut VoiceEventBatch) {
@@ -684,8 +913,18 @@ impl PerformerEngine {
             notes: pending.notes,
             off_beat: pending.start_beat + pending.gate_beats,
         });
+        self.states[index].last_attack_beat = Some(pending.start_beat);
         if pending.notes.len == 1 {
-            self.states[index].previous_note = Some(pending.notes.notes[0]);
+            let next_note = pending.notes.notes[0];
+            self.states[index].motion_direction =
+                self.states[index].previous_note.map_or(0, |previous| {
+                    match next_note.cmp(&previous) {
+                        std::cmp::Ordering::Less => -1,
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 1,
+                    }
+                });
+            self.states[index].previous_note = Some(next_note);
         }
         self.states[index].pending = None;
     }
@@ -697,6 +936,8 @@ impl PerformerEngine {
         variant: PatternVariant,
         timing: StepTiming,
         behavior: Behavior,
+        ensemble: EnsembleContext,
+        now_beat: f64,
     ) -> bool {
         if role == VoiceRole::Melody {
             return self.states[index].melody_plan.intent(timing.position) != MelodyIntent::Rest;
@@ -707,20 +948,23 @@ impl PerformerEngine {
             return false;
         }
 
-        // Bass and Chords play their selected pattern coherently. Texture is
-        // intentionally more porous and can omit deterministic sibling hits.
         if role != VoiceRole::Texture {
             return true;
         }
 
-        let repeat_group = repeat_group(timing.cycle_index, behavior.repeat);
-        let chance = deterministic_unit(
-            role_seed(role)
-                ^ (repeat_group as u64).wrapping_mul(0x9E37_79B9)
-                ^ (timing.position as u64).wrapping_mul(0x85EB_CA6B),
-        );
-        let keep = (0.52 + behavior.activity * 0.62 - behavior.space * 0.32).clamp(0.15, 1.0);
-        chance <= keep
+        // Texture rhythm is intentionally regular in v0.11. Complementary
+        // patterns create space by relationship rule rather than random holes.
+        if texture_relationship(variant, behavior) == TextureRelationship::Complement
+            && ensemble.recent_attack(3, now_beat, 0.125)
+            && !matches!(
+                variant,
+                PatternVariant::TextureLongDrone | PatternVariant::TextureBarDrone
+            )
+        {
+            return false;
+        }
+
+        true
     }
 
     fn ensure_melody_plan(
@@ -748,7 +992,13 @@ impl PerformerEngine {
         );
     }
 
-    fn choose_melody_note(&mut self, index: usize, position: usize, voice: Voice) -> u8 {
+    fn choose_melody_note(
+        &mut self,
+        index: usize,
+        position: usize,
+        voice: Voice,
+        ensemble: EnsembleContext,
+    ) -> u8 {
         if let Some(resolution) = self.states[index].pending_resolution.take() {
             return resolution;
         }
@@ -759,10 +1009,11 @@ impl PerformerEngine {
                 MelodyIntent::Skeleton(contour),
                 self.chord,
                 self.tonal,
-                self.chord_voicing.notes[3],
+                self.chord_voicing.top_note(),
                 self.states[index].previous_note,
                 voice.parameters.spread,
                 0.45,
+                ensemble,
             );
             self.states[index].pending_resolution = Some(resolution);
             return chromatic_approach_note(resolution, self.chord, self.tonal);
@@ -772,10 +1023,11 @@ impl PerformerEngine {
             intent,
             self.chord,
             self.tonal,
-            self.chord_voicing.notes[3],
+            self.chord_voicing.top_note(),
             self.states[index].previous_note,
             voice.parameters.spread,
             voice.parameters.color,
+            ensemble,
         )
     }
 }
@@ -798,17 +1050,25 @@ struct RoleNoteRequest {
     position: usize,
     chord_voicing: Voicing,
     previous_note: Option<u8>,
+    next_chord: Option<FutureHarmony>,
+    now_beat: f64,
+    ensemble: EnsembleContext,
 }
 
 fn variants_for(family: PatternFamily) -> &'static [PatternVariant] {
     match family {
+        PatternFamily::BassAnchor => &BASS_ANCHOR,
         PatternFamily::BassFoundation => &BASS_FOUNDATION,
         PatternFamily::BassMoving => &BASS_MOVING,
         PatternFamily::BassConnecting => &BASS_CONNECTING,
-        PatternFamily::ChordsSustain => &CHORDS_SUSTAIN,
+        PatternFamily::ChordsLongSustain => &CHORDS_LONG_SUSTAIN,
+        PatternFamily::ChordsBarSustain => &CHORDS_BAR_SUSTAIN,
+        PatternFamily::ChordsPulse => &CHORDS_PULSE,
         PatternFamily::ChordsComp => &CHORDS_COMP,
         PatternFamily::ChordsActive => &CHORDS_ACTIVE,
+        PatternFamily::TextureDrone => &TEXTURE_DRONE,
         PatternFamily::TextureSparse => &TEXTURE_SPARSE,
+        PatternFamily::TexturePulse => &TEXTURE_PULSE,
         PatternFamily::TextureMotion => &TEXTURE_MOTION,
         PatternFamily::TextureActive => &TEXTURE_ACTIVE,
         PatternFamily::MelodyMotif => &MELODY_MOTIF,
@@ -820,7 +1080,6 @@ fn variants_for(family: PatternFamily) -> &'static [PatternVariant] {
 #[derive(Clone, Copy, Debug)]
 struct VariantRequest {
     family: PatternFamily,
-    role: VoiceRole,
     current: Option<PatternVariant>,
     previous: PatternVariant,
     age_cycles: u8,
@@ -832,7 +1091,7 @@ struct VariantRequest {
 
 fn choose_variant(request: VariantRequest) -> PatternVariant {
     let candidates = variants_for(request.family);
-    let local = family_local_activity(request.role, request.activity);
+    let local = family_local_activity(request.family, request.activity);
     let target = local * (candidates.len().saturating_sub(1)) as f32;
     let mut best = candidates[0];
     let mut best_score = f32::MIN;
@@ -869,16 +1128,21 @@ fn choose_variant(request: VariantRequest) -> PatternVariant {
 
 fn family_for(role: VoiceRole, activity: f32) -> PatternFamily {
     match role {
-        VoiceRole::Bass if activity < 0.32 => PatternFamily::BassFoundation,
-        VoiceRole::Bass if activity < 0.72 => PatternFamily::BassMoving,
+        VoiceRole::Bass if activity < 0.16 => PatternFamily::BassAnchor,
+        VoiceRole::Bass if activity < 0.42 => PatternFamily::BassFoundation,
+        VoiceRole::Bass if activity < 0.78 => PatternFamily::BassMoving,
         VoiceRole::Bass => PatternFamily::BassConnecting,
 
-        VoiceRole::Chords if activity < 0.30 => PatternFamily::ChordsSustain,
-        VoiceRole::Chords if activity < 0.75 => PatternFamily::ChordsComp,
+        VoiceRole::Chords if activity < 0.14 => PatternFamily::ChordsLongSustain,
+        VoiceRole::Chords if activity < 0.34 => PatternFamily::ChordsBarSustain,
+        VoiceRole::Chords if activity < 0.58 => PatternFamily::ChordsPulse,
+        VoiceRole::Chords if activity < 0.82 => PatternFamily::ChordsComp,
         VoiceRole::Chords => PatternFamily::ChordsActive,
 
-        VoiceRole::Texture if activity < 0.38 => PatternFamily::TextureSparse,
-        VoiceRole::Texture if activity < 0.75 => PatternFamily::TextureMotion,
+        VoiceRole::Texture if activity < 0.12 => PatternFamily::TextureDrone,
+        VoiceRole::Texture if activity < 0.30 => PatternFamily::TextureSparse,
+        VoiceRole::Texture if activity < 0.52 => PatternFamily::TexturePulse,
+        VoiceRole::Texture if activity < 0.78 => PatternFamily::TextureMotion,
         VoiceRole::Texture => PatternFamily::TextureActive,
 
         VoiceRole::Melody if activity < 0.30 => PatternFamily::MelodyMotif,
@@ -887,23 +1151,36 @@ fn family_for(role: VoiceRole, activity: f32) -> PatternFamily {
     }
 }
 
-fn family_local_activity(role: VoiceRole, activity: f32) -> f32 {
-    let (low, high) = match family_for(role, activity) {
-        PatternFamily::BassFoundation => (0.0, 0.32),
-        PatternFamily::BassMoving => (0.32, 0.72),
-        PatternFamily::BassConnecting => (0.72, 1.0),
-        PatternFamily::ChordsSustain => (0.0, 0.30),
-        PatternFamily::ChordsComp => (0.30, 0.75),
-        PatternFamily::ChordsActive => (0.75, 1.0),
-        PatternFamily::TextureSparse => (0.0, 0.38),
-        PatternFamily::TextureMotion => (0.38, 0.75),
-        PatternFamily::TextureActive => (0.75, 1.0),
+fn family_local_activity(family: PatternFamily, activity: f32) -> f32 {
+    let (low, high) = match family {
+        PatternFamily::BassAnchor => (0.0, 0.16),
+        PatternFamily::BassFoundation => (0.16, 0.42),
+        PatternFamily::BassMoving => (0.42, 0.78),
+        PatternFamily::BassConnecting => (0.78, 1.0),
+        PatternFamily::ChordsLongSustain => (0.0, 0.14),
+        PatternFamily::ChordsBarSustain => (0.14, 0.34),
+        PatternFamily::ChordsPulse => (0.34, 0.58),
+        PatternFamily::ChordsComp => (0.58, 0.82),
+        PatternFamily::ChordsActive => (0.82, 1.0),
+        PatternFamily::TextureDrone => (0.0, 0.12),
+        PatternFamily::TextureSparse => (0.12, 0.30),
+        PatternFamily::TexturePulse => (0.30, 0.52),
+        PatternFamily::TextureMotion => (0.52, 0.78),
+        PatternFamily::TextureActive => (0.78, 1.0),
         PatternFamily::MelodyMotif => (0.0, 0.30),
         PatternFamily::MelodyPhrase => (0.30, 0.76),
         PatternFamily::MelodyOrnament => (0.76, 1.0),
     };
 
     ((activity - low) / (high - low)).clamp(0.0, 1.0)
+}
+
+fn family_boundary_index(role: VoiceRole, now_beat: f64, beats_per_bar: f64) -> i64 {
+    let bar = beats_per_bar.max(0.25);
+    match role {
+        VoiceRole::Bass | VoiceRole::Chords | VoiceRole::Texture => (now_beat / bar).floor() as i64,
+        VoiceRole::Melody => (now_beat / (bar * 2.0)).floor() as i64,
+    }
 }
 
 fn step_timing(
@@ -931,23 +1208,29 @@ fn step_timing(
             }
         }
         VoiceRole::Chords => {
-            let steps = cycle_steps(safe_bar, step_length);
-            let bar_position = now_beat.rem_euclid(safe_bar);
-            StepTiming {
-                step_key: absolute_step,
-                position: ((bar_position / step_length).floor() as usize).min(steps - 1),
-                steps_per_cycle: steps,
-                step_length,
-                cycle_index: (now_beat / safe_bar).floor() as i64,
-            }
-        }
-        VoiceRole::Texture => {
-            let cycle_beats = safe_bar * 2.0;
+            let cycle_beats = if family == PatternFamily::ChordsLongSustain {
+                safe_bar * 4.0
+            } else {
+                safe_bar
+            };
             let steps = cycle_steps(cycle_beats, step_length);
             let cycle_position = now_beat.rem_euclid(cycle_beats);
             StepTiming {
                 step_key: absolute_step,
                 position: ((cycle_position / step_length).floor() as usize).min(steps - 1),
+                steps_per_cycle: steps,
+                step_length,
+                cycle_index: (now_beat / cycle_beats).floor() as i64,
+            }
+        }
+        VoiceRole::Texture => {
+            let cycle_beats = safe_bar * 2.0;
+            let steps = cycle_steps(cycle_beats, step_length);
+            StepTiming {
+                step_key: absolute_step,
+                // Use absolute phase so odd-length Texture cells continue
+                // through bar and harmony boundaries instead of restarting.
+                position: absolute_step.rem_euclid(96) as usize,
                 steps_per_cycle: steps,
                 step_length,
                 cycle_index: (now_beat / cycle_beats).floor() as i64,
@@ -971,6 +1254,7 @@ fn step_timing(
 fn step_length(family: PatternFamily) -> f64 {
     match family {
         PatternFamily::TextureActive | PatternFamily::MelodyOrnament => 0.25,
+        PatternFamily::TextureDrone => 0.5,
         _ => 0.5,
     }
 }
@@ -1023,22 +1307,24 @@ fn pattern_hit(variant: PatternVariant, position: usize, steps: usize) -> bool {
 
     match variant {
         PatternVariant::BassRootHold => position == 0,
-        PatternVariant::BassRootPulse => position.is_multiple_of(2),
-        PatternVariant::BassRootOctave => position == 0 || position == half,
+        PatternVariant::BassRootPedal => position == 0,
         PatternVariant::BassRootFifth => position == 0 || position == half,
+        PatternVariant::BassRootOctave => position == 0 || position == half,
+        PatternVariant::BassRootBounce => matches!(position % 8, 0 | 2 | 4 | 6),
         PatternVariant::BassRootFifthOctave => {
             position == 0 || position == quarter || position == half
         }
         PatternVariant::BassBroken => matches!(position % 8, 0 | 3 | 5 | 7),
+        PatternVariant::BassChordToneOstinato => matches!(position % 8, 0 | 2 | 4 | 6),
         PatternVariant::BassScaleApproach => matches!(position % 8, 0 | 4 | 6 | 7),
-        PatternVariant::BassChromaticApproach => {
-            matches!(position % 8, 0 | 4 | 7)
-        }
+        PatternVariant::BassChromaticApproach => matches!(position % 8, 0 | 4 | 7),
         PatternVariant::BassWalkingFragment => true,
 
-        PatternVariant::ChordsSustain => position == 0,
-        PatternVariant::ChordsSinglePulse => position == 0,
+        PatternVariant::ChordsFourBarHold => position == 0,
+        PatternVariant::ChordsTwoBarHold => position == 0 || position == half,
+        PatternVariant::ChordsOneBarHold => position == 0,
         PatternVariant::ChordsTwoPulse => position == 0 || position == half,
+        PatternVariant::ChordsFourPulse => position.is_multiple_of(2),
         PatternVariant::ChordsBackbeat => position == quarter || position == quarter * 3,
         PatternVariant::ChordsOffbeat => !position.is_multiple_of(2),
         PatternVariant::ChordsCharleston => position == 0 || position == quarter + 1,
@@ -1047,17 +1333,19 @@ fn pattern_hit(variant: PatternVariant, position: usize, steps: usize) -> bool {
         PatternVariant::ChordsSyncopatedB => matches!(position % 8, 1 | 4 | 7),
         PatternVariant::ChordsActiveStabs => matches!(position % 8, 0 | 2 | 3 | 5 | 7),
 
-        PatternVariant::TextureIsolatedUpper => position == 0,
-        PatternVariant::TextureDelayedEcho => position == quarter || position == half + quarter,
-        PatternVariant::TextureChordSparkle => position == 1,
-        PatternVariant::TextureTwoNoteResponse => matches!(position % 8, 3 | 7),
+        PatternVariant::TextureLongDrone => position.is_multiple_of(steps.max(1)),
+        PatternVariant::TextureBarDrone => position.is_multiple_of((steps / 2).max(1)),
+        PatternVariant::TextureIsolatedUpper => position.is_multiple_of(steps.max(1)),
+        PatternVariant::TextureDelayedEcho => matches!(position % 8, 3 | 7),
+        PatternVariant::TextureHalfPulse => position.is_multiple_of(4),
+        PatternVariant::TextureQuarterPulse => position.is_multiple_of(2),
+        PatternVariant::TextureThreeStepArp => true,
         PatternVariant::TextureSlowArp => position.is_multiple_of(2),
-        PatternVariant::TextureStaggeredExtensions => matches!(position % 8, 1 | 4 | 6),
-        PatternVariant::TextureShimmer => position.is_multiple_of(2),
-        PatternVariant::TextureRepeatingArp => position % 3 != 2,
         PatternVariant::TextureExtensionFigure => matches!(position % 8, 0 | 3 | 5 | 7),
+        PatternVariant::TextureShimmer => position.is_multiple_of(2),
+        PatternVariant::TextureRepeatingArp => position % 4 != 3,
+        PatternVariant::TextureRotatingThree => true,
 
-        // Melody rhythm comes from the phrase planner.
         PatternVariant::MelodyMotifA
         | PatternVariant::MelodyMotifB
         | PatternVariant::MelodySparseSkeleton
@@ -1070,22 +1358,17 @@ fn pattern_hit(variant: PatternVariant, position: usize, steps: usize) -> bool {
     }
 }
 
-fn repeat_group(cycle_index: i64, repeat: f32) -> i64 {
-    if repeat >= 0.72 {
-        cycle_index.div_euclid(2)
-    } else if repeat >= 0.48 {
-        cycle_index
+fn texture_relationship(variant: PatternVariant, behavior: Behavior) -> TextureRelationship {
+    if matches!(
+        variant,
+        PatternVariant::TextureDelayedEcho
+            | PatternVariant::TextureExtensionFigure
+            | PatternVariant::TextureRotatingThree
+    ) || behavior.space >= 0.62
+    {
+        TextureRelationship::Complement
     } else {
-        cycle_index.wrapping_mul(3)
-    }
-}
-
-fn role_seed(role: VoiceRole) -> u64 {
-    match role {
-        VoiceRole::Bass => 0xB455_0001,
-        VoiceRole::Chords => 0xC40D_0002,
-        VoiceRole::Texture => 0x7E87_0003,
-        VoiceRole::Melody => 0x4E10_0004,
+        TextureRelationship::Independent
     }
 }
 
@@ -1196,7 +1479,7 @@ fn role_note_pool(
             }
         }
         VoiceRole::Chords => {
-            // Chords uses the dedicated four-note voicing rather than a pool.
+            // Chords uses the complete semantic-chord voicing rather than a pool.
         }
     }
 
@@ -1218,9 +1501,9 @@ fn choose_role_note(request: RoleNoteRequest) -> u8 {
     let spread = request.voice.parameters.spread.clamp(0.0, 1.0);
     let target = match role {
         VoiceRole::Bass => 36.0 + spread * 8.0,
-        VoiceRole::Texture => f32::from(request.chord_voicing.notes[3]) + 3.0 + spread * 10.0,
-        VoiceRole::Melody => f32::from(request.chord_voicing.notes[3]) + 5.0 + spread * 12.0,
-        VoiceRole::Chords => f32::from(request.chord_voicing.notes[1]),
+        VoiceRole::Texture => f32::from(request.chord_voicing.top_note()) + 3.0 + spread * 10.0,
+        VoiceRole::Melody => f32::from(request.chord_voicing.top_note()) + 5.0 + spread * 12.0,
+        VoiceRole::Chords => f32::from(request.chord_voicing.note(1)),
     };
     let preferred_index = pattern_note_offset(request.variant, request.position);
     let preferred = pool.get(preferred_index);
@@ -1236,6 +1519,9 @@ fn choose_role_note(request: RoleNoteRequest) -> u8 {
         target,
         request.previous_note,
         movement_weight,
+        role,
+        request.voice.parameters.color,
+        request.ensemble,
     );
 
     if matches!(request.variant, PatternVariant::BassRootOctave) && request.position > 0 {
@@ -1244,8 +1530,28 @@ fn choose_role_note(request: RoleNoteRequest) -> u8 {
     if matches!(request.variant, PatternVariant::BassRootFifthOctave) && request.position >= 4 {
         note = note.saturating_add(12).min(88);
     }
-    if matches!(request.variant, PatternVariant::BassChromaticApproach) && request.position % 8 == 7
+    if let Some(future) = request.next_chord
+        && future.start_beat >= request.now_beat
+        && future.start_beat - request.now_beat <= 1.0
+        && matches!(
+            request.variant,
+            PatternVariant::BassScaleApproach
+                | PatternVariant::BassChromaticApproach
+                | PatternVariant::BassWalkingFragment
+        )
+        && request.position % 8 == 7
     {
+        let destination = nearest_pitch_class_near(future.chord.root.value(), target as u8);
+        note = if matches!(request.variant, PatternVariant::BassChromaticApproach) {
+            destination.saturating_sub(1).max(24)
+        } else {
+            diatonic_approach_note(destination, request.tonal, request.previous_note)
+        };
+    } else if matches!(request.variant, PatternVariant::BassChromaticApproach)
+        && request.position % 8 == 7
+    {
+        // With no known future chord, CONNECT remains local to the current
+        // harmony rather than fabricating a destination.
         let root_target = nearest_pitch_class_near(request.chord.root.value(), target as u8);
         note = root_target.saturating_sub(1).max(24);
     }
@@ -1253,13 +1559,53 @@ fn choose_role_note(request: RoleNoteRequest) -> u8 {
     note
 }
 
+fn diatonic_approach_note(destination: u8, tonal: TonalContext, previous_note: Option<u8>) -> u8 {
+    let mut best = destination.saturating_sub(2).max(24);
+    let mut best_score = f32::MAX;
+
+    for candidate in 24_u8..=88 {
+        if candidate == destination {
+            continue;
+        }
+        let in_scale = tonal
+            .mode
+            .intervals()
+            .iter()
+            .any(|interval| tonal.tonic.transpose(*interval).value() == candidate % 12);
+        if !in_scale {
+            continue;
+        }
+
+        let destination_distance = f32::from(candidate.abs_diff(destination));
+        if destination_distance > 4.0 {
+            continue;
+        }
+        let movement = previous_note.map_or(0.0, |previous| {
+            f32::from(candidate.abs_diff(previous)) * 0.25
+        });
+        let score = destination_distance + movement;
+        if score < best_score {
+            best = candidate;
+            best_score = score;
+        }
+    }
+
+    best
+}
+
 fn pattern_note_offset(variant: PatternVariant, position: usize) -> usize {
     match variant {
-        PatternVariant::BassRootHold
-        | PatternVariant::BassRootPulse
-        | PatternVariant::BassRootOctave => 0,
+        PatternVariant::BassRootHold | PatternVariant::BassRootPedal => 0,
         PatternVariant::BassRootFifth => {
             if position == 0 {
+                0
+            } else {
+                1
+            }
+        }
+        PatternVariant::BassRootOctave => 0,
+        PatternVariant::BassRootBounce => {
+            if position.is_multiple_of(4) {
                 0
             } else {
                 1
@@ -1271,15 +1617,17 @@ fn pattern_note_offset(variant: PatternVariant, position: usize) -> usize {
             _ => 0,
         },
         PatternVariant::BassBroken
+        | PatternVariant::BassChordToneOstinato
         | PatternVariant::BassScaleApproach
         | PatternVariant::BassWalkingFragment => position / 2,
         PatternVariant::BassChromaticApproach => 0,
-        PatternVariant::TextureIsolatedUpper | PatternVariant::TextureChordSparkle => 0,
-        PatternVariant::TextureDelayedEcho | PatternVariant::TextureTwoNoteResponse => {
-            position / 2 + 1
-        }
+        PatternVariant::TextureLongDrone
+        | PatternVariant::TextureBarDrone
+        | PatternVariant::TextureIsolatedUpper => 0,
+        PatternVariant::TextureDelayedEcho => position / 2 + 1,
+        PatternVariant::TextureHalfPulse | PatternVariant::TextureQuarterPulse => position / 2,
+        PatternVariant::TextureThreeStepArp | PatternVariant::TextureRotatingThree => position % 3,
         PatternVariant::TextureSlowArp
-        | PatternVariant::TextureStaggeredExtensions
         | PatternVariant::TextureShimmer
         | PatternVariant::TextureRepeatingArp
         | PatternVariant::TextureExtensionFigure => position + 1,
@@ -1309,6 +1657,9 @@ fn nearest_allowed_note(
     target: f32,
     previous_note: Option<u8>,
     movement_weight: f32,
+    role: VoiceRole,
+    color: f32,
+    ensemble: EnsembleContext,
 ) -> u8 {
     let mut best_note = target.round().clamp(24.0, 100.0) as u8;
     let mut best_score = f32::MAX;
@@ -1326,13 +1677,97 @@ fn nearest_allowed_note(
         } else {
             3.5
         };
-        let score = register_cost + movement_cost + preference_cost;
+        let ensemble_cost = counterpoint_cost(note, previous_note, role, color, ensemble);
+        let score = register_cost + movement_cost + preference_cost + ensemble_cost;
         if score < best_score {
             best_score = score;
             best_note = note;
         }
     }
     best_note
+}
+
+fn counterpoint_cost(
+    note: u8,
+    previous_note: Option<u8>,
+    role: VoiceRole,
+    color: f32,
+    ensemble: EnsembleContext,
+) -> f32 {
+    let other_index = match role {
+        VoiceRole::Texture => 3,
+        VoiceRole::Melody => 2,
+        VoiceRole::Bass => 3,
+        VoiceRole::Chords => return 0.0,
+    };
+    let Some(other) = ensemble.active_notes[other_index] else {
+        return 0.0;
+    };
+
+    let strength = match role {
+        VoiceRole::Texture => 1.0,
+        VoiceRole::Melody => 0.82,
+        VoiceRole::Bass => 0.42,
+        VoiceRole::Chords => 0.0,
+    };
+    let color = color.clamp(0.0, 1.0);
+    let absolute_distance = note.abs_diff(other);
+    let raw_pc_interval = (note % 12).abs_diff(other % 12);
+    let interval_class = raw_pc_interval.min(12_u8.saturating_sub(raw_pc_interval));
+
+    let mut cost = 0.0;
+
+    // Same-register collisions are the strongest generic avoidance rule.
+    if absolute_distance <= 2 {
+        cost += (8.0 - color * 4.0) * strength;
+    }
+
+    // Dissonance remains available as Color increases; it is discouraged,
+    // not prohibited.
+    cost += match interval_class {
+        0 => (2.2 - color * 1.5) * strength,
+        1 => (4.5 - color * 3.8) * strength,
+        2 => (2.2 - color * 1.8) * strength,
+        6 => (2.8 - color * 2.2) * strength,
+        _ => 0.0,
+    };
+
+    if let Some(previous) = previous_note {
+        let candidate_motion = match note.cmp(&previous) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        };
+        let other_motion = ensemble.motion_direction[other_index];
+
+        if candidate_motion != 0 && other_motion != 0 {
+            if candidate_motion == -other_motion {
+                cost -= 1.1 * strength;
+            } else if candidate_motion == other_motion {
+                cost += 0.35 * strength;
+
+                // Repeated exposed perfect parallel motion gets a modest
+                // penalty, never a hard classical prohibition.
+                if matches!(interval_class, 0 | 5) {
+                    cost += 0.8 * strength;
+                }
+            }
+        }
+    }
+
+    cost
+}
+
+fn melody_cadence_position(len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+
+    // Leave roughly one quarter-note beat after the cadence so a held arrival
+    // is audible before the next two-bar phrase begins. MelodyOrnament uses a
+    // sixteenth-note grid; the other Melody families use eighth notes.
+    let trailing_steps = if len >= 24 { 4 } else { 2 };
+    len.saturating_sub(trailing_steps).min(len - 1)
 }
 
 fn generate_melody_plan(
@@ -1358,15 +1793,20 @@ fn generate_melody_plan(
         let mut repeated = previous;
         repeated.cycle_index = cycle_index;
         repeated.generation = previous.generation.wrapping_add(1);
+
+        // A′ variation: preserve rhythm/gates and alter one non-structural
+        // melodic intent instead of regenerating the whole phrase.
         let variation = ((cycle_index.unsigned_abs() as usize * 5) + 3) % len;
-        if matches!(repeated.steps[variation], MelodyIntent::Fill(_)) {
-            repeated.steps[variation] = MelodyIntent::Neighbor(1);
+        if matches!(repeated.steps[variation].intent, MelodyIntent::Fill(_)) {
+            repeated.steps[variation].intent = MelodyIntent::Neighbor(1);
+            repeated.steps[variation].articulation = MelodyArticulation::Short;
+            repeated.steps[variation].gate_steps = 1;
         }
         return repeated;
     }
 
     let mut plan = MelodyPlan {
-        steps: [MelodyIntent::Rest; MAX_MELODY_STEPS],
+        steps: [MelodyStep::REST; MAX_MELODY_STEPS],
         len,
         cycle_index,
         generation: previous.generation.wrapping_add(1),
@@ -1376,7 +1816,7 @@ fn generate_melody_plan(
     let half = (len / 2).min(len - 1);
     let peak = ((len * 5) / 8).min(len - 1);
     let three_quarter = ((len * 3) / 4).min(len - 1);
-    let cadence = len - 1;
+    let cadence = melody_cadence_position(len);
     let skeleton = melody_skeleton(variant);
 
     for (position, contour) in [
@@ -1387,55 +1827,224 @@ fn generate_melody_plan(
         (three_quarter, skeleton[4]),
         (cadence, skeleton[5]),
     ] {
-        plan.steps[position] = MelodyIntent::Skeleton(contour);
+        plan.steps[position] = MelodyStep::new(MelodyIntent::Skeleton(contour));
     }
 
     let variant_fill = match variant {
-        PatternVariant::MelodySparseSkeleton => -0.28,
+        PatternVariant::MelodySparseSkeleton => -0.32,
         PatternVariant::MelodyMotifA | PatternVariant::MelodyMotifB => -0.16,
         PatternVariant::MelodyDevelopedPhrase
         | PatternVariant::MelodyMotifVariation
         | PatternVariant::MelodyAnsweringPhrase => 0.0,
-        PatternVariant::MelodyOrnamentedPhrase => 0.12,
-        PatternVariant::MelodyPassingDense => 0.22,
+        PatternVariant::MelodyOrnamentedPhrase => 0.14,
+        PatternVariant::MelodyPassingDense => 0.24,
         PatternVariant::MelodyChromaticPhrase => 0.18,
         _ => 0.0,
     };
-    let fill_probability =
-        (0.14 + behavior.activity * 0.70 - behavior.space * 0.22 + variant_fill).clamp(0.03, 0.96);
+    let base_fill =
+        (0.14 + behavior.activity * 0.70 - behavior.space * 0.22 + variant_fill).clamp(0.02, 0.96);
 
-    for position in 1..cadence {
-        if plan.steps[position] != MelodyIntent::Rest {
+    let mut position = 1;
+    while position < cadence {
+        if plan.steps[position].intent != MelodyIntent::Rest {
+            position += 1;
             continue;
         }
+
+        let fill_probability =
+            (base_fill + melody_rhythm_bias(variant, position, len)).clamp(0.01, 0.98);
         let chance = deterministic_unit(
             plan.generation.wrapping_mul(0xD6E8_FEB8_6659_FD93)
                 ^ (position as u64).wrapping_mul(0xA5A3_58B5),
         );
         if chance > fill_probability {
+            position += 1;
             continue;
         }
 
         let contour = arch_contour(position, len);
-        let before_skeleton =
-            position + 1 < len && matches!(plan.steps[position + 1], MelodyIntent::Skeleton(_));
+        let before_skeleton = position + 1 < len
+            && matches!(plan.steps[position + 1].intent, MelodyIntent::Skeleton(_));
         let chromatic_permission =
             color >= 0.80 || matches!(variant, PatternVariant::MelodyChromaticPhrase);
 
-        if chromatic_permission && before_skeleton {
-            let target_contour = match plan.steps[position + 1] {
+        let intent = if chromatic_permission && before_skeleton {
+            let target_contour = match plan.steps[position + 1].intent {
                 MelodyIntent::Skeleton(value) => value,
                 _ => contour,
             };
-            plan.steps[position] = MelodyIntent::ChromaticApproach(target_contour);
+            MelodyIntent::ChromaticApproach(target_contour)
+        } else if color >= 0.58 && before_skeleton {
+            MelodyIntent::Suspension(contour)
+        } else if color >= 0.68 && position % 5 == 3 {
+            MelodyIntent::ModalTension(contour)
+        } else if matches!(variant, PatternVariant::MelodyOrnamentedPhrase) && position % 3 == 1 {
+            MelodyIntent::Neighbor(contour)
         } else if behavior.activity >= 0.68 && position % 4 == 2 {
-            plan.steps[position] = MelodyIntent::Neighbor(contour);
+            MelodyIntent::Neighbor(contour)
         } else {
-            plan.steps[position] = MelodyIntent::Fill(contour);
-        }
+            MelodyIntent::Fill(contour)
+        };
+
+        plan.steps[position] = MelodyStep::new(intent);
+        position += 1;
     }
 
+    apply_melody_articulation(&mut plan, variant);
     plan
+}
+
+/// Phrase-level rhythmic identity layered on top of Density.
+///
+/// These are not exposed as extra UI modes: the selected Melody variant keeps
+/// a recognizable rhythmic character while Density controls overall activity.
+fn melody_rhythm_bias(variant: PatternVariant, position: usize, len: usize) -> f32 {
+    let half = len / 2;
+    let peak = (len * 5) / 8;
+    match variant {
+        // CALL: more activity in the opening statement, then space.
+        PatternVariant::MelodyMotifA => {
+            if position < half {
+                0.08
+            } else {
+                -0.20
+            }
+        }
+        // PULSE: a recognizable alternating rhythmic lattice.
+        PatternVariant::MelodyMotifB => {
+            if position.is_multiple_of(2) {
+                0.16
+            } else {
+                -0.20
+            }
+        }
+        // SPARSE ARCH: structural notes do most of the work.
+        PatternVariant::MelodySparseSkeleton => -0.34,
+        // ARCH: modest activity around the climb and peak.
+        PatternVariant::MelodyDevelopedPhrase => {
+            if position.abs_diff(peak) <= len / 8 {
+                0.10
+            } else {
+                0.0
+            }
+        }
+        // WAVE / motif development: recurring internal rhythmic landmarks.
+        PatternVariant::MelodyMotifVariation => {
+            if position % 4 == 1 {
+                0.12
+            } else {
+                -0.02
+            }
+        }
+        // ANSWER: leave room early, become more active in the response half.
+        PatternVariant::MelodyAnsweringPhrase => {
+            if position < half {
+                -0.14
+            } else {
+                0.18
+            }
+        }
+        // PASSING / FLOURISH families increase local connective activity.
+        PatternVariant::MelodyOrnamentedPhrase => {
+            if position.abs_diff(peak) <= len / 6 {
+                0.26
+            } else {
+                0.02
+            }
+        }
+        PatternVariant::MelodyPassingDense => 0.28,
+        PatternVariant::MelodyChromaticPhrase => {
+            if position + 1 < len {
+                0.18
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+fn apply_melody_articulation(plan: &mut MelodyPlan, variant: PatternVariant) {
+    let mut position = 0;
+    while position < plan.len {
+        let intent = plan.steps[position].intent;
+        if intent == MelodyIntent::Rest {
+            position += 1;
+            continue;
+        }
+
+        let desired_gate = melody_desired_gate_steps(intent, variant, position, plan.len);
+        let next_attack =
+            ((position + 1)..plan.len).find(|next| plan.steps[*next].intent != MelodyIntent::Rest);
+        let gate_steps = next_attack.map_or(desired_gate, |next| {
+            desired_gate.min((next - position).max(1))
+        });
+
+        plan.steps[position].gate_steps = gate_steps.clamp(1, usize::from(u8::MAX)) as u8;
+        plan.steps[position].articulation =
+            melody_articulation(intent, gate_steps, position, plan.len);
+        position += 1;
+    }
+}
+
+fn melody_desired_gate_steps(
+    intent: MelodyIntent,
+    variant: PatternVariant,
+    position: usize,
+    len: usize,
+) -> usize {
+    match intent {
+        MelodyIntent::Rest => 0,
+        MelodyIntent::ChromaticApproach(_) | MelodyIntent::Neighbor(_) => 1,
+        MelodyIntent::Fill(_) => {
+            if matches!(variant, PatternVariant::MelodyMotifB) && position.is_multiple_of(2) {
+                2
+            } else {
+                1
+            }
+        }
+        MelodyIntent::Suspension(_) => 3,
+        MelodyIntent::ModalTension(_) => 3,
+        MelodyIntent::Skeleton(_) if position == melody_cadence_position(len) => 6,
+        MelodyIntent::Skeleton(_) if position.abs_diff((len * 5) / 8) <= 1 => 4,
+        MelodyIntent::Skeleton(_) if matches!(variant, PatternVariant::MelodySparseSkeleton) => 4,
+        MelodyIntent::Skeleton(_) => 2,
+    }
+}
+
+fn melody_articulation(
+    intent: MelodyIntent,
+    gate_steps: usize,
+    position: usize,
+    len: usize,
+) -> MelodyArticulation {
+    match intent {
+        MelodyIntent::Rest => MelodyArticulation::Short,
+        MelodyIntent::ChromaticApproach(_) | MelodyIntent::Neighbor(_) => MelodyArticulation::Short,
+        MelodyIntent::Suspension(_) | MelodyIntent::ModalTension(_) => MelodyArticulation::Legato,
+        MelodyIntent::Skeleton(_)
+            if position == melody_cadence_position(len) || gate_steps >= 4 =>
+        {
+            MelodyArticulation::Held
+        }
+        MelodyIntent::Skeleton(_) if gate_steps >= 2 => MelodyArticulation::Legato,
+        MelodyIntent::Fill(_) | MelodyIntent::Skeleton(_) => MelodyArticulation::Normal,
+    }
+}
+
+fn melody_gate_beats(step: MelodyStep, step_length: f64) -> f64 {
+    if step.intent == MelodyIntent::Rest || step.gate_steps == 0 {
+        return 0.0;
+    }
+
+    let ratio = match step.articulation {
+        MelodyArticulation::Short => 0.54,
+        MelodyArticulation::Normal => 0.78,
+        MelodyArticulation::Legato => 0.94,
+        MelodyArticulation::Held => 0.985,
+    };
+
+    f64::from(step.gate_steps) * step_length * ratio
 }
 
 fn melody_skeleton(variant: PatternVariant) -> [i8; 6] {
@@ -1444,7 +2053,10 @@ fn melody_skeleton(variant: PatternVariant) -> [i8; 6] {
         PatternVariant::MelodyMotifB => [0, 2, 1, 3, 1, 0],
         PatternVariant::MelodySparseSkeleton => [0, 1, 2, 4, 2, 0],
         PatternVariant::MelodyAnsweringPhrase => [2, 1, 0, 2, 1, 0],
+        PatternVariant::MelodyMotifVariation => [0, 2, 1, 3, 2, 0],
         PatternVariant::MelodyOrnamentedPhrase => [0, 2, 3, 5, 2, 0],
+        PatternVariant::MelodyPassingDense => [0, 1, 3, 4, 2, 0],
+        PatternVariant::MelodyChromaticPhrase => [0, 2, 2, 5, 1, 0],
         _ => [0, 1, 2, 4, 2, 0],
     }
 }
@@ -1466,11 +2078,14 @@ fn melody_target_note(
     previous_note: Option<u8>,
     spread: f32,
     color: f32,
+    ensemble: EnsembleContext,
 ) -> u8 {
     let contour = match intent {
         MelodyIntent::Skeleton(value)
         | MelodyIntent::Fill(value)
         | MelodyIntent::Neighbor(value)
+        | MelodyIntent::Suspension(value)
+        | MelodyIntent::ModalTension(value)
         | MelodyIntent::ChromaticApproach(value) => value,
         MelodyIntent::Rest => 0,
     };
@@ -1497,14 +2112,25 @@ fn melody_target_note(
     let contour_target = base_target + f32::from(contour) * 1.7;
     let preferred = match intent {
         MelodyIntent::Skeleton(_) => pool.get(contour.unsigned_abs() as usize),
-        MelodyIntent::Neighbor(_) => pool.get(contour.unsigned_abs() as usize + 1),
-        MelodyIntent::Fill(_) | MelodyIntent::ChromaticApproach(_) => {
-            pool.get(contour.unsigned_abs() as usize + 2)
+        MelodyIntent::Neighbor(_) | MelodyIntent::Suspension(_) => {
+            pool.get(contour.unsigned_abs() as usize + 1)
         }
+        MelodyIntent::ModalTension(_)
+        | MelodyIntent::Fill(_)
+        | MelodyIntent::ChromaticApproach(_) => pool.get(contour.unsigned_abs() as usize + 2),
         MelodyIntent::Rest => chord.root.value(),
     };
 
-    nearest_allowed_note(&pool, preferred, contour_target, previous_note, 0.82)
+    nearest_allowed_note(
+        &pool,
+        preferred,
+        contour_target,
+        previous_note,
+        0.82,
+        VoiceRole::Melody,
+        color,
+        ensemble,
+    )
 }
 
 fn chromatic_approach_note(resolution: u8, chord: Chord, tonal: TonalContext) -> u8 {
@@ -1536,12 +2162,17 @@ fn gate_beats(
     space: f32,
     intensity: f32,
 ) -> f64 {
-    if matches!(
-        variant,
-        PatternVariant::BassRootHold | PatternVariant::ChordsSustain
-    ) {
-        let cycle_beats = timing.step_length * timing.steps_per_cycle as f64;
-        return cycle_beats * (0.93 - f64::from(space.clamp(0.0, 1.0)) * 0.08);
+    let cycle_beats = timing.step_length * timing.steps_per_cycle as f64;
+    match variant {
+        PatternVariant::BassRootHold => {
+            return cycle_beats * (0.94 - f64::from(space.clamp(0.0, 1.0)) * 0.06);
+        }
+        PatternVariant::ChordsFourBarHold => return cycle_beats * 0.985,
+        PatternVariant::ChordsTwoBarHold => return cycle_beats * 0.49,
+        PatternVariant::ChordsOneBarHold => return cycle_beats * 0.97,
+        PatternVariant::TextureLongDrone => return cycle_beats * 0.985,
+        PatternVariant::TextureBarDrone => return cycle_beats * 0.49,
+        _ => {}
     }
 
     timing.step_length * gate_ratio(role, variant, space, intensity)
@@ -1567,27 +2198,31 @@ fn gate_ratio(role: VoiceRole, variant: PatternVariant, space: f32, intensity: f
     let base = match role {
         VoiceRole::Bass => 0.78,
         VoiceRole::Chords => 0.70,
-        VoiceRole::Texture => 0.42,
-        VoiceRole::Melody => 0.56,
+        VoiceRole::Texture => 0.78,
+        // Melody has its own phrase-step articulation in v0.11.
+        VoiceRole::Melody => 0.78,
     };
     let pattern_adjustment = match variant {
-        PatternVariant::ChordsSinglePulse
+        PatternVariant::ChordsTwoPulse
         | PatternVariant::ChordsBackbeat
         | PatternVariant::ChordsOffbeat
         | PatternVariant::ChordsActiveStabs => -0.20,
-        PatternVariant::TextureChordSparkle
-        | PatternVariant::TextureShimmer
-        | PatternVariant::TextureRepeatingArp => -0.12,
-        PatternVariant::MelodyOrnamentedPhrase
-        | PatternVariant::MelodyPassingDense
-        | PatternVariant::MelodyChromaticPhrase => -0.08,
+
+        PatternVariant::TextureIsolatedUpper | PatternVariant::TextureDelayedEcho => -0.18,
+        PatternVariant::TextureHalfPulse | PatternVariant::TextureQuarterPulse => -0.10,
+        PatternVariant::TextureThreeStepArp | PatternVariant::TextureSlowArp => 0.08,
+        PatternVariant::TextureExtensionFigure => -0.04,
+        PatternVariant::TextureShimmer => -0.38,
+        PatternVariant::TextureRepeatingArp => -0.12,
+        PatternVariant::TextureRotatingThree => -0.18,
+
         _ => 0.0,
     };
 
     (base + pattern_adjustment
-        - f64::from(space) * 0.22
+        - f64::from(space) * 0.12
         - f64::from(intensity.clamp(-1.0, 1.0)) * 0.04)
-        .clamp(0.14, 0.96)
+        .clamp(0.14, 0.98)
 }
 
 fn timing_offset_beats(role: VoiceRole) -> f64 {
@@ -1620,14 +2255,27 @@ mod tests {
 
     #[test]
     fn density_selects_behavior_family_not_exact_pattern() {
-        assert_eq!(
-            family_for(VoiceRole::Bass, 0.10),
-            PatternFamily::BassFoundation
-        );
+        assert_eq!(family_for(VoiceRole::Bass, 0.10), PatternFamily::BassAnchor);
         assert_eq!(family_for(VoiceRole::Bass, 0.55), PatternFamily::BassMoving);
         assert_eq!(
+            family_for(VoiceRole::Chords, 0.10),
+            PatternFamily::ChordsLongSustain
+        );
+        assert_eq!(
             family_for(VoiceRole::Chords, 0.50),
+            PatternFamily::ChordsPulse
+        );
+        assert_eq!(
+            family_for(VoiceRole::Chords, 0.70),
             PatternFamily::ChordsComp
+        );
+        assert_eq!(
+            family_for(VoiceRole::Texture, 0.08),
+            PatternFamily::TextureDrone
+        );
+        assert_eq!(
+            family_for(VoiceRole::Texture, 0.40),
+            PatternFamily::TexturePulse
         );
         assert_eq!(
             family_for(VoiceRole::Texture, 0.85),
@@ -1652,13 +2300,7 @@ mod tests {
             42,
         );
         for cycle in 0..12 {
-            state.update(
-                PatternFamily::ChordsComp,
-                VoiceRole::Chords,
-                cycle,
-                0.55,
-                0.82,
-            );
+            state.update(PatternFamily::ChordsComp, cycle, cycle, 0.70, 0.82);
             assert!(variants_for(PatternFamily::ChordsComp).contains(&state.variant));
         }
     }
@@ -1670,9 +2312,7 @@ mod tests {
         let mut engine = PerformerEngine::new(
             c_major(),
             settings.tonal,
-            Voicing {
-                notes: [52, 55, 60, 64],
-            },
+            Voicing::from_slice(&[52, 55, 60]),
         );
         engine.transport_started(0.0);
         let _ = engine.update(0.0, 4.0, &voices);
@@ -1682,7 +2322,7 @@ mod tests {
             .filter(|event| matches!(event, VoiceEvent::NoteOn { voice_index: 1, .. }))
             .count();
 
-        assert_eq!(chord_note_ons, 4);
+        assert_eq!(chord_note_ons, 3);
     }
 
     #[test]
@@ -1691,9 +2331,7 @@ mod tests {
         let engine = PerformerEngine::new(
             c_major(),
             settings.tonal,
-            Voicing {
-                notes: [52, 55, 60, 64],
-            },
+            Voicing::from_slice(&[52, 55, 60]),
         );
         let snapshots = engine.snapshots();
 
@@ -1710,9 +2348,7 @@ mod tests {
         let mut engine = PerformerEngine::new(
             c_major(),
             settings.tonal,
-            Voicing {
-                notes: [52, 55, 60, 64],
-            },
+            Voicing::from_slice(&[52, 55, 60]),
         );
         engine.transport_started(0.0);
         let _ = engine.update(0.0, 4.0, &voices);
@@ -1721,5 +2357,182 @@ mod tests {
 
         assert!(first_started.iter().count() > 0);
         assert_eq!(second.iter().count(), 0);
+    }
+
+    #[test]
+    fn chord_density_continuum_includes_sustain_pulse_comp_and_active() {
+        assert_eq!(
+            family_for(VoiceRole::Chords, 0.08),
+            PatternFamily::ChordsLongSustain
+        );
+        assert_eq!(
+            family_for(VoiceRole::Chords, 0.22),
+            PatternFamily::ChordsBarSustain
+        );
+        assert_eq!(
+            family_for(VoiceRole::Chords, 0.48),
+            PatternFamily::ChordsPulse
+        );
+        assert_eq!(
+            family_for(VoiceRole::Chords, 0.70),
+            PatternFamily::ChordsComp
+        );
+        assert_eq!(
+            family_for(VoiceRole::Chords, 0.92),
+            PatternFamily::ChordsActive
+        );
+    }
+
+    #[test]
+    fn family_change_waits_for_new_density_boundary() {
+        let mut state = PatternState::new(
+            PatternFamily::ChordsBarSustain,
+            PatternVariant::ChordsOneBarHold,
+            7,
+        );
+        state.update(PatternFamily::ChordsBarSustain, 0, 0, 0.20, 0.82);
+        state.update(PatternFamily::ChordsComp, 0, 0, 0.70, 0.82);
+        assert_eq!(state.family, PatternFamily::ChordsBarSustain);
+
+        state.update(PatternFamily::ChordsComp, 1, 1, 0.70, 0.82);
+        assert_eq!(state.family, PatternFamily::ChordsComp);
+    }
+
+    #[test]
+    fn texture_absolute_phase_does_not_restart_at_bar_boundary() {
+        let before = super::step_timing(
+            VoiceRole::Texture,
+            PatternFamily::TextureMotion,
+            3.5,
+            4.0,
+            0.0,
+        );
+        let boundary = super::step_timing(
+            VoiceRole::Texture,
+            PatternFamily::TextureMotion,
+            4.0,
+            4.0,
+            0.0,
+        );
+
+        assert_eq!(before.position, 7);
+        assert_eq!(boundary.position, 8);
+    }
+
+    #[test]
+    fn melody_plan_contains_short_and_sustained_gates() {
+        let plan = super::generate_melody_plan(
+            32,
+            super::Behavior {
+                activity: 0.92,
+                space: 0.10,
+                repeat: 0.40,
+            },
+            0.82,
+            super::MelodyPlan::empty(),
+            0,
+            PatternVariant::MelodyPassingDense,
+        );
+
+        let gates = plan
+            .steps
+            .iter()
+            .take(plan.len)
+            .filter(|step| step.intent != super::MelodyIntent::Rest)
+            .map(|step| step.gate_steps)
+            .collect::<Vec<_>>();
+
+        assert!(gates.iter().any(|gate| *gate == 1));
+        assert!(gates.iter().any(|gate| *gate >= 3));
+    }
+
+    #[test]
+    fn counterpoint_scoring_prefers_contrary_motion_when_other_costs_match() {
+        let context = super::EnsembleContext {
+            active_notes: [None, None, None, Some(60)],
+            last_attack_beat: [None; 4],
+            motion_direction: [0, 0, 0, 1],
+        };
+
+        let contrary = super::counterpoint_cost(64, Some(67), VoiceRole::Texture, 0.5, context);
+        let parallel = super::counterpoint_cost(69, Some(67), VoiceRole::Texture, 0.5, context);
+
+        assert!(contrary < parallel);
+    }
+
+    #[test]
+    fn harmony_change_preserves_texture_and_melody_note_ownership() {
+        let settings = MusicalSettings::default();
+        let mut engine = PerformerEngine::new(
+            c_major(),
+            settings.tonal,
+            Voicing::from_slice(&[52, 55, 60]),
+        );
+
+        engine.states[2].sounding = Some(super::ScheduledNotes {
+            notes: super::NoteSet::single(76),
+            off_beat: 3.0,
+        });
+        engine.states[3].sounding = Some(super::ScheduledNotes {
+            notes: super::NoteSet::single(79),
+            off_beat: 2.0,
+        });
+
+        let d_minor = Chord::new(
+            PitchClass::from_value(2),
+            ChordQuality::Minor,
+            ChordExtension::Triad,
+        );
+        engine.harmony_changed(
+            d_minor,
+            settings.tonal,
+            Voicing::from_slice(&[50, 53, 57]),
+            1.0,
+        );
+
+        assert_eq!(engine.snapshots()[2].active_notes[0], Some(76));
+        assert_eq!(engine.snapshots()[3].active_notes[0], Some(79));
+        assert!(engine.states[0].force_attack);
+        assert!(engine.states[1].force_attack);
+    }
+
+    #[test]
+    fn melody_cadence_leaves_time_for_an_audible_hold() {
+        assert_eq!(super::melody_cadence_position(16), 14);
+        assert_eq!(super::melody_cadence_position(32), 28);
+
+        let plan = super::generate_melody_plan(
+            16,
+            super::Behavior {
+                activity: 0.55,
+                space: 0.35,
+                repeat: 0.50,
+            },
+            0.45,
+            super::MelodyPlan::empty(),
+            0,
+            PatternVariant::MelodyDevelopedPhrase,
+        );
+        let cadence = super::melody_cadence_position(plan.len);
+        assert!(plan.steps[cadence].gate_steps >= 2);
+        assert_eq!(
+            plan.steps[cadence].articulation,
+            super::MelodyArticulation::Held
+        );
+    }
+
+    #[test]
+    fn texture_pulse_and_rotating_cells_are_regular() {
+        for position in 0..16 {
+            assert_eq!(
+                super::pattern_hit(PatternVariant::TextureQuarterPulse, position, 16,),
+                position.is_multiple_of(2)
+            );
+            assert!(super::pattern_hit(
+                PatternVariant::TextureRotatingThree,
+                position,
+                16,
+            ));
+        }
     }
 }

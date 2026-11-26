@@ -164,23 +164,11 @@ impl Chord {
             .any(|interval| (self.root.value() + interval) % 12 == pitch_class)
     }
 
-    /// Returns the pitch classes that a four-voice realization must contain.
+    /// Returns every semantic pitch class encoded by this chord.
     ///
-    /// Triads retain root/third/fifth and may double one tone. Sevenths retain
-    /// all four chord tones. Ninth chords retain root/third/seventh/ninth and
-    /// omit the fifth by default, a conventional four-voice reduction.
+    /// Khaṇa's Chords performer realizes each of these tones exactly once.
     pub fn essential_pitch_classes(self) -> Vec<u8> {
-        let intervals = self.intervals();
-
-        let essential_intervals: Vec<u8> = match self.extension {
-            ChordExtension::Triad => intervals[..3].to_vec(),
-            ChordExtension::Seventh => intervals[..4].to_vec(),
-            ChordExtension::Ninth => {
-                vec![intervals[0], intervals[1], intervals[3], intervals[4]]
-            }
-        };
-
-        essential_intervals
+        self.intervals()
             .into_iter()
             .map(|interval| (self.root.value() + interval) % 12)
             .collect()
