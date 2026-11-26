@@ -155,15 +155,6 @@ impl Chord {
         format!("{}{}", self.root.label(), self.suffix())
     }
 
-    /// Returns true when `midi_note` belongs to this chord realization.
-    pub fn contains_midi_pitch(self, midi_note: u8) -> bool {
-        let pitch_class = midi_note % 12;
-
-        self.intervals()
-            .iter()
-            .any(|interval| (self.root.value() + interval) % 12 == pitch_class)
-    }
-
     /// Returns every semantic pitch class encoded by this chord.
     ///
     /// Khaṇa's Chords performer realizes each of these tones exactly once.

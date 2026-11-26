@@ -777,8 +777,7 @@ impl PerformerEngine {
             self.states[index].force_attack = false;
             if behavior.activity <= 0.01
                 || (!forced
-                    && !self
-                        .should_attack(index, role, variant, timing, behavior, ensemble, now_beat))
+                    && !self.should_attack(index, role, timing, behavior, ensemble, now_beat))
             {
                 continue;
             }
@@ -933,12 +932,12 @@ impl PerformerEngine {
         &self,
         index: usize,
         role: VoiceRole,
-        variant: PatternVariant,
         timing: StepTiming,
         behavior: Behavior,
         ensemble: EnsembleContext,
         now_beat: f64,
     ) -> bool {
+        let variant = self.states[index].pattern.variant;
         if role == VoiceRole::Melody {
             return self.states[index].melody_plan.intent(timing.position) != MelodyIntent::Rest;
         }
@@ -1012,8 +1011,11 @@ impl PerformerEngine {
                 self.chord_voicing.top_note(),
                 self.states[index].previous_note,
                 voice.parameters.spread,
-                0.45,
-                ensemble,
+                NoteScoringContext {
+                    role: VoiceRole::Melody,
+                    color: 0.45,
+                    ensemble,
+                },
             );
             self.states[index].pending_resolution = Some(resolution);
             return chromatic_approach_note(resolution, self.chord, self.tonal);
@@ -1026,8 +1028,11 @@ impl PerformerEngine {
             self.chord_voicing.top_note(),
             self.states[index].previous_note,
             voice.parameters.spread,
-            voice.parameters.color,
-            ensemble,
+            NoteScoringContext {
+                role: VoiceRole::Melody,
+                color: voice.parameters.color,
+                ensemble,
+            },
         )
     }
 }
@@ -1519,9 +1524,11 @@ fn choose_role_note(request: RoleNoteRequest) -> u8 {
         target,
         request.previous_note,
         movement_weight,
-        role,
-        request.voice.parameters.color,
-        request.ensemble,
+        NoteScoringContext {
+            role,
+            color: request.voice.parameters.color,
+            ensemble: request.ensemble,
+        },
     );
 
     if matches!(request.variant, PatternVariant::BassRootOctave) && request.position > 0 {
@@ -1651,16 +1658,27 @@ fn nearest_pitch_class_near(pitch_class: u8, target: u8) -> u8 {
     best
 }
 
+/// Performer-specific inputs for soft contrapuntal note scoring.
+#[derive(Clone, Copy, Debug)]
+struct NoteScoringContext {
+    role: VoiceRole,
+    color: f32,
+    ensemble: EnsembleContext,
+}
+
 fn nearest_allowed_note(
     pool: &PitchPool,
     preferred_pitch_class: u8,
     target: f32,
     previous_note: Option<u8>,
     movement_weight: f32,
-    role: VoiceRole,
-    color: f32,
-    ensemble: EnsembleContext,
+    scoring: NoteScoringContext,
 ) -> u8 {
+    let NoteScoringContext {
+        role,
+        color,
+        ensemble,
+    } = scoring;
     let mut best_note = target.round().clamp(24.0, 100.0) as u8;
     let mut best_score = f32::MAX;
 
@@ -1878,9 +1896,9 @@ fn generate_melody_plan(
             MelodyIntent::Suspension(contour)
         } else if color >= 0.68 && position % 5 == 3 {
             MelodyIntent::ModalTension(contour)
-        } else if matches!(variant, PatternVariant::MelodyOrnamentedPhrase) && position % 3 == 1 {
-            MelodyIntent::Neighbor(contour)
-        } else if behavior.activity >= 0.68 && position % 4 == 2 {
+        } else if (matches!(variant, PatternVariant::MelodyOrnamentedPhrase) && position % 3 == 1)
+            || (behavior.activity >= 0.68 && position % 4 == 2)
+        {
             MelodyIntent::Neighbor(contour)
         } else {
             MelodyIntent::Fill(contour)
@@ -1953,13 +1971,7 @@ fn melody_rhythm_bias(variant: PatternVariant, position: usize, len: usize) -> f
             }
         }
         PatternVariant::MelodyPassingDense => 0.28,
-        PatternVariant::MelodyChromaticPhrase => {
-            if position + 1 < len {
-                0.18
-            } else {
-                0.0
-            }
-        }
+        PatternVariant::MelodyChromaticPhrase if position + 1 < len => 0.18,
         _ => 0.0,
     }
 }
@@ -2077,9 +2089,9 @@ fn melody_target_note(
     anchor_note: u8,
     previous_note: Option<u8>,
     spread: f32,
-    color: f32,
-    ensemble: EnsembleContext,
+    scoring: NoteScoringContext,
 ) -> u8 {
+    let color = scoring.color;
     let contour = match intent {
         MelodyIntent::Skeleton(value)
         | MelodyIntent::Fill(value)
@@ -2127,9 +2139,7 @@ fn melody_target_note(
         contour_target,
         previous_note,
         0.82,
-        VoiceRole::Melody,
-        color,
-        ensemble,
+        scoring,
     )
 }
 
@@ -2442,7 +2452,7 @@ mod tests {
             .map(|step| step.gate_steps)
             .collect::<Vec<_>>();
 
-        assert!(gates.iter().any(|gate| *gate == 1));
+        assert!(gates.contains(&1));
         assert!(gates.iter().any(|gate| *gate >= 3));
     }
 
