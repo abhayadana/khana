@@ -148,7 +148,7 @@ impl CandidateOrigin {
             Self::Diatonic => 0.08,
             Self::SecondaryDominant => 0.38,
             Self::Borrowed => 0.50,
-            Self::DiminishedApproach => 0.64,
+            Self::DiminishedApproach => 0.69,
             Self::ChromaticMediant => 0.72,
             Self::Tritone => 0.79,
             Self::Surprise => 0.88,
@@ -542,7 +542,10 @@ fn progression_score(
 
     // A dominant resolving down a fifth (up a fourth) is strong regardless of
     // whether it is the primary dominant or a secondary dominant.
-    if current.quality == ChordQuality::Dominant && candidate.root == current.root.transpose(5) {
+    if current.quality == ChordQuality::Dominant
+        && candidate.root == current.root.transpose(5)
+        && is_stable_resolution_quality(candidate.quality)
+    {
         return (1.0, RecommendationReason::DominantResolution);
     }
 
@@ -554,8 +557,12 @@ fn progression_score(
             return (0.98, RecommendationReason::TwoFive);
         }
 
-        if from == 4 && matches!(to, 0 | 5) {
+        if from == 4 && to == 0 && matches_diatonic_quality(candidate, context, 0) {
             return (1.0, RecommendationReason::Cadence);
+        }
+
+        if from == 4 && to == 5 && matches_diatonic_quality(candidate, context, 5) {
+            return (0.86, RecommendationReason::Cadence);
         }
     }
 
@@ -567,12 +574,20 @@ fn progression_score(
             (previous_degree, current_degree, candidate_degree)
         {
             // ii -> V -> I
-            if previous == 1 && current == 4 && next == 0 {
+            if previous == 1
+                && current == 4
+                && next == 0
+                && matches_diatonic_quality(candidate, context, 0)
+            {
                 return (1.0, RecommendationReason::Cadence);
             }
 
             // IV -> V -> I
-            if previous == 3 && current == 4 && next == 0 {
+            if previous == 3
+                && current == 4
+                && next == 0
+                && matches_diatonic_quality(candidate, context, 0)
+            {
                 return (0.98, RecommendationReason::Cadence);
             }
 
@@ -622,11 +637,36 @@ fn progression_score(
         _ => 0.35,
     };
 
-    (pair_score, RecommendationReason::ProgressionPrior)
+    let quality_factor = candidate_degree.map_or(1.0, |degree| {
+        if matches_diatonic_quality(candidate, context, degree) {
+            1.0
+        } else {
+            0.72
+        }
+    });
+
+    (
+        pair_score * quality_factor,
+        RecommendationReason::ProgressionPrior,
+    )
+}
+
+const fn is_stable_resolution_quality(quality: ChordQuality) -> bool {
+    matches!(quality, ChordQuality::Major | ChordQuality::Minor)
+}
+
+fn matches_diatonic_quality(candidate: Chord, context: TonalContext, degree: usize) -> bool {
+    candidate.quality
+        == context
+            .diatonic_chord(degree, ChordExtension::Seventh)
+            .quality
 }
 
 fn functional_coherence(current: Chord, candidate: Chord, context: TonalContext) -> f32 {
-    if current.quality == ChordQuality::Dominant && candidate.root == current.root.transpose(5) {
+    if current.quality == ChordQuality::Dominant
+        && candidate.root == current.root.transpose(5)
+        && is_stable_resolution_quality(candidate.quality)
+    {
         return 1.0;
     }
 
@@ -657,6 +697,18 @@ fn functional_coherence(current: Chord, candidate: Chord, context: TonalContext)
 }
 
 fn function_of(chord: Chord, context: TonalContext) -> HarmonicFunction {
+    // Dominant quality encodes directional function even when its root belongs
+    // to a normally tonic-function scale degree (e.g. E7 = V/vi in C).
+    if chord.quality == ChordQuality::Dominant {
+        return HarmonicFunction::Dominant;
+    }
+
+    // Fully diminished chords in the current vocabulary are generated as
+    // leading-tone approaches and therefore behave as dominant-function color.
+    if chord.quality == ChordQuality::Diminished {
+        return HarmonicFunction::Dominant;
+    }
+
     match degree_of_root(context, chord.root) {
         Some(0 | 2 | 5) => HarmonicFunction::Tonic,
         Some(1 | 3) => HarmonicFunction::Predominant,
@@ -675,7 +727,7 @@ fn directional_fit(
 
     match direction {
         HarmonicDirection::Resolve => (0.55_f32 - delta * 0.42_f32).clamp(0.0_f32, 1.0_f32),
-        HarmonicDirection::Neutral => (1.0_f32 - delta.abs() * 0.35_f32).clamp(0.0_f32, 1.0_f32),
+        HarmonicDirection::Neutral => 1.0,
         HarmonicDirection::Tension => (0.55_f32 + delta * 0.42_f32).clamp(0.0_f32, 1.0_f32),
     }
 }
@@ -830,12 +882,48 @@ fn fallback_recommendations(context: TonalContext) -> [Recommendation; 3] {
 
 #[cfg(test)]
 mod tests {
-    use super::{HarmonicDirection, RecommendationClass, RecommendationEngine};
+    use super::{
+        HarmonicDirection, HarmonicFunction, RecommendationClass, RecommendationEngine,
+        RecommendationReason, directional_fit, function_of, progression_score,
+    };
     use crate::music::chord::{Chord, ChordExtension, ChordQuality, PitchClass};
     use crate::music::settings::MusicalSettings;
 
     fn chord(root: u8, quality: ChordQuality, extension: ChordExtension) -> Chord {
         Chord::new(PitchClass::from_value(root), quality, extension)
+    }
+
+    #[test]
+    fn dominant_on_resolution_root_does_not_count_as_resolution() {
+        let settings = MusicalSettings::default();
+        let e7 = chord(4, ChordQuality::Dominant, ChordExtension::Seventh);
+        let a7 = chord(9, ChordQuality::Dominant, ChordExtension::Seventh);
+
+        let (score, reason) = progression_score(&[e7], a7, settings.tonal);
+
+        assert_ne!(reason, RecommendationReason::DominantResolution);
+        assert!(score < 1.0);
+    }
+
+    #[test]
+    fn neutral_direction_does_not_penalize_tension_release() {
+        let settings = MusicalSettings::default();
+        let g7 = chord(7, ChordQuality::Dominant, ChordExtension::Seventh);
+        let cmaj7 = chord(0, ChordQuality::Major, ChordExtension::Seventh);
+        let a7 = chord(9, ChordQuality::Dominant, ChordExtension::Seventh);
+
+        assert_eq!(
+            directional_fit(g7, cmaj7, settings.tonal, HarmonicDirection::Neutral,),
+            directional_fit(g7, a7, settings.tonal, HarmonicDirection::Neutral,)
+        );
+    }
+
+    #[test]
+    fn secondary_dominant_quality_is_functionally_dominant() {
+        let settings = MusicalSettings::default();
+        let e7 = chord(4, ChordQuality::Dominant, ChordExtension::Seventh);
+
+        assert_eq!(function_of(e7, settings.tonal), HarmonicFunction::Dominant);
     }
 
     #[test]
@@ -920,6 +1008,31 @@ mod tests {
             settings.tonal,
             HarmonicDirection::Neutral,
             true,
+        );
+
+        let mut chords = Vec::new();
+        for class in RecommendationClass::ALL {
+            for recommendation in set.for_class(class) {
+                assert!(!chords.contains(&recommendation.chord));
+                chords.push(recommendation.chord);
+            }
+        }
+    }
+
+    #[test]
+    fn lydian_without_surprise_keeps_three_distinct_columns() {
+        use crate::music::settings::{ScaleMode, TonalContext};
+
+        let context = TonalContext {
+            tonic: PitchClass::from_value(0),
+            mode: ScaleMode::Lydian,
+        };
+        let engine = RecommendationEngine::new();
+        let set = engine.recommend(
+            &[context.tonic_chord()],
+            context,
+            HarmonicDirection::Neutral,
+            false,
         );
 
         let mut chords = Vec::new();

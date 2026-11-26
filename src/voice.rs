@@ -1,4 +1,4 @@
-//! Four performer states, macro handling, and MIDI realization.
+//! Four performer states, macro handling, and chord-voicing realization.
 
 use crate::music::chord::Chord;
 use crate::music::voicing::{Voicing, VoicingEngine};
@@ -7,16 +7,17 @@ use crate::music::voicing::{Voicing, VoicingEngine};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VoiceRole {
     Bass,
-    Inner,
+    Chords,
     Texture,
     Melody,
 }
 
 impl VoiceRole {
+    /// Compact UI label.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Bass => "BASS",
-            Self::Inner => "INNER",
+            Self::Chords => "CHORDS",
             Self::Texture => "TEXTURE",
             Self::Melody => "MELODY",
         }
@@ -47,6 +48,7 @@ pub enum VoiceScope {
 }
 
 impl VoiceScope {
+    /// Compact scope label.
     pub fn label(self) -> String {
         match self {
             Self::All => "ALL".to_owned(),
@@ -54,6 +56,7 @@ impl VoiceScope {
         }
     }
 
+    /// Selects the next voice scope.
     pub const fn next(self) -> Self {
         match self {
             Self::All => Self::One(0),
@@ -64,6 +67,7 @@ impl VoiceScope {
         }
     }
 
+    /// Selects the previous voice scope.
     pub const fn previous(self) -> Self {
         match self {
             Self::All => Self::One(3),
@@ -84,20 +88,21 @@ pub enum MacroKind {
     Color,
 }
 
-/// Fully realized voice state ready for MIDI output and display.
+/// Smooth polyphonic voicing used by the Chords performer and as a register
+/// reference for the other performers.
 #[derive(Clone, Copy, Debug)]
 pub struct VoiceRender {
     pub voicing: Voicing,
-    pub velocities: [u8; 4],
 }
 
-/// Converts harmonic state into four performer outputs.
+/// Converts harmonic state into a smooth upper chord voicing.
 pub struct VoiceEngine {
     voicing_engine: VoicingEngine,
     current_voicing: Option<Voicing>,
 }
 
 impl VoiceEngine {
+    /// Creates an empty chord-voicing engine.
     pub const fn new() -> Self {
         Self {
             voicing_engine: VoicingEngine::new(),
@@ -105,11 +110,7 @@ impl VoiceEngine {
         }
     }
 
-    /// Realizes a new harmonic event.
-    ///
-    /// In the sustained-chord prototype all four performers remain present.
-    /// Density is reserved for the upcoming rhythmic performer engine and does
-    /// not mute a voice at chord boundaries.
+    /// Realizes the Chords performer voicing for a new harmonic event.
     pub fn harmonic_change(&mut self, chord: Chord, voices: &[Voice; 4]) -> VoiceRender {
         self.render(chord, voices)
     }
@@ -120,20 +121,17 @@ impl VoiceEngine {
     }
 
     fn render(&mut self, chord: Chord, voices: &[Voice; 4]) -> VoiceRender {
-        let spread = average_spread(voices);
-        let voicing = self
-            .voicing_engine
-            .realize(chord, self.current_voicing, spread);
-
-        let velocities =
-            std::array::from_fn(|index| velocity_from_dynamics(voices[index].parameters.dynamics));
+        let chord_spread = voices[1].parameters.spread;
+        let bass_present = voices[0].parameters.density > 0.01;
+        let voicing = self.voicing_engine.realize_with_bass(
+            chord,
+            self.current_voicing,
+            chord_spread,
+            bass_present,
+        );
 
         self.current_voicing = Some(voicing);
-
-        VoiceRender {
-            voicing,
-            velocities,
-        }
+        VoiceRender { voicing }
     }
 }
 
@@ -149,34 +147,34 @@ pub fn default_voices() -> [Voice; 4] {
         Voice {
             role: VoiceRole::Bass,
             parameters: VoiceParameters {
-                density: 0.72,
+                density: 0.56,
                 dynamics: 0.72,
-                spread: 0.72,
+                spread: 0.58,
                 color: 0.20,
             },
         },
         Voice {
-            role: VoiceRole::Inner,
+            role: VoiceRole::Chords,
             parameters: VoiceParameters {
-                density: 0.56,
-                dynamics: 0.60,
-                spread: 0.42,
-                color: 0.42,
+                density: 0.52,
+                dynamics: 0.62,
+                spread: 0.48,
+                color: 0.34,
             },
         },
         Voice {
             role: VoiceRole::Texture,
             parameters: VoiceParameters {
-                density: 0.44,
-                dynamics: 0.52,
-                spread: 0.62,
+                density: 0.40,
+                dynamics: 0.50,
+                spread: 0.68,
                 color: 0.72,
             },
         },
         Voice {
             role: VoiceRole::Melody,
             parameters: VoiceParameters {
-                density: 0.66,
+                density: 0.62,
                 dynamics: 0.70,
                 spread: 0.80,
                 color: 0.82,
@@ -212,13 +210,16 @@ fn adjust_one(voice: &mut Voice, kind: MacroKind, delta: f32) {
     *value = (*value + delta).clamp(0.0, 1.0);
 }
 
-fn average_spread(voices: &[Voice; 4]) -> f32 {
-    voices
-        .iter()
-        .map(|voice| voice.parameters.spread)
-        .sum::<f32>()
-        / voices.len() as f32
-}
-fn velocity_from_dynamics(dynamics: f32) -> u8 {
-    (35.0 + dynamics.clamp(0.0, 1.0) * 92.0).round() as u8
+#[cfg(test)]
+mod tests {
+    use super::{VoiceRole, default_voices};
+
+    #[test]
+    fn default_ensemble_is_bass_chords_texture_melody() {
+        let voices = default_voices();
+        assert_eq!(voices[0].role, VoiceRole::Bass);
+        assert_eq!(voices[1].role, VoiceRole::Chords);
+        assert_eq!(voices[2].role, VoiceRole::Texture);
+        assert_eq!(voices[3].role, VoiceRole::Melody);
+    }
 }

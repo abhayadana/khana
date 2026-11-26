@@ -3,11 +3,46 @@
 use crate::music::chord::Chord;
 use crate::music::recommendation::{HarmonicDirection, RecommendationClass, RecommendationSet};
 use crate::music::settings::{MusicalSettings, SettingField};
+use crate::performer::PerformerSnapshot;
 use crate::phrase::{Phrase, RecorderStatus};
 use crate::sync::{SyncMode, SyncStatus};
 use crate::voice::{Voice, VoiceRender, VoiceScope};
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
+
+/// All state needed to render the live Performance screen.
+pub struct PerformanceView<'a> {
+    pub settings: MusicalSettings,
+    pub setting_focus: Option<SettingField>,
+    pub sync_status: SyncStatus,
+    pub current_chord: Chord,
+    pub chord_elapsed_beats: f64,
+    pub current_render: VoiceRender,
+    pub recommendations: &'a RecommendationSet,
+    pub selected_class: RecommendationClass,
+    pub selected_row: usize,
+    pub direction: HarmonicDirection,
+    pub voices: &'a [Voice; 4],
+    pub performer_snapshots: [PerformerSnapshot; 4],
+    pub scope: VoiceScope,
+    pub recorder_status: RecorderStatus,
+    pub next_recording_armed: bool,
+    pub quantize_beats: f64,
+    pub phrase_count: usize,
+}
+
+/// All state needed to render the Phrase Editor screen.
+pub struct PhraseEditorView<'a> {
+    pub settings: MusicalSettings,
+    pub sync_status: SyncStatus,
+    pub phrase: Option<&'a Phrase>,
+    pub phrase_index: usize,
+    pub phrase_count: usize,
+    pub selected_event: usize,
+    pub pixels_per_beat: f32,
+    pub playing_phrase: Option<usize>,
+    pub queued_phrase: Option<usize>,
+}
 
 /// Stateless 1024×768 renderer.
 pub struct Ui {
@@ -19,27 +54,31 @@ impl Ui {
         Self { width }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn draw_performance(
         &self,
         canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
-        settings: MusicalSettings,
-        setting_focus: Option<SettingField>,
-        sync_status: SyncStatus,
-        current_chord: Chord,
-        chord_elapsed_beats: f64,
-        current_render: VoiceRender,
-        recommendations: &RecommendationSet,
-        selected_class: RecommendationClass,
-        selected_row: usize,
-        direction: HarmonicDirection,
-        voices: &[Voice; 4],
-        scope: VoiceScope,
-        recorder_status: RecorderStatus,
-        next_recording_armed: bool,
-        quantize_beats: f64,
-        phrase_count: usize,
+        view: PerformanceView<'_>,
     ) -> Result<(), String> {
+        let PerformanceView {
+            settings,
+            setting_focus,
+            sync_status,
+            current_chord,
+            chord_elapsed_beats,
+            current_render,
+            recommendations,
+            selected_class,
+            selected_row,
+            direction,
+            voices,
+            performer_snapshots,
+            scope,
+            recorder_status,
+            next_recording_armed,
+            quantize_beats,
+            phrase_count,
+        } = view;
+
         canvas.set_draw_color(background());
         canvas.clear();
 
@@ -55,7 +94,7 @@ impl Ui {
             5,
             text_color(),
         )?;
-        draw_text(canvas, 54, 192, "4 VOICES", 2, accent())?;
+        draw_text(canvas, 54, 192, "CHORD VOICING", 2, accent())?;
 
         let note_line = current_render
             .voicing
@@ -95,7 +134,7 @@ impl Ui {
             accent(),
         )?;
 
-        draw_voice_rows(canvas, settings.tonal, voices, scope, current_render)?;
+        draw_voice_rows(canvas, settings.tonal, voices, performer_snapshots, scope)?;
 
         draw_panel(canvas, Rect::new(32, 660, 960, 82), panel())?;
         draw_recording_strip(
@@ -109,20 +148,23 @@ impl Ui {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn draw_phrase_editor(
         &self,
         canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
-        settings: MusicalSettings,
-        sync_status: SyncStatus,
-        phrase: Option<&Phrase>,
-        phrase_index: usize,
-        phrase_count: usize,
-        selected_event: usize,
-        pixels_per_beat: f32,
-        playing_phrase: Option<usize>,
-        queued_phrase: Option<usize>,
+        view: PhraseEditorView<'_>,
     ) -> Result<(), String> {
+        let PhraseEditorView {
+            settings,
+            sync_status,
+            phrase,
+            phrase_index,
+            phrase_count,
+            selected_event,
+            pixels_per_beat,
+            playing_phrase,
+            queued_phrase,
+        } = view;
+
         canvas.set_draw_color(background());
         canvas.clear();
 
@@ -307,7 +349,14 @@ fn draw_header(
         } else {
             "SETTINGS  LINK NOT BUILT".to_owned()
         };
-        draw_text(canvas, 360, 52, &link_text, 1, accent())?;
+        draw_text(
+            canvas,
+            360,
+            52,
+            &link_text,
+            1,
+            field_color(focus, SettingField::StartStopSync),
+        )?;
     }
 
     Ok(())
@@ -377,10 +426,10 @@ fn draw_voice_rows(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
     context: crate::music::settings::TonalContext,
     voices: &[Voice; 4],
+    snapshots: [PerformerSnapshot; 4],
     scope: VoiceScope,
-    render: VoiceRender,
 ) -> Result<(), String> {
-    draw_text(canvas, 36, 330, "VOICES", 2, dim_text())?;
+    draw_text(canvas, 36, 330, "PERFORMERS", 2, dim_text())?;
     draw_text(canvas, 260, 330, "DENS", 2, dim_text())?;
     draw_text(canvas, 430, 330, "DYN", 2, dim_text())?;
     draw_text(canvas, 600, 330, "SPRD", 2, dim_text())?;
@@ -395,18 +444,26 @@ fn draw_voice_rows(
             Rect::new(32, y - 8, 960, 56),
             if scoped { scoped_panel() } else { panel() },
         )?;
+        let active = active_note_summary(context, snapshots[index].active_notes);
         draw_text(
             canvas,
             52,
-            y + 6,
-            &format!(
-                "{} {} {}",
-                index + 1,
-                voice.role.label(),
-                context.midi_note_label(render.voicing.notes[index])
-            ),
+            y + 4,
+            &format!("{} {} {}", index + 1, voice.role.label(), active),
             2,
             text_color(),
+        )?;
+        draw_text(
+            canvas,
+            52,
+            y + 31,
+            &format!(
+                "RST {}  {}",
+                snapshots[index].reset_rule.label(),
+                snapshots[index].family.label()
+            ),
+            1,
+            dim_text(),
         )?;
         draw_value_bar(canvas, 250, y + 4, voice.parameters.density)?;
         draw_value_bar(canvas, 420, y + 4, voice.parameters.dynamics)?;
@@ -415,6 +472,25 @@ fn draw_voice_rows(
     }
 
     Ok(())
+}
+
+fn active_note_summary(
+    context: crate::music::settings::TonalContext,
+    notes: [Option<u8>; 4],
+) -> String {
+    let labels = notes
+        .into_iter()
+        .flatten()
+        .map(|note| context.midi_note_label(note))
+        .collect::<Vec<_>>();
+
+    if labels.is_empty() {
+        "--".to_owned()
+    } else if labels.len() == 1 {
+        labels[0].clone()
+    } else {
+        format!("{}N", labels.len())
+    }
 }
 
 fn draw_recording_strip(

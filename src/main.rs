@@ -1,12 +1,14 @@
-//! Khaṇa v0.7 desktop prototype.
+//! Khaṇa v0.9.1 desktop prototype.
 //!
-//! v0.7 replaces local chord heuristics with progression-context ranking,
-//! makes chord identity stable across performance macros, and keeps chord
-//! display / MIDI realization semantically aligned.
+//! v0.9 replaces Inner with a genuinely polyphonic Chords performer and
+//! separates pattern family selection from exact rhythmic variants. Density
+//! chooses a behavior region; continuity, age, history, and deterministic
+//! variation let each performer develop related patterns over time.
 
 mod input;
 mod midi;
 mod music;
+mod performer;
 mod phrase;
 mod sync;
 mod ui;
@@ -22,10 +24,11 @@ use music::recommendation::{
     HarmonicDirection, RecommendationClass, RecommendationEngine, RecommendationSet,
 };
 use music::settings::{MusicalSettings, SettingField};
+use performer::PerformerEngine;
 use phrase::{Phrase, PhrasePlayer, PhraseRecorder};
 use sdl2::event::Event;
 use sync::{SyncMode, SyncTransport};
-use ui::Ui;
+use ui::{PerformanceView, PhraseEditorView, Ui};
 use voice::{MacroKind, Voice, VoiceEngine, VoiceRender, VoiceScope, adjust_macro, default_voices};
 
 const WINDOW_WIDTH: u32 = 1024;
@@ -52,6 +55,7 @@ struct App {
     direction: HarmonicDirection,
     surprise: bool,
     voice_engine: VoiceEngine,
+    performer_engine: PerformerEngine,
     voices: [Voice; 4],
     scope: VoiceScope,
     recorder: PhraseRecorder,
@@ -74,6 +78,8 @@ impl App {
         let voices = default_voices();
         let mut voice_engine = VoiceEngine::new();
         let current_render = voice_engine.harmonic_change(current_chord, &voices);
+        let performer_engine =
+            PerformerEngine::new(current_chord, settings.tonal, current_render.voicing);
 
         Self {
             screen: Screen::Performance,
@@ -90,6 +96,7 @@ impl App {
             direction,
             surprise: false,
             voice_engine,
+            performer_engine,
             voices,
             scope: VoiceScope::All,
             recorder: PhraseRecorder::new(),
@@ -129,8 +136,15 @@ impl App {
         self.current_render = self.voice_engine.harmonic_change(chord, &self.voices);
 
         if transport_running {
-            midi.play_render(self.current_render)?;
+            midi.stop_all()?;
         }
+        self.performer_engine.harmony_changed(
+            chord,
+            self.settings.tonal,
+            self.current_render.voicing,
+            now_beat,
+        );
+        self.performer_engine.set_enabled(transport_running);
 
         if record {
             self.recorder.chord_changed(now_beat, chord);
@@ -153,22 +167,28 @@ impl App {
             .map(|note| self.settings.tonal.midi_note_label(note));
 
         println!(
-            "CHORD {} -> {:?} MIDI {:?}",
+            "CHORD {} | CHORDS VOICING {:?} MIDI {:?}",
             chord_name, note_names, self.current_render.voicing.notes
         );
 
         Ok(())
     }
 
-    fn revoice_current(
-        &mut self,
-        midi: &mut MidiEngine,
-        transport_running: bool,
-    ) -> Result<(), String> {
+    fn revoice_current(&mut self) {
         self.current_render = self.voice_engine.revoice(self.current_chord, &self.voices);
+        self.performer_engine
+            .update_anchor(self.settings.tonal, self.current_render.voicing);
+    }
 
-        if transport_running {
-            midi.play_render(self.current_render)?;
+    fn update_performers(&mut self, now_beat: f64, midi: &mut MidiEngine) -> Result<(), String> {
+        let batch = self.performer_engine.update(
+            now_beat,
+            self.settings.meter.beats_per_bar(),
+            &self.voices,
+        );
+
+        for event in batch.iter() {
+            midi.apply_event(event)?;
         }
 
         Ok(())
@@ -210,6 +230,13 @@ impl App {
         self.current_render = self
             .voice_engine
             .harmonic_change(self.current_chord, &self.voices);
+        self.performer_engine.harmony_changed(
+            self.current_chord,
+            self.settings.tonal,
+            self.current_render.voicing,
+            now_beat,
+        );
+        self.performer_engine.set_enabled(false);
         self.progression_history.clear();
         self.progression_history.push(self.current_chord);
         midi.stop_all()?;
@@ -218,7 +245,7 @@ impl App {
     }
 }
 
-/// Runs Khaṇa v0.7.
+/// Runs Khaṇa v0.9.1.
 ///
 /// # Errors
 ///
@@ -228,7 +255,7 @@ fn main() -> Result<(), String> {
     let video = sdl_context.video()?;
     let window = video
         .window(
-            "Khaṇa v0.7.0 — progression-context harmony",
+            "Khaṇa v0.9.1 — polyphonic chords + evolving patterns",
             WINDOW_WIDTH,
             WINDOW_HEIGHT,
         )
@@ -257,9 +284,10 @@ fn main() -> Result<(), String> {
         if running_now != was_running {
             if running_now {
                 app.chord_started_beat = now_beat;
-                midi.play_render(app.current_render)?;
+                app.performer_engine.transport_started(now_beat);
             } else {
                 app.phrase_player.stop();
+                app.performer_engine.transport_stopped();
                 midi.stop_all()?;
             }
             was_running = running_now;
@@ -285,8 +313,11 @@ fn main() -> Result<(), String> {
             }
 
             if playback.ended && app.phrase_player.queued_phrase().is_none() {
+                app.performer_engine.set_enabled(false);
                 midi.stop_all()?;
             }
+
+            app.update_performers(now_beat, &mut midi)?;
         }
 
         for event in event_pump.poll_iter() {
@@ -332,22 +363,25 @@ fn main() -> Result<(), String> {
 
                 ui.draw_performance(
                     &mut canvas,
-                    app.settings,
-                    app.setting_focus,
-                    sync_status,
-                    app.current_chord,
-                    now_beat - app.chord_started_beat,
-                    app.current_render,
-                    &app.recommendations,
-                    app.selected_class,
-                    app.selected_row,
-                    app.direction,
-                    &app.voices,
-                    app.scope,
-                    app.recorder.status(),
-                    app.recorder.next_is_armed(),
-                    app.recorder.quantize_beats(),
-                    app.phrases.len(),
+                    PerformanceView {
+                        settings: app.settings,
+                        setting_focus: app.setting_focus,
+                        sync_status,
+                        current_chord: app.current_chord,
+                        chord_elapsed_beats: now_beat - app.chord_started_beat,
+                        current_render: app.current_render,
+                        recommendations: &app.recommendations,
+                        selected_class: app.selected_class,
+                        selected_row: app.selected_row,
+                        direction: app.direction,
+                        voices: &app.voices,
+                        performer_snapshots: app.performer_engine.snapshots(),
+                        scope: app.scope,
+                        recorder_status: app.recorder.status(),
+                        next_recording_armed: app.recorder.next_is_armed(),
+                        quantize_beats: app.recorder.quantize_beats(),
+                        phrase_count: app.phrases.len(),
+                    },
                 )?;
             }
             Screen::PhraseEditor => {
@@ -356,15 +390,17 @@ fn main() -> Result<(), String> {
 
                 ui.draw_phrase_editor(
                     &mut canvas,
-                    app.settings,
-                    sync_status,
-                    app.selected_phrase(),
-                    app.editor_phrase_index,
-                    app.phrases.len(),
-                    app.editor_event_index,
-                    app.editor_zoom,
-                    app.phrase_player.playing_phrase(),
-                    app.phrase_player.queued_phrase(),
+                    PhraseEditorView {
+                        settings: app.settings,
+                        sync_status,
+                        phrase: app.selected_phrase(),
+                        phrase_index: app.editor_phrase_index,
+                        phrase_count: app.phrases.len(),
+                        selected_event: app.editor_event_index,
+                        pixels_per_beat: app.editor_zoom,
+                        playing_phrase: app.phrase_player.playing_phrase(),
+                        queued_phrase: app.phrase_player.queued_phrase(),
+                    },
                 )?;
             }
         }
@@ -453,10 +489,12 @@ fn handle_performance_action(
             app.scope = app.scope.next();
         }
         InputAction::AdjustMacro { kind, delta } => {
+            let bass_density_changed = kind == MacroKind::Density
+                && matches!(app.scope, VoiceScope::All | VoiceScope::One(0));
             adjust_macro(&mut app.voices, app.scope, kind, delta);
 
-            if kind == MacroKind::Spread {
-                app.revoice_current(midi, transport.is_running())?;
+            if kind == MacroKind::Spread || bass_density_changed {
+                app.revoice_current();
             }
         }
         InputAction::ToggleRecord => {
@@ -611,6 +649,7 @@ fn handle_editor_action(
                     transport.start();
                 }
 
+                app.performer_engine.set_enabled(true);
                 app.phrase_player.request(
                     app.editor_phrase_index,
                     transport.beat(app.settings.meter.beats_per_bar()),
@@ -699,7 +738,7 @@ fn replace_selected_with_safe_choice(app: &mut App) {
 }
 
 fn print_controls() {
-    println!("Khaṇa v0.7.0");
+    println!("Khaṇa v0.9.1");
     println!("GLOBAL:");
     println!("  Space   transport start/stop");
     println!("  Tab     Performance / Phrase Editor");
@@ -713,13 +752,15 @@ fn print_controls() {
     println!("  T/G     density -/+");
     println!("  Y/H     dynamics -/+");
     println!("  U/J     spread -/+");
-    println!("  I/K     color -/+");
+    println!("  I/K     color -/+ (role-specific note pool)");
     println!("  P       quantized record start/stop");
     println!("  N       arm next phrase");
     println!("  M       edit tonic/mode/tempo/meter/sync (stopped)");
     println!("SETTINGS:");
     println!("  Left/Right field   Up/Down value   Z/M exit");
     println!("  SYNC INTERNAL/LINK; STARTSYNC OFF/ON");
+    println!("PERFORMERS:");
+    println!("  Bass CHD | Chords BAR | Texture 2BAR | Melody PHR");
     println!("PHRASE EDITOR:");
     println!("  A/L        previous/next phrase");
     println!("  Z          play selected / queue at next bar");

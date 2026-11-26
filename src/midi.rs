@@ -1,19 +1,51 @@
-//! Four-channel MIDI output.
+//! Four-channel MIDI output with polyphonic note ownership.
 //!
-//! The sustained-chord prototype guarantees one active note on each of MIDI
-//! channels 1–4 whenever a render is sounding. Density is intentionally *not*
-//! interpreted as a mute/probability gate here.
+//! Bass, Texture, and Melody currently behave monophonically at the performer
+//! layer. Chords is polyphonic on MIDI channel 2. The MIDI layer therefore
+//! tracks a set of active notes for every channel so stale Note Off messages
+//! cannot terminate unrelated notes.
 
-use crate::voice::VoiceRender;
+use crate::performer::VoiceEvent;
 use midir::os::unix::VirtualOutput;
 use midir::{MidiOutput, MidiOutputConnection};
 
 const VOICE_COUNT: usize = 4;
 
+#[derive(Clone, Copy, Debug)]
+struct NoteOwnership {
+    active: [u128; VOICE_COUNT],
+}
+
+impl NoteOwnership {
+    const fn new() -> Self {
+        Self {
+            active: [0; VOICE_COUNT],
+        }
+    }
+
+    fn contains(&self, voice_index: usize, note: u8) -> bool {
+        self.active
+            .get(voice_index)
+            .is_some_and(|bits| bits & note_bit(note) != 0)
+    }
+
+    fn insert(&mut self, voice_index: usize, note: u8) {
+        if let Some(bits) = self.active.get_mut(voice_index) {
+            *bits |= note_bit(note);
+        }
+    }
+
+    fn remove(&mut self, voice_index: usize, note: u8) {
+        if let Some(bits) = self.active.get_mut(voice_index) {
+            *bits &= !note_bit(note);
+        }
+    }
+}
+
 /// MIDI transport for the four Khaṇa performers.
 pub struct MidiEngine {
     connection: MidiOutputConnection,
-    active_notes: [Option<u8>; VOICE_COUNT],
+    ownership: NoteOwnership,
 }
 
 impl MidiEngine {
@@ -30,67 +62,95 @@ impl MidiEngine {
 
         Ok(Self {
             connection,
-            active_notes: [None; VOICE_COUNT],
+            ownership: NoteOwnership::new(),
         })
     }
 
-    /// Rearticulates a complete four-voice realization.
-    ///
-    /// Every currently tracked note is turned off first, then exactly one Note
-    /// On is sent on each of channels 1–4. Rearticulation is deliberate: a new
-    /// chord selection is a new harmonic attack even when one voice keeps the
-    /// same pitch.
+    /// Applies one performer event while preserving per-note ownership.
     ///
     /// # Errors
     ///
     /// Returns an error if a MIDI message cannot be sent.
-    pub fn play_render(&mut self, render: VoiceRender) -> Result<(), String> {
-        self.stop_all()?;
+    pub fn apply_event(&mut self, event: VoiceEvent) -> Result<(), String> {
+        match event {
+            VoiceEvent::NoteOn {
+                voice_index,
+                note,
+                velocity,
+            } => self.note_on(voice_index, note, velocity),
+            VoiceEvent::NoteOff { voice_index, note } => self.note_off_if_owned(voice_index, note),
+        }
+    }
 
-        for index in 0..VOICE_COUNT {
-            let message =
-                note_on_message(index, render.voicing.notes[index], render.velocities[index]);
-            self.connection
-                .send(&message)
-                .map_err(|error| error.to_string())?;
-            self.active_notes[index] = Some(render.voicing.notes[index]);
+    fn note_on(&mut self, voice_index: usize, note: u8, velocity: u8) -> Result<(), String> {
+        if voice_index >= VOICE_COUNT {
+            return Ok(());
+        }
+
+        // Rearticulating the same pitch first releases only that pitch. Other
+        // Chords notes on the channel remain owned and sounding.
+        if self.ownership.contains(voice_index, note) {
+            self.send(note_off_message(voice_index, note))?;
+            self.ownership.remove(voice_index, note);
+        }
+
+        self.send(note_on_message(voice_index, note, velocity))?;
+        self.ownership.insert(voice_index, note);
+        Ok(())
+    }
+
+    fn note_off_if_owned(&mut self, voice_index: usize, note: u8) -> Result<(), String> {
+        if voice_index >= VOICE_COUNT {
+            return Ok(());
+        }
+
+        if self.ownership.contains(voice_index, note) {
+            self.send(note_off_message(voice_index, note))?;
+            self.ownership.remove(voice_index, note);
         }
 
         Ok(())
     }
 
-    /// Sends Note Off for every note Khaṇa currently tracks as active.
-    ///
-    /// After any successful `play_render`, this means one Note Off on each of
-    /// channels 1–4.
+    /// Sends Note Off for every note currently owned by Khaṇa.
     ///
     /// # Errors
     ///
     /// Returns an error if a MIDI message cannot be sent.
     pub fn stop_all(&mut self) -> Result<(), String> {
-        for index in 0..VOICE_COUNT {
-            if let Some(note) = self.active_notes[index].take() {
-                let message = note_off_message(index, note);
-                self.connection
-                    .send(&message)
-                    .map_err(|error| error.to_string())?;
+        for voice_index in 0..VOICE_COUNT {
+            for note in 0_u8..=127 {
+                if self.ownership.contains(voice_index, note) {
+                    self.send(note_off_message(voice_index, note))?;
+                    self.ownership.remove(voice_index, note);
+                }
             }
         }
 
         Ok(())
     }
+
+    fn send(&mut self, message: [u8; 3]) -> Result<(), String> {
+        self.connection
+            .send(&message)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn note_bit(note: u8) -> u128 {
+    1_u128 << note.min(127)
 }
 
 fn note_on_message(channel_index: usize, note: u8, velocity: u8) -> [u8; 3] {
     [
         0x90 | channel_nibble(channel_index),
-        note,
+        note.min(127),
         velocity.min(127),
     ]
 }
 
 fn note_off_message(channel_index: usize, note: u8) -> [u8; 3] {
-    [0x80 | channel_nibble(channel_index), note, 0]
+    [0x80 | channel_nibble(channel_index), note.min(127), 0]
 }
 
 fn channel_nibble(channel_index: usize) -> u8 {
@@ -100,35 +160,55 @@ fn channel_nibble(channel_index: usize) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{note_off_message, note_on_message};
+    use super::{NoteOwnership, note_off_message, note_on_message};
 
     #[test]
     fn four_voice_note_on_messages_use_midi_channels_one_through_four() {
-        let messages = [
-            note_on_message(0, 48, 90),
-            note_on_message(1, 55, 91),
-            note_on_message(2, 60, 92),
-            note_on_message(3, 67, 93),
-        ];
-
-        assert_eq!(messages[0], [0x90, 48, 90]);
-        assert_eq!(messages[1], [0x91, 55, 91]);
-        assert_eq!(messages[2], [0x92, 60, 92]);
-        assert_eq!(messages[3], [0x93, 67, 93]);
+        assert_eq!(note_on_message(0, 48, 90), [0x90, 48, 90]);
+        assert_eq!(note_on_message(1, 55, 91), [0x91, 55, 91]);
+        assert_eq!(note_on_message(2, 60, 92), [0x92, 60, 92]);
+        assert_eq!(note_on_message(3, 67, 93), [0x93, 67, 93]);
     }
 
     #[test]
     fn four_voice_note_off_messages_use_midi_channels_one_through_four() {
-        let messages = [
-            note_off_message(0, 48),
-            note_off_message(1, 55),
-            note_off_message(2, 60),
-            note_off_message(3, 67),
-        ];
+        assert_eq!(note_off_message(0, 48), [0x80, 48, 0]);
+        assert_eq!(note_off_message(1, 55), [0x81, 55, 0]);
+        assert_eq!(note_off_message(2, 60), [0x82, 60, 0]);
+        assert_eq!(note_off_message(3, 67), [0x83, 67, 0]);
+    }
 
-        assert_eq!(messages[0], [0x80, 48, 0]);
-        assert_eq!(messages[1], [0x81, 55, 0]);
-        assert_eq!(messages[2], [0x82, 60, 0]);
-        assert_eq!(messages[3], [0x83, 67, 0]);
+    #[test]
+    fn one_channel_can_own_multiple_chord_notes() {
+        let mut ownership = NoteOwnership::new();
+        ownership.insert(1, 52);
+        ownership.insert(1, 55);
+        ownership.insert(1, 59);
+
+        assert!(ownership.contains(1, 52));
+        assert!(ownership.contains(1, 55));
+        assert!(ownership.contains(1, 59));
+    }
+
+    #[test]
+    fn removing_one_chord_note_keeps_the_others_owned() {
+        let mut ownership = NoteOwnership::new();
+        ownership.insert(1, 52);
+        ownership.insert(1, 55);
+        ownership.insert(1, 59);
+        ownership.remove(1, 55);
+
+        assert!(ownership.contains(1, 52));
+        assert!(!ownership.contains(1, 55));
+        assert!(ownership.contains(1, 59));
+    }
+
+    #[test]
+    fn stale_note_off_cannot_release_an_unrelated_note() {
+        let mut ownership = NoteOwnership::new();
+        ownership.insert(2, 64);
+
+        assert!(!ownership.contains(2, 60));
+        assert!(ownership.contains(2, 64));
     }
 }

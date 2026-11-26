@@ -1,8 +1,8 @@
-//! Four-voice chord realization with smooth voice leading.
+//! Four-note chord realization for the polyphonic Chords performer.
 
-use super::chord::Chord;
+use super::chord::{Chord, ChordExtension};
 
-/// Four ascending MIDI notes, one for each Khaṇa voice.
+/// Four ascending MIDI notes forming the current Chords voicing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Voicing {
     pub notes: [u8; 4],
@@ -12,17 +12,29 @@ pub struct Voicing {
 pub struct VoicingEngine;
 
 impl VoicingEngine {
+    /// Creates a voicing engine.
     pub const fn new() -> Self {
         Self
     }
 
-    /// Finds a smooth ascending four-note realization.
-    pub fn realize(&self, chord: Chord, previous: Option<Voicing>, spread: f32) -> Voicing {
+    /// Finds a smooth upper realization for the Chords performer.
+    ///
+    /// When `bass_present` is true, the dedicated Bass performer is allowed to
+    /// supply the root. Chords then prioritize the tones that identify quality
+    /// and extension: third, seventh, and explicit upper extensions before an
+    /// otherwise redundant root doubling.
+    pub fn realize_with_bass(
+        &self,
+        chord: Chord,
+        previous: Option<Voicing>,
+        spread: f32,
+        bass_present: bool,
+    ) -> Voicing {
         let spread = spread.clamp(0.0, 1.0);
         let targets = target_registers(spread);
         let candidates = candidate_notes(chord);
 
-        let mut best = [48_u8, 55, 60, 67];
+        let mut best = [52_u8, 60, 67, 72];
         let mut best_score = f32::MAX;
 
         for &a in &candidates {
@@ -40,13 +52,12 @@ impl VoicingEngine {
                         }
 
                         let notes = [a, b, c, d];
-
-                        if !covers_essential_tones(chord, notes) {
+                        if !covers_required_tones(chord, notes, bass_present) {
                             continue;
                         }
 
-                        let score = score_voicing(notes, previous, targets);
-
+                        let score = score_voicing(notes, previous, targets)
+                            + root_doubling_cost(chord, notes, bass_present);
                         if score < best_score {
                             best = notes;
                             best_score = score;
@@ -67,23 +78,54 @@ impl Default for VoicingEngine {
 }
 
 fn candidate_notes(chord: Chord) -> Vec<u8> {
-    (36_u8..=88)
+    (47_u8..=91)
         .filter(|note| chord.contains_midi_pitch(*note))
         .collect()
 }
 
-fn covers_essential_tones(chord: Chord, notes: [u8; 4]) -> bool {
+fn covers_required_tones(chord: Chord, notes: [u8; 4], bass_present: bool) -> bool {
     let pitch_classes = notes.map(|note| note % 12);
+    let intervals = chord.intervals();
 
-    chord
-        .essential_pitch_classes()
-        .into_iter()
-        .all(|required| pitch_classes.contains(&required))
+    let required_intervals: Vec<u8> = if bass_present {
+        match chord.extension {
+            ChordExtension::Triad => vec![intervals[1], intervals[2]],
+            ChordExtension::Seventh => {
+                vec![intervals[1], intervals[2], intervals[3]]
+            }
+            ChordExtension::Ninth => {
+                vec![intervals[1], intervals[3], intervals[4]]
+            }
+        }
+    } else {
+        match chord.extension {
+            ChordExtension::Triad => intervals[..3].to_vec(),
+            ChordExtension::Seventh => intervals[..4].to_vec(),
+            ChordExtension::Ninth => {
+                vec![intervals[0], intervals[1], intervals[3], intervals[4]]
+            }
+        }
+    };
+
+    required_intervals.into_iter().all(|interval| {
+        let pitch_class = (chord.root.value() + interval) % 12;
+        pitch_classes.contains(&pitch_class)
+    })
+}
+
+fn root_doubling_cost(chord: Chord, notes: [u8; 4], bass_present: bool) -> f32 {
+    if !bass_present {
+        return 0.0;
+    }
+
+    let root = chord.root.value();
+    let root_count = notes.iter().filter(|note| **note % 12 == root).count();
+    root_count as f32 * 2.5
 }
 
 fn target_registers(spread: f32) -> [f32; 4] {
-    let compact = [48.0_f32, 55.0, 61.0, 67.0];
-    let wide = [38.0_f32, 52.0, 68.0, 82.0];
+    let compact = [52.0_f32, 57.0, 62.0, 67.0];
+    let wide = [48.0_f32, 59.0, 72.0, 84.0];
 
     std::array::from_fn(|index| compact[index] + (wide[index] - compact[index]) * spread)
 }
@@ -109,7 +151,7 @@ fn score_voicing(notes: [u8; 4], previous: Option<Voicing>, targets: [f32; 4]) -
         .max()
         .unwrap_or(0);
 
-    movement_cost * if previous.is_some() { 2.4 } else { 0.0 }
+    movement_cost * if previous.is_some() { 2.5 } else { 0.0 }
         + target_cost
         + f32::from(largest_gap.saturating_sub(24)) * 2.0
 }
@@ -120,13 +162,13 @@ mod tests {
     use crate::music::chord::{Chord, ChordExtension, ChordQuality, PitchClass};
 
     #[test]
-    fn major_seventh_voicing_contains_all_four_chord_tones() {
+    fn seventh_voicing_without_bass_contains_all_four_chord_tones() {
         let chord = Chord::new(
             PitchClass::from_value(0),
             ChordQuality::Major,
             ChordExtension::Seventh,
         );
-        let voicing = VoicingEngine::new().realize(chord, None, 0.5);
+        let voicing = VoicingEngine::new().realize_with_bass(chord, None, 0.5, false);
         let pcs = voicing.notes.map(|note| note % 12);
 
         for essential in chord.essential_pitch_classes() {
@@ -135,18 +177,30 @@ mod tests {
     }
 
     #[test]
-    fn dominant_ninth_four_voice_reduction_omits_fifth_not_essential_colors() {
+    fn dominant_ninth_with_bass_keeps_third_seventh_and_ninth() {
         let chord = Chord::new(
             PitchClass::from_value(7),
             ChordQuality::Dominant,
             ChordExtension::Ninth,
         );
-        let voicing = VoicingEngine::new().realize(chord, None, 0.5);
+        let voicing = VoicingEngine::new().realize_with_bass(chord, None, 0.5, true);
         let pcs = voicing.notes.map(|note| note % 12);
 
-        // G9 -> essential G, B, F, A in four voices.
-        for required in [7_u8, 11, 5, 9] {
+        // G9 with a dedicated bass must still state B, F, and A upstairs.
+        for required in [11_u8, 5, 9] {
             assert!(pcs.contains(&required));
         }
+    }
+
+    #[test]
+    fn chord_voicing_stays_in_upper_register() {
+        let chord = Chord::new(
+            PitchClass::from_value(0),
+            ChordQuality::Major,
+            ChordExtension::Triad,
+        );
+        let voicing = VoicingEngine::new().realize_with_bass(chord, None, 0.5, true);
+
+        assert!(voicing.notes[0] >= 47);
     }
 }

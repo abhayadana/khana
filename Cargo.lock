@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "khana"
-version = "0.7.0"
+version = "0.9.1"
 dependencies = [
  "midir",
  "rusty_link",
