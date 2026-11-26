@@ -1,4 +1,7 @@
-# Khaṇa v0.11.1
+# Khaṇa v0.11.2
+
+See [v0.11.2 MIDI bring-up](docs/BRICK_V0.11.2.md) for headless MIDI discovery,
+explicit raw USB MIDI output, timing diagnostics and the hardware test plan.
 
 Khaṇa is a performance-oriented MIDI harmony/phrase instrument for the TrimUI
 Brick Pro and desktop development. Its core workflow is:

@@ -545,6 +545,8 @@ pub struct PerformerEngine {
     enabled: bool,
     intensity: f32,
     states: [PerformerState; VOICE_COUNT],
+    expired_attacks: u64,
+    max_attack_lateness_beats: f64,
 }
 
 impl PerformerEngine {
@@ -558,6 +560,8 @@ impl PerformerEngine {
             next_chord_target: None,
             enabled: false,
             intensity: 0.0,
+            expired_attacks: 0,
+            max_attack_lateness_beats: 0.0,
             states: [
                 PerformerState::new(PatternState::new(
                     PatternFamily::BassFoundation,
@@ -674,6 +678,14 @@ impl PerformerEngine {
         }
     }
 
+    /// Return and reset scheduler diagnostics for the reporting interval.
+    pub fn take_timing_diagnostics(&mut self) -> (u64, f64) {
+        (
+            std::mem::take(&mut self.expired_attacks),
+            std::mem::take(&mut self.max_attack_lateness_beats),
+        )
+    }
+
     /// Returns current UI state for all four performers.
     pub fn snapshots(&self) -> [PerformerSnapshot; VOICE_COUNT] {
         std::array::from_fn(|index| PerformerSnapshot {
@@ -701,7 +713,12 @@ impl PerformerEngine {
 
         // First settle every already-scheduled event so EnsembleContext never
         // observes a note that should have been released this frame.
-        for index in 0..VOICE_COUNT {
+        for (index, voice) in voices.iter().enumerate() {
+            // A muted voice must not emit an already-queued Note On.
+            if voice.parameters.density <= 0.01 {
+                self.mute_voice(index, &mut batch);
+                continue;
+            }
             self.release_due_notes(index, now_beat, &mut batch);
             self.start_due_attack(index, now_beat, &mut batch);
         }
@@ -713,7 +730,6 @@ impl PerformerEngine {
             let role = voice.role;
 
             if voice.parameters.density <= 0.01 {
-                self.mute_voice(index, &mut batch);
                 continue;
             }
 
@@ -890,6 +906,16 @@ impl PerformerEngine {
         if now_beat + f64::EPSILON < pending.start_beat {
             return;
         }
+        self.max_attack_lateness_beats = self
+            .max_attack_lateness_beats
+            .max(now_beat - pending.start_beat);
+        if now_beat >= pending.start_beat + pending.gate_beats {
+            // A missed gate is silence, not a late burst of Note On/Off.
+            self.states[index].pending = None;
+            self.states[index].pending_resolution = None;
+            self.expired_attacks = self.expired_attacks.saturating_add(1);
+            return;
+        }
 
         if let Some(active) = self.states[index].sounding.take() {
             for note in active.notes.iter() {
@@ -912,7 +938,7 @@ impl PerformerEngine {
             notes: pending.notes,
             off_beat: pending.start_beat + pending.gate_beats,
         });
-        self.states[index].last_attack_beat = Some(pending.start_beat);
+        self.states[index].last_attack_beat = Some(now_beat);
         if pending.notes.len == 1 {
             let next_note = pending.notes.notes[0];
             self.states[index].motion_direction =
@@ -2529,6 +2555,56 @@ mod tests {
             plan.steps[cadence].articulation,
             super::MelodyArticulation::Held
         );
+    }
+
+    #[test]
+    fn expired_attack_does_not_retrigger_or_release_a_held_note() {
+        let mut engine = PerformerEngine::new(
+            c_major(),
+            MusicalSettings::default().tonal,
+            Voicing::from_slice(&[52, 55, 60]),
+        );
+        engine.states[2].sounding = Some(super::ScheduledNotes {
+            notes: super::NoteSet::single(76),
+            off_beat: 4.0,
+        });
+        engine.states[2].pending = Some(super::PendingAttack {
+            notes: super::NoteSet::single(79),
+            velocity: 90,
+            start_beat: 1.0,
+            gate_beats: 0.25,
+        });
+        let mut batch = super::VoiceEventBatch::new();
+        engine.start_due_attack(2, 1.5, &mut batch);
+        assert_eq!(batch.iter().count(), 0);
+        assert!(engine.states[2].pending.is_none());
+        assert_eq!(engine.snapshots()[2].active_notes[0], Some(76));
+        assert_eq!(engine.take_timing_diagnostics(), (1, 0.5));
+        assert_eq!(engine.take_timing_diagnostics(), (0, 0.0));
+    }
+
+    #[test]
+    fn mute_cancels_pending_attack_before_dispatch() {
+        let mut engine = PerformerEngine::new(
+            c_major(),
+            MusicalSettings::default().tonal,
+            Voicing::from_slice(&[52, 55, 60]),
+        );
+        engine.transport_started(0.0);
+        engine.states[2].pending = Some(super::PendingAttack {
+            notes: super::NoteSet::single(76),
+            velocity: 90,
+            start_beat: 1.0,
+            gate_beats: 0.5,
+        });
+        let mut voices = default_voices();
+        voices[2].parameters.density = 0.0;
+        let batch = engine.update(1.0, 4.0, &voices);
+        assert!(!batch.iter().any(|event| matches!(
+            event,
+            VoiceEvent::NoteOn { voice_index: 2, .. }
+        )));
+        assert!(engine.states[2].pending.is_none());
     }
 
     #[test]

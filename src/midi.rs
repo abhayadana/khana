@@ -5,6 +5,12 @@
 //! tracks a set of active notes for every channel so stale Note Off messages
 //! cannot terminate unrelated notes.
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::path::Path;
+use std::time::Duration;
+
 use crate::performer::VoiceEvent;
 use midir::os::unix::VirtualOutput;
 use midir::{MidiOutput, MidiOutputConnection};
@@ -42,9 +48,16 @@ impl NoteOwnership {
     }
 }
 
+/// The selected output backend. Raw MIDI is explicit, never guessed.
+enum MidiSink {
+    Alsa(MidiOutputConnection),
+    Raw(File),
+    DryRun,
+}
+
 /// MIDI transport for the four Khaṇa performers.
 pub struct MidiEngine {
-    connection: Option<MidiOutputConnection>,
+    connection: MidiSink,
     ownership: NoteOwnership,
     destination_name: String,
     trace: bool,
@@ -63,7 +76,7 @@ impl MidiEngine {
             .map_err(|error| error.to_string())?;
 
         Ok(Self {
-            connection: Some(connection),
+            connection: MidiSink::Alsa(connection),
             ownership: NoteOwnership::new(),
             destination_name: format!("VIRTUAL: {port_name}"),
             trace: trace_enabled(),
@@ -125,7 +138,7 @@ impl MidiEngine {
 
             println!("MIDI: connected to destination: {name}");
             return Ok(Self {
-                connection: Some(connection),
+                connection: MidiSink::Alsa(connection),
                 ownership: NoteOwnership::new(),
                 destination_name: name,
                 trace: trace_enabled(),
@@ -143,10 +156,60 @@ impl MidiEngine {
     pub fn dry_run() -> Self {
         println!("MIDI: DRY RUN - no output");
         Self {
-            connection: None,
+            connection: MidiSink::DryRun,
             ownership: NoteOwnership::new(),
             destination_name: "DRY RUN - NO OUTPUT".to_owned(),
             trace: trace_enabled(),
+        }
+    }
+
+    /// Open the requested Linux raw MIDI character device without blocking.
+    ///
+    /// This bypasses ALSA sequencer discovery, not the kernel USB MIDI driver.
+    fn new_raw(path: &Path) -> Result<Self, String> {
+        // Linux O_NONBLOCK on x86_64 and aarch64. No new libc dependency.
+        const O_NONBLOCK: i32 = 0x800;
+        let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+        if !metadata.file_type().is_char_device() {
+            return Err(format!("Not a MIDI character device: {}", path.display()));
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .custom_flags(O_NONBLOCK)
+            .open(path)
+            .map_err(|error| format!("Raw MIDI {}: {error}", path.display()))?;
+        let destination_name = format!("RAW: {}", path.display());
+        println!("MIDI: {destination_name}");
+        Ok(Self {
+            connection: MidiSink::Raw(file),
+            ownership: NoteOwnership::new(),
+            destination_name,
+            trace: trace_enabled(),
+        })
+    }
+
+    /// Resolve explicit output requests before attempting automatic discovery.
+    /// Only an unrequested auto connection may fall back to Brick dry-run.
+    pub fn configured(brick: bool) -> Result<Self, String> {
+        if std::env::var("KHANA_MIDI_DRY_RUN").as_deref() == Ok("1") {
+            return Ok(Self::dry_run());
+        }
+
+        let raw = std::env::var_os("KHANA_MIDI_RAW_DEVICE").filter(|path| !path.is_empty());
+        let requested = explicit_port();
+        if let Some(path) = raw {
+            if requested {
+                return Err("Set only one of KHANA_MIDI_PORT and KHANA_MIDI_RAW_DEVICE".to_owned());
+            }
+            return Self::new_raw(Path::new(&path));
+        }
+
+        match Self::new_auto("Khana MIDI") {
+            Err(error) if brick && !requested => {
+                eprintln!("MIDI unavailable: {error}; starting UI-only dry run");
+                Ok(Self::dry_run())
+            }
+            result => result,
         }
     }
 
@@ -236,10 +299,14 @@ impl MidiEngine {
                 message[0], message[1], message[2]
             );
         }
-        if let Some(connection) = &mut self.connection {
-            connection.send(&message).map_err(|error| error.to_string())
-        } else {
-            Ok(())
+        match &mut self.connection {
+            MidiSink::Alsa(connection) => {
+                connection.send(&message).map_err(|error| error.to_string())
+            }
+            MidiSink::Raw(file) => file
+                .write_all(&message)
+                .map_err(|error| format!("Raw MIDI write: {error}")),
+            MidiSink::DryRun => Ok(()),
         }
     }
 }
@@ -251,6 +318,77 @@ impl Drop for MidiEngine {
             eprintln!("MIDI cleanup: {error}");
         }
     }
+}
+
+/// Print both discovery paths, even when the sequencer cannot initialize.
+pub fn list_destinations() {
+    match MidiOutput::new("Khana probe") {
+        Ok(output) => {
+            let ports = output.ports();
+            println!("ALSA sequencer destinations: {}", ports.len());
+            for (index, port) in ports.iter().enumerate() {
+                let name = output.port_name(port).unwrap_or_else(|error| error.to_string());
+                println!("  {index}: {name}");
+            }
+        }
+        Err(error) => eprintln!("ALSA sequencer unavailable: {error}"),
+    }
+    match std::fs::read_dir("/dev/snd") {
+        Ok(entries) => {
+            let mut paths: Vec<_> = entries
+                .filter_map(Result::ok)
+                .filter(|entry| raw_device_name(&entry.file_name().to_string_lossy()))
+                .map(|entry| entry.path())
+                .collect();
+            paths.sort();
+            println!("Raw MIDI device nodes: {}", paths.len());
+            for path in paths {
+                println!("  {}", path.display());
+            }
+        }
+        Err(error) => eprintln!("Cannot enumerate /dev/snd: {error}"),
+    }
+}
+
+fn raw_device_name(name: &str) -> bool {
+    let Some((card, device)) = name.strip_prefix("midiC").and_then(|rest| rest.split_once('D'))
+    else {
+        return false;
+    };
+    !card.is_empty()
+        && !device.is_empty()
+        && card.bytes().all(|byte| byte.is_ascii_digit())
+        && device.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn explicit_port() -> bool {
+    std::env::var("KHANA_MIDI_PORT").is_ok_and(|value| !value.trim().is_empty())
+}
+
+/// Exercise the four channels with a short, explicit-destination audition.
+pub fn smoke_test() -> Result<(), String> {
+    let dry = std::env::var("KHANA_MIDI_DRY_RUN").as_deref() == Ok("1");
+    let raw = std::env::var_os("KHANA_MIDI_RAW_DEVICE").is_some_and(|path| !path.is_empty());
+    if !dry && !raw && !explicit_port() {
+        return Err("MIDI test requires KHANA_MIDI_PORT, KHANA_MIDI_RAW_DEVICE or dry-run".to_owned());
+    }
+    let mut midi = MidiEngine::configured(false)?;
+    let groups: [&[u8]; VOICE_COUNT] = [&[48], &[60, 64, 67], &[72], &[76]];
+    for (voice_index, notes) in groups.into_iter().enumerate() {
+        println!("Testing channel {}: {notes:?}", voice_index + 1);
+        for &note in notes {
+            midi.apply_event(VoiceEvent::NoteOn {
+                voice_index,
+                note,
+                velocity: 72,
+            })?;
+        }
+        println!("Owned notes: {:?}", midi.active_counts());
+        std::thread::sleep(Duration::from_millis(350));
+        midi.stop_all()?;
+    }
+    println!("MIDI test complete; owned notes: {:?}", midi.active_counts());
+    Ok(())
 }
 
 fn trace_enabled() -> bool {
@@ -330,6 +468,15 @@ mod tests {
 
         assert!(!ownership.contains(2, 60));
         assert!(ownership.contains(2, 64));
+    }
+
+    #[test]
+    fn raw_device_names_exclude_pcm_and_control_nodes() {
+        assert!(super::raw_device_name("midiC1D0"));
+        assert!(super::raw_device_name("midiC12D3"));
+        for name in ["seq", "controlC1", "pcmC1D0p", "midiCD0", "midiC1D0x"] {
+            assert!(!super::raw_device_name(name));
+        }
     }
 
     #[test]

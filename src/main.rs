@@ -1,4 +1,4 @@
-//! Khaṇa v0.11.1 Brick foundation.
+//! Khaṇa v0.11.2 MIDI bring-up and timing diagnostics.
 //!
 //! v0.11 adds complete semantic chord voicings, rhythmic/gated Melody phrases,
 //! persistent cyclic Texture, and lightweight performer-to-performer awareness.
@@ -260,6 +260,21 @@ fn ui_period(value: Option<&str>) -> Result<Duration, String> {
 }
 
 fn main() -> Result<(), String> {
+    // Headless diagnostics deliberately run before SDL/video initialization.
+    let mut args = std::env::args().skip(1);
+    if let Some(command) = args.next() {
+        if args.next().is_some() {
+            return Err("Expected a single diagnostic option".to_owned());
+        }
+        return match command.as_str() {
+            "--midi-list" => {
+                midi::list_destinations();
+                Ok(())
+            }
+            "--midi-test" => midi::smoke_test(),
+            _ => Err(format!("Unknown option: {command}")),
+        };
+    }
     let brick = std::env::var("KHANA_BRICK").as_deref() == Ok("1")
         || std::env::var("PLATFORM").as_deref() == Ok("tg5040");
     let frame_period = ui_period(std::env::var("BRICK_UI_FPS").ok().as_deref())?;
@@ -320,18 +335,7 @@ fn main() -> Result<(), String> {
     let ui = Ui::new(WINDOW_WIDTH, brick);
     let mut app = App::new();
     let mut transport = SyncTransport::new(app.settings.tempo_bpm);
-    let mut midi = if std::env::var("KHANA_MIDI_DRY_RUN").as_deref() == Ok("1") {
-        MidiEngine::dry_run()
-    } else {
-        match MidiEngine::new_auto("Khana MIDI") {
-            Ok(midi) => midi,
-            Err(error) if brick => {
-                eprintln!("MIDI unavailable: {error}; starting UI-only dry run");
-                MidiEngine::dry_run()
-            }
-            Err(error) => return Err(error),
-        }
-    };
+    let mut midi = MidiEngine::configured(brick)?;
     let midi_destination = midi.destination_name().to_owned();
     let mut was_running = false;
 
@@ -340,18 +344,24 @@ fn main() -> Result<(), String> {
     let mut last_poll = next_render;
     let mut last_report = next_render;
     let mut max_gap = Duration::ZERO;
+    let mut max_render = Duration::ZERO;
 
     'running: loop {
         let poll = Instant::now();
         max_gap = max_gap.max(poll.duration_since(last_poll));
         last_poll = poll;
         if poll.duration_since(last_report) >= Duration::from_secs(5) {
+            let (expired, late_beats) = app.performer_engine.take_timing_diagnostics();
             println!(
-                "DIAG max poll gap {:.2} ms | active MIDI notes {:?}",
+                "DIAG poll {:.2} ms | render {:.2} ms | expired attacks {} | max attack lateness {:.4} beats | active MIDI {:?}",
                 max_gap.as_secs_f64() * 1000.0,
+                max_render.as_secs_f64() * 1000.0,
+                expired,
+                late_beats,
                 midi.active_counts()
             );
             max_gap = Duration::ZERO;
+            max_render = Duration::ZERO;
             last_report = poll;
         }
         let now_beat = transport.beat(app.settings.meter.beats_per_bar());
@@ -500,6 +510,7 @@ fn main() -> Result<(), String> {
         }
 
         canvas.present();
+        max_render = max_render.max(render_now.elapsed());
         thread::sleep(Duration::from_millis(1));
     }
 

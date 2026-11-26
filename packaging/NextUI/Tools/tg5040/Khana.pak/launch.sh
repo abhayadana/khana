@@ -8,7 +8,7 @@ cd "$PAK_DIR"
 export KHANA_BRICK=1
 export BRICK_UI_FPS="${BRICK_UI_FPS:-30}"
 # Preserve NextUI's SDL environment. Do not force an unverified video backend.
-echo "Khana v0.11.1 NextUI launch"
+echo "Khana v0.11.2 NextUI launch"
 date
 printf 'PAK=%s PLATFORM=%s SDL_VIDEODRIVER=%s UI_FPS=%s\n' "$PAK_DIR" "${PLATFORM:-unknown}" "${SDL_VIDEODRIVER:-auto}" "$BRICK_UI_FPS"
 if [ ! -x ./khana ]; then
