@@ -1,548 +1,247 @@
-# Khaṇa v0.12.1
+# Khaṇa v0.12.2
 
-See [v0.12.1 live harmony and session restore](docs/BRICK_V0.12.1.md) for
-the new controls, looping, voicings, and save behavior.
+Khaṇa is a playable MIDI instrument for TrimUI Brick Pro with NextUI and for
+Linux desktop. Choose a chord, shape the four performers, then record and
+loop a progression. Connect it to a synth, DAW, or other MIDI receiver for
+sound.
 
-See [v0.12.0 transpose and musical continuity](docs/BRICK_V0.12.0.md) for
-per-performer MIDI transpose, the evolving Melody motif, and listening checks.
+## Build and install
 
-See [v0.11.6 MIDI routing and external sync](docs/BRICK_V0.11.6.md) for
-assigning performer channels, following MIDI Clock In, and building with
-Ableton Link for Brick Pro.
+The Brick build uses an AArch64 NextUI toolchain with `cross` and Docker.
+For an existing `khana-nextui-link:pic` image, use the checked-in
+`Cross-link-local.toml`. That image needs Clang/libclang for the Link
+bindings and `CMAKE_POSITION_INDEPENDENT_CODE=ON` in the NextUI CMake
+toolchain. This guide uses the local PIC image for both build and deploy.
 
-With transport stopped, hold **Select** and press **X** on Performance
-(desktop **M**) to edit tonic, mode, tempo, meter, and sync settings. Use
-left/right to select a field and up/down to change it. During internal-clock
-playback, the same shortcut opens live tempo editing.
+When installing a patch, start from its stated GitHub commit and use
+`git apply --check /path/to/patch` followed by `git apply /path/to/patch`.
+The v0.12.2 patch is based on `1f20363ad1679fdeaf5e428e97b3f969b0f5d57e`.
 
-See [v0.11.5 MIDI Clock Out](docs/BRICK_V0.11.5.md) for clock routing,
-Start/Continue behavior, MIDI panic, and the Brick and desktop test plan.
-
-See [v0.11.4 musical timing worker](docs/BRICK_V0.11.4.md) for thread ownership,
-MIDI output selection, NextUI runtime setup and acceptance tests.
-
-See [v0.11.3 raw MIDI platform](docs/BRICK_V0.11.3.md) for the new Brick default,
-device selection, reconnection behavior, build flags and hardware tests.
-
-See [v0.11.2 MIDI bring-up](docs/BRICK_V0.11.2.md) for headless MIDI discovery,
-explicit raw USB MIDI output, timing diagnostics and the hardware test plan.
-
-Khaṇa is a performance-oriented MIDI harmony/phrase instrument for the TrimUI
-Brick Pro and desktop development. Its core workflow is:
-
-```text
-hear possibilities → choose → shape → capture → revisit → vary
-```
-
-v0.11.0 is the first build where the four generators begin behaving like a
-small ensemble rather than four independent parts reacting to the same chord.
-
-## v0.11.1 — Brick foundation
-
-This cumulative upgrade applies directly to **v0.9.1** at GitHub commit
-`ad880bdfb6714f7c552ed81813a25420ad0d5202` (20261126 baseline). It includes
-the v0.10 editor and performer changes, audited v0.11 ensemble changes,
-and v0.11.1 Brick foundation. No intermediate patches are required. See [Brick setup and controls](docs/BRICK_V0.11.1.md)
-for the complete handheld mapping, build/deploy workflow and hardware test plan.
+From the repository root, build a Link-enabled Pak or deploy it over SSH:
 
 ```sh
-./scripts/package-khana.sh
-BRICK_HOST=user@brick-ip ./scripts/deploy-khana.sh
+CROSS_CONFIG="$PWD/Cross-link-local.toml" KHANA_LINK=1 \
+  ./scripts/package-khana.sh
+
+# Substitute the Brick's IP address. This command also builds the Pak.
+CROSS_CONFIG="$PWD/Cross-link-local.toml" KHANA_LINK=1 \
+  BRICK_HOST=root@YOUR_BRICK_IP ./scripts/deploy-khana.sh
 ```
 
-The package is `dist/Khana.pak.zip`; deployment always rebuilds first. The first
-hardware pass may use `KHANA_MIDI_DRY_RUN=1` to validate controls without MIDI.
+For an SD-card install, extract `dist/Khana.pak.zip` into `Tools/tg5040/`
+on the card. Launch Khaṇa from Tools. Exit Khaṇa before replacing the Pak
+and back up any local changes to `launch.sh`. The session lives outside
+the Pak. The default NextUI log is
+`/mnt/SDCARD/.userdata/tg5040/logs/Khana.txt`.
 
-## v0.11 musical foundation
+On Linux desktop, install the Rust toolchain, SDL2 and ALSA development
+packages, CMake, Clang/libclang, and a C++ compiler. Run with Link and the
+desktop ALSA sequencer backend:
 
-```text
-Bass      foundation / line / destination
-Chords    complete harmonic statement
-Texture   regular cyclic motion / atmosphere
-Melody    phrase / motif / expressive rhythm
-
-                    ↕
-             EnsembleContext
-                    ↕
-       rhythmic + melodic coordination
+```sh
+cargo run --locked --features ableton-link
 ```
 
-The harmonic recommendation engine, Phrase Editor grid, Brick/NextUI
-scaffolding, and physical MIDI discovery from v0.10 remain in place.
-
-## Chords: play the chord that is displayed
-
-The Chords performer no longer forces every harmony into a four-note voicing.
-
-```text
-C          C E G             3 notes
-Cm         C Eb G            3 notes
-
-Cmaj7      C E G B           4 notes
-Cm7        C Eb G Bb         4 notes
-G7         G B D F           4 notes
-
-Cmaj9      C E G B D         5 notes
-G9         G B D F A         5 notes
-```
-
-Every semantic chord tone appears exactly once in the Chords performer.
-
-Bass presence does not remove the root from Chords and does not change the
-chord's note count. Spread changes inversion/register width while preserving
-membership.
-
-The real-time voicing container remains fixed-capacity and allocation-free.
-Seven slots are reserved so future 11th/13th chord support does not require
-another storage redesign.
-
-## Chords Density
-
-The v0.10 continuum remains:
-
-```text
-SILENT
-  ↓
-LONG SUSTAIN
-  ↓
-BAR SUSTAIN
-  ↓
-PULSE
-  ↓
-COMP
-  ↓
-ACTIVE
-```
-
-LONG SUSTAIN includes two- and four-bar holds. A real harmony change always
-interrupts the prior chord immediately.
-
-## Melody: phrase rhythm is now part of the idea
-
-Melody is still generated as two-bar phrases, but v0.11 no longer treats phrase
-events as mostly equal-length sequencer notes.
-
-Each Melody step carries:
-
-```text
-intent
-gate length
-articulation
-```
-
-Current intents:
-
-```text
-Skeleton
-Fill
-Neighbor
-Suspension
-Modal Tension
-Chromatic Approach
-Rest
-```
-
-Current articulation states:
-
-```text
-Short
-Normal
-Legato
-Held
-```
-
-Typical duration behavior:
-
-```text
-passing / neighbor / chromatic approach   short
-ordinary fill                            short–medium
-structural skeleton                      medium
-suspension / modal tension               longer / legato
-phrase peak                              longer
-cadential arrival                        longest / held
-```
-
-A phrase can therefore sound more like:
-
-```text
-G──────  A B  C────────
-```
-
-rather than a stream of equal eighth notes.
-
-### Melody rhythmic identities
-
-The existing user-facing families remain:
-
-```text
-MOTIF → PHRASE → ORNAMENT
-```
-
-Their internal variants now carry more recognizable rhythmic behavior:
-
-```text
-MOTIF
-Call
-Pulse
-Sparse Arch
-
-PHRASE
-Arch
-Motif Development / Wave
-Answer
-
-ORNAMENT
-Flourish
-Passing-dense
-Chromatic phrase
-```
-
-Density still controls overall activity. The hidden phrase identity determines
-where that activity tends to occur.
-
-### A → A′ continuity
-
-When repetition/continuity is strong, a new phrase can retain the previous
-rhythmic skeleton, rests, gates, and articulation while altering a small
-non-structural event.
-
-```text
-A  →  A′
-```
-
-This is intentionally preferred over redrawing an unrelated melody every two
-bars.
-
-Chromatic approaches still carry an explicit resolution target. Suspensions and
-modal tensions are allowed to persist rather than being mechanically resolved
-on the next note.
-
-## Texture: regularity is intentional
-
-Texture is now the performer most comfortable with persistent, regular cyclic
-rhythm.
-
-Its Density continuum is:
-
-```text
-SILENT
-  ↓
-DRONE
-  ↓
-SPARSE
-  ↓
-PULSE
-  ↓
-MOTION
-  ↓
-ACTIVE
-```
-
-Current pattern vocabulary includes:
-
-```text
-DRONE
-long drone
-bar drone
-
-SPARSE
-isolated upper tone
-delayed echo
-
-PULSE
-half-note pulse
-quarter-note pulse
-
-MOTION
-continuous three-step arpeggio
-slow arpeggio
-extension figure
-
-ACTIVE
-shimmer
-repeating arpeggio with a gap
-continuous rotating three-note figure
-```
-
-### Texture phase continues through the music
-
-Texture uses its own absolute pattern phase.
-
-A three-step cell can therefore rotate across a 4/4 bar rather than restarting
-at beat one every measure:
-
-```text
-E G B | E G B | E G B | ...
-```
-
-When harmony changes, the rhythm normally keeps running and the pitch mapping
-adapts to the new chord.
-
-This deliberately separates Texture from Chords:
-
-```text
-Chords   articulate harmonic events
-Texture  maintain a continuing patterned stream
-```
-
-### Texture articulation belongs to the pattern
-
-Texture does not randomly change gate shape note by note.
-
-```text
-drone     very long
-pulse     medium
-arp       more legato
-shimmer   short
-```
-
-That makes the cyclic identity audible and repeatable.
-
-## First relationship modes
-
-Texture now has two internal relationship behaviors:
-
-```text
-INDEPENDENT
-COMPLEMENT
-```
-
-Independent Texture maintains its own cycle.
-
-Complementary Texture can leave a subdivision open when Melody has just
-attacked, creating simple rhythmic interlock without random omission.
-
-Future builds can extend this architecture with:
-
-```text
-SHADOW
-IMITATE
-COUNTERLINE
-```
-
-## EnsembleContext and soft counterpoint
-
-Each performer can now consult a small shared snapshot:
-
-```text
-currently active representative notes
-recent attack times
-recent melodic motion direction
-```
-
-This is advisory. It does not centrally compose all four parts.
-
-v0.11 uses it for the first counterpoint preferences, primarily:
-
-```text
-Melody ↔ Texture
-Melody ↔ Bass
-```
-
-Candidate-note scoring can:
-
-- penalize very close same-register collisions,
-- modestly prefer contrary motion,
-- allow oblique motion naturally,
-- mildly discourage repeated same-direction perfect-interval motion,
-- reduce dissonance penalties as Color increases.
-
-These are soft preferences, never textbook species-counterpoint prohibitions.
-
-Low Color favors clearer separation and stable intervals. Higher Color permits
-more seconds, sevenths, tritone/modal friction, and unresolved color.
-
-## Bass
-
-The v0.10 Bass continuum remains:
-
-```text
-SILENT
-  ↓
-ANCHOR
-  ↓
-FOUNDATION
-  ↓
-MOVING
-  ↓
-CONNECT
-```
-
-Vocabulary still includes:
-
-```text
-root sustain / pedal
-root–fifth
-root–octave
-root bounce
-broken bass
-chord-tone ostinato
-scale approach
-chromatic approach
-walking fragment
-```
-
-### Known-next-chord targeting
-
-v0.11 adds one important CONNECT refinement.
-
-During semantic Phrase playback, the next chord is genuinely known. Khaṇa now
-passes that destination to the Bass performer so CONNECT patterns can prepare
-the actual next root with diatonic or chromatic approaches.
-
-During live improvisation no future harmony is invented:
-
-```text
-future chord unknown → stay local to current harmony
-future chord known   → connector may target it
-```
-
-## Density-change boundaries
-
-The v0.10 behavior remains:
-
-```text
-Bass       next bar or harmony change
-Chords     next bar or harmony change
-Texture    next bar
-Melody     next two-bar phrase
-
-Density 0  immediate clean mute
-```
-
-The control value changes immediately; musical behavior changes at an
-appropriate boundary.
-
-## Phrase Editor grid
-
-Unchanged from v0.10:
-
-```text
-1/16 | 1/8 | 1/4 | 1/2 | BEAT | BAR
-```
-
-Shorten/Extend snaps down/up to the adjacent grid boundary instead of adding an
-increment to an already off-grid value.
-
-Example in 4/4:
-
-```text
-duration = 4.1 bars
-grid     = BAR
-
-Shorten → 4.0 bars
-Extend  → 5.0 bars
-```
-
-Literal note-value grids remain literal. `BEAT` is meter-aware; compound
-6/8, 9/8, and 12/8 use dotted-quarter beats.
-
-## MIDI / Brick / NextUI
-
-v0.11.1 keeps MIDI channels 1–4 for Bass / Chords / Texture / Melody and
-polyphonic per-note ownership. See [Brick setup](docs/BRICK_V0.11.1.md) for
-physical-port diagnostics, virtual and dry-run modes, raw joystick handling,
-30/60 FPS rendering, build/package/deploy scripts and device checks.
-
-## Static-audit hardening
-
-Before release handoff, v0.11 received an additional source-level audit. That
-audit made four important corrections:
-
-- Phrase-known Bass CONNECT targets now include the destination's scheduled
-  transport beat; CONNECT only treats that chord as an imminent destination
-  when the arrival is within one beat. Long-held phrase chords therefore do not
-  produce a false approach at the end of every intervening bar.
-- Harmony changes no longer call a global MIDI panic-stop or erase internal
-  Texture/Melody note ownership. Bass and Chords still force the new harmony,
-  while sounding Texture/Melody notes finish through their normal gate/next
-  attack and retain phase/phrase identity.
-- Melody cadential arrivals are placed early enough to make their held gate
-  audible before the next two-bar phrase starts.
-- Voicing candidate validation reuses the already-computed chord pitch classes
-  instead of allocating another vector for every candidate voicing.
-
-Regression tests were added for exhaustive chord membership across all current
-roots/qualities/extensions, phrase-next-chord timing, harmony-change note
-ownership, audible cadence holds, Texture regularity, Texture phase continuity,
-and soft counterpoint motion preference.
-
-## Desktop validation
-
-Run on the Xubuntu development machine:
-
-```bash
-cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-cargo run --features ableton-link
-```
-
-The build environment used to prepare this source does not contain Rust, so
-v0.11.1 has **not** been compiled here. Shell syntax and the local mocked
-package/deploy freshness regression have been checked.
-The user's Rust 1.98.1 machine remains the authoritative compile/Clippy/test
-environment.
-
-## Suggested v0.11 listening tests
-
-### Chords
-
-1. Play a major/minor triad and confirm channel 2 emits three notes.
-2. Play a seventh chord and confirm four notes.
-3. Play a ninth chord and confirm five notes.
-4. Change Spread and confirm chord membership is unchanged.
-
-### Melody
-
-1. Listen for short passing/neighbor notes versus sustained structural notes.
-2. Confirm cadential/peak notes can sustain over multiple grid steps.
-3. Leave the phrase running and listen for recognizable A → A′ continuity.
-4. Increase Color and verify modal/suspension tension is not always immediately
-   resolved.
-5. Increase Density and verify the phrase becomes more active without losing
-   its contour/rhythmic identity.
-
-### Texture
-
-1. Move Density through DRONE → SPARSE → PULSE → MOTION → ACTIVE.
-2. Listen for regular pulse/arp behavior rather than random holes.
-3. Use a rotating three-step figure and confirm it crosses bar boundaries
-   without restarting.
-4. Change chords and confirm the Texture phase continues.
-5. Listen for complementary Texture occasionally leaving room for Melody.
-
-### Ensemble / counterpoint
-
-1. Run Texture + Melody and listen for fewer same-register collisions.
-2. Listen for a mixture of contrary, oblique, and parallel motion rather than
-   identical line movement.
-3. Increase Color and verify interval friction becomes more permissible rather
-   than being treated as an error.
-4. Mute each performer independently; the remaining ensemble should retain a
-   coherent musical role.
-
-### Bass
-
-During Phrase playback, use high Bass Density and verify CONNECT behavior can
-prepare the actual following chord. During live performance with no queued
-future chord, Bass should never fabricate a harmonic destination.
-
-## Deliberately deferred
-
-v0.11 does not yet implement:
-
-- variable 1-/2-/4-bar Melody phrase lengths,
-- full Texture SHADOW / IMITATE / COUNTERLINE modes,
-- explicit motif locking in the UI,
-- cadence-aware whole-ensemble arrival behavior,
-- user-facing Intensity gesture,
-- Chords common-tone legato versus deliberate comp rearticulation distinction,
-- full 11th/13th chord vocabulary,
-- final verification of the Brick-specific physical button map and ALSA output,
-- independent real-time MIDI scheduler and USB MIDI reconnection.
-
-The guiding test remains:
-
-> Can a small amount of harmonic material stay compelling because four
-> performers retain identity, vary gradually, and listen to one another?
+## First performance
+
+1. Connect a MIDI receiver to the Brick's USB host port or route the
+   desktop sequencer output to a synth. Khaṇa assigns Bass, Chords, Texture,
+   and Melody to MIDI channels 1, 2, 3, and 4 by default.
+2. Press **Start** and use the **D-pad** to browse Safe, Colorful, and Bold
+   suggestions. Press **A** to commit a chord. **L2**, **L2+R2**, and **R2**
+   set the harmonic direction to Resolve, Neutral, and Tension. **Y** also
+   selects Neutral. Direction shapes recommendations independently of the
+   three suggestion columns.
+3. Press **L1/R1** to scope the sticks to one performer or All. Try lowering
+   Chords Density for longer gates, then adjust its Spread. Turn off a busy
+   part briefly with **Select+L2**, or audition one with **Select+R2**.
+4. Use **Select+R1** to set the live chord grid. The Performance screen shows
+   the pending chord, its time to launch, and a wider flash on the downbeat.
+5. Press **Select+A** to start or arm recording, play a progression, then
+   press it again to end the capture. Tap **Menu** to open Phrase Editor.
+
+### Performance and transport gestures
+
+| Action | Brick Pro | Desktop keyboard |
+|---|---|---|
+| Start or stop | Start | Space |
+| Switch Performance / Phrase Editor | Tap Menu | Tab |
+| Quit | Hold Menu | Escape |
+| Choose suggestion column and row | D-pad | Arrows |
+| Commit the selected chord | A | Z |
+| Reroll / Surprise | B / X | X / S |
+| Resolve / Neutral / Tension | L2 / L2+R2 or Y / R2 | Q / E / W |
+| Previous / next performer scope | L1 / R1 | C / V |
+| Density − / + | Left stick ← / → | T / G |
+| Dynamics − / + | Left stick ↓ / ↑ | Y / H |
+| Spread − / + | Right stick ← / → | U / J |
+| Color − / + | Right stick ↓ / ↑ | I / K |
+| Toggle Sustain | L3 | F5 |
+| Cycle chord voicing | R3 | F6 |
+| Request scoped Vary | Select+R3 or Select+Y | F7 |
+| Toggle scoped Pattern Hold | Select+L1 | F8 |
+| Cycle live chord grid | Select+R1 | F9 |
+| Toggle scoped Mute | Select+L2 | F10 |
+| Toggle Solo | Select+R2 | F11 |
+| Start or end phrase capture | Select+A | P |
+| Arm or disarm the next capture | Select+B | N |
+| Settings when stopped / BPM during Internal playback | Select+X | M |
+
+The sticks make relative changes. Let them return to center to leave the
+values where you set them. L2/R2 are digital triggers. For Neutral, press
+both triggers together or use Y. Press and release the triggers for each new
+direction gesture. Brick Pro defaults to raw SDL buttons 11 and 12 for L3
+and R3. `KHANA_L3_BUTTON` and `KHANA_R3_BUTTON` override those indices.
+
+**Live grid** cycles Now, 1/8, 1/4, Beat, and Bar. Now commits immediately.
+The other choices wait for the next boundary while transport runs. The
+latest commit replaces the pending chord. Changing the grid leaves an
+already queued chord at its scheduled time. While stopped, A commits
+immediately. In 6/8, 9/8, and 12/8, Beat means a dotted quarter.
+
+**Performer macros** shape independent roles. Bass anchors the harmony
+and can walk into a known chord. Chords play the complete displayed chord
+with register and spacing set by Spread and voicing. Texture contributes
+repeating figures and drones. Melody uses phrase-shaped motifs, peaks,
+and answers. Density changes activity, Dynamics changes velocity, Spread
+changes register and voicing width, and Color opens up each role's pitch
+choices. At Density zero a performer is silent.
+
+**Sustain** extends sounding notes for the active scope. It holds a stable
+note already sounding, or waits for the next one. Chords hold the current
+voicing, Texture can carry a pedal pitch, Melody waits for a structural
+chord tone, and Bass follows its Root or Voice-led arrival setting on a
+new chord. Texture and Melody sustain across a chord change when their
+pitch is still a chord tone. Click again to release and resume regular
+gates. Stop, mute, soloing another performer, and Density zero release
+sounding notes and clear the affected Sustain latch.
+
+**Pattern Hold** keeps the scoped patterns or motifs repeating as the
+harmony changes. **Vary** requests related variation at the next
+performer boundary. Held patterns return after the variation.
+
+**Mute and Solo** act independently of the macros. Use Mute to silence
+one performer. With All selected it mutes all, and repeating it with all
+muted clears all mutes. Solo isolates the selected performer. Solo the
+same performer again or use Solo with All selected to clear it. Explicit
+mutes remain in effect while soloing, including on the selected performer.
+Silenced performers keep their pattern timing and can re-enter in time.
+
+**Voicing** cycles Smooth, Close, and Open. While stopped the displayed
+voicing changes immediately. During playback the pending style applies
+on the next beat and preserves common sounding pitches where possible. The
+current style and next style appear beside the chord. A chord change on
+the same beat uses the newly selected style.
+
+## Record, edit, and loop phrases
+
+Recording starts and stops at bar boundaries. It captures chord selections
+and timing, including the exact landing time of a quantized change. Arm
+Next starts another phrase at the current capture's end. When playing a
+phrase, the current performer settings supply the arrangement.
+
+| Action | Brick Pro | Desktop keyboard |
+|---|---|---|
+| Previous / next phrase | L1 / R1 | A / L |
+| Select previous / next chord event | D-pad ← / → | Left / Right |
+| Play or queue the selected phrase | A | Z |
+| Replace selected chord with a Safe suggestion | B | X |
+| Duplicate event | X | D |
+| Delete event | Select+Y | Backspace |
+| Shorten / lengthen to the next edit boundary | L2 / R2 | F / R |
+| Previous / next duration grid | D-pad ↑ / ↓ | Up / Down or [ / ] |
+| Zoom out / in | Select+L1 / Select+R1 | - / = |
+| Toggle selected phrase loop | L3 or Select+X | F5 |
+| Clear queued phrase | R3 or Select+B | F6 |
+| Undo the selected phrase's last edit | Select+A | F12 |
+| Return to Performance | Y or tap Menu | Tab |
+
+The duration grid offers 1/16, 1/8, 1/4, 1/2, Beat, and Bar. On-grid
+durations move one increment. Off-grid durations snap down when shortened
+and up when lengthened. An enabled phrase loop wraps at its full length,
+including off-grid lengths. A new phrase queued during playback replaces
+the playing phrase at the next transport bar. Clear Queue leaves the
+playing phrase in place.
+
+Undo restores duration edits, chord replacements, duplicates, and deletions
+in reverse order for the selected phrase. It restores the selection for
+that edit. Each phrase keeps up to 32 edits in the current session.
+
+## Settings and MIDI rig
+
+From stopped Performance, press **Select+X** on Brick or **M** on desktop.
+Left/Right selects a field and Up/Down changes its value. A, B, or Menu
+closes Settings on Brick. On desktop use Z or M. Press Start or Space
+to close Settings and toggle the transport. While Internal playback is
+running, the Settings shortcut opens the live tempo control.
+
+The general fields are Tonic, Mode, Tempo, Meter, Chord Hold, Bass
+Arrival, and Voicing. Mode includes Harmonic Minor and the ascending
+Melodic Minor scale used in both directions. Chord Hold applies to the
+low-density Chords sustain families and offers Auto, 4, 8, or 16 bars,
+and Until Change.
+
+In Settings, **Left from Tonic** opens **MIDI Rig** at MIDI Output.
+Here you can see each performer's channel and transpose alongside the
+clock source, MIDI input and output, Link peers, and shared transport
+status. Channels range from 1 to 16 and transpose from −24 to +24
+semitones. Assigning the same channel to multiple performers is supported.
+If they share a sounding pitch, Khaṇa releases it when the last performer
+lets go. Transposition changes the outgoing pitch while the progression
+and displayed chord stay in the source key. Choose MIDI Panic and press
+A or Z while stopped to send All Sound Off and All Notes Off on the
+assigned channels.
+
+### MIDI Clock and Ableton Link
+
+- **Internal** uses Khaṇa's BPM. Turn on MIDI Clock Out in the rig to drive
+  an external sequencer.
+- **MIDI In** follows a raw MIDI clock input. Arm with Start if required,
+  then send Start or Continue from the source. Khaṇa shows the input state
+  and releases notes when external transport stops or lock is lost. Clock
+  Out is blocked while following MIDI In to avoid feedback.
+- **Ableton Link** shares tempo and beat phase with peers on the same local
+  network. Enable Link on the other app and select **Ableton Link** as the
+  clock source while stopped. The rig displays the peer count. Press Start
+  to queue launch at the next bar, or press it again to cancel a pending
+  launch. Enable Link Start/Stop Sync on both apps to share transport.
+  Match meters when bar alignment matters. MIDI Clock Out can drive
+  attached hardware from the Link session.
+
+Raw MIDI Output can select Auto, an available port, or Off. Set
+`KHANA_MIDI_PORT` for a name match or `KHANA_MIDI_RAW_DEVICE` for an exact
+raw node. Set `KHANA_MIDI_CLOCK_IN_PORT` separately for a clock input by name
+or path. `KHANA_INPUT_LOG=1` logs SDL events. `KHANA_MIDI_TRACE=1` shows MIDI
+traffic. On desktop, `cargo run --locked -- --midi-list` lists ports.
+Use `KHANA_MIDI_DRY_RUN=1` to try the interface without sending MIDI.
+
+## Save and resume
+
+Khaṇa saves the key, meter, clock mode, performer settings, output channels
+and transpose, voicing, both grids, and phrases with their loop flags.
+Quit cleanly to flush the last changes. The next launch restores the
+setup with transport stopped and empty playback and recording queues.
+Mute, Solo, Sustain, and the undo history are performance-session state.
+
+On Brick, the default file is
+`/mnt/SDCARD/.userdata/tg5040/khana/session.json`. On desktop it is
+`$XDG_STATE_HOME/khana/session.json` or `~/.local/state/khana/session.json`.
+Set `KHANA_SESSION_PATH` to override the location. Valid launcher values
+for `KHANA_MIDI_CHANNELS` and `KHANA_MIDI_TRANSPOSE` override the saved
+routing values in Bass, Chords, Texture, Melody order.
+
+## Validation
+
+The Rust tests cover performer note transitions, phrase editing, routing,
+and transport. The Link-enabled Brick build and desktop checks exercise
+the compiled code. Physical Brick controls and external MIDI and Link
+timing need a device test. Try sustaining Texture, soloing Melody,
+switching voicing over a queued chord, then clearing Solo. Listen for
+continuous shared notes, clean releases, and the previously muted
+performers returning in phase.
+
+## LLM disclosure
+
+Khaṇa was developed with assistance from OpenAI Codex for design,
+implementation, documentation, and automated testing. Musical decisions
+and device tests are guided by the project maintainer.

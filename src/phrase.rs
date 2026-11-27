@@ -424,6 +424,15 @@ impl PhrasePlayer {
         self.playing.map(|state| state.phrase_index)
     }
 
+    pub fn phrase_edited(&mut self, phrase_index: usize) {
+        if let Some(playing) = &mut self.playing
+            && playing.phrase_index == phrase_index
+        {
+            // Re-read the edited timeline at the current playhead.
+            playing.next_event_index = 0;
+        }
+    }
+
     pub fn clear_queue(&mut self) {
         self.queued = None;
     }
@@ -682,6 +691,35 @@ mod tests {
         assert_eq!(player.update(&phrases, 8.0).chord, Some(d_minor()));
         assert_eq!(player.playing_phrase(), Some(1));
         assert_eq!(player.queued_phrase(), None);
+    }
+
+    #[test]
+    fn resizing_a_playing_phrase_resolves_the_chord_at_the_current_beat() {
+        let mut phrases = [Phrase {
+            looping: true,
+            id: 1,
+            events: vec![
+                ChordEvent {
+                    chord: c_major(),
+                    start_beat: 0.0,
+                    duration_beats: 1.0,
+                },
+                ChordEvent {
+                    chord: d_minor(),
+                    start_beat: 1.0,
+                    duration_beats: 2.0,
+                },
+            ],
+        }];
+        let mut player = PhrasePlayer::new();
+        player.request(0, 4.0, 4.0);
+        assert_eq!(player.update(&phrases, 5.5).chord, Some(d_minor()));
+        phrases[0].snap_resize_event(0, 1.0, true);
+        player.phrase_edited(0);
+        let update = player.update(&phrases, 5.5);
+        assert_eq!(update.chord, Some(c_major()));
+        assert_eq!(update.next_chord, Some(d_minor()));
+        assert_eq!(update.next_chord_beat, Some(6.0));
     }
 
     #[test]

@@ -298,6 +298,7 @@ impl NoteSet {
 struct ScheduledNotes {
     notes: NoteSet,
     off_beat: f64,
+    sustain_eligible: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -307,6 +308,7 @@ struct PendingAttack {
     start_beat: f64,
     gate_beats: f64,
     preserve_common: bool,
+    sustain_eligible: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -500,6 +502,7 @@ struct PerformerState {
     melody_plan: MelodyPlan,
     melody_motif: MelodyPlan,
     held: bool,
+    sustain: bool,
     vary_queued: bool,
     gesture_boundary: Option<i64>,
     return_variant: Option<PatternVariant>,
@@ -521,6 +524,7 @@ impl PerformerState {
             melody_plan: MelodyPlan::empty(),
             melody_motif: MelodyPlan::empty(),
             held: false,
+            sustain: false,
             vary_queued: false,
             gesture_boundary: None,
             return_variant: None,
@@ -535,6 +539,9 @@ pub struct PerformerSnapshot {
     pub reset_rule: ResetRule,
     pub family: PatternFamily,
     pub held: bool,
+    pub sustain: bool,
+    pub muted: bool,
+    pub soloed: bool,
     pub vary_queued: bool,
 }
 
@@ -593,6 +600,9 @@ pub struct PerformerEngine {
     chord_origin_beat: f64,
     next_chord_target: Option<FutureHarmony>,
     enabled: bool,
+    muted: [bool; VOICE_COUNT],
+    solo: Option<usize>,
+    live_revoice: bool,
     intensity: f32,
     states: [PerformerState; VOICE_COUNT],
     pub(crate) hold_length: ChordHold,
@@ -647,6 +657,66 @@ impl PerformerEngine {
             }
         }
     }
+    pub(crate) fn toggle_mute(&mut self, scope: VoiceScope) {
+        match scope {
+            VoiceScope::All => self.muted = [self.muted.iter().any(|&muted| !muted); VOICE_COUNT],
+            VoiceScope::One(index) => self.muted[index] = !self.muted[index],
+        }
+    }
+
+    pub(crate) fn toggle_solo(&mut self, scope: VoiceScope) {
+        self.solo = match scope {
+            VoiceScope::One(index) if self.solo != Some(index) => Some(index),
+            _ => None,
+        };
+    }
+
+    fn suppressed(&self, index: usize) -> bool {
+        self.muted[index] || self.solo.is_some_and(|solo| solo != index)
+    }
+
+    pub(crate) fn toggle_sustain(
+        &mut self,
+        scope: VoiceScope,
+        voices: &[Voice; VOICE_COUNT],
+        now_beat: f64,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let activate = voices.iter().enumerate().any(|(index, voice)| {
+            in_scope(scope, index)
+                && !self.suppressed(index)
+                && voice.parameters.density > 0.01
+                && !self.states[index].sustain
+        });
+        for (index, voice) in voices.iter().enumerate() {
+            if !in_scope(scope, index) || self.suppressed(index) || voice.parameters.density <= 0.01
+            {
+                continue;
+            }
+            let state = &mut self.states[index];
+            if activate == state.sustain {
+                continue;
+            }
+            state.sustain = activate;
+            if let Some(active) = &mut state.sounding {
+                if activate && active.off_beat > now_beat && active.sustain_eligible {
+                    state.pending = None;
+                    state.pending_resolution = None;
+                } else if activate && active.off_beat <= now_beat {
+                    active.sustain_eligible = false;
+                } else if !activate && active.sustain_eligible {
+                    active.off_beat = now_beat;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn request_live_revoice(&mut self) {
+        self.live_revoice = true;
+    }
+
     pub(crate) fn request_variation(&mut self, scope: VoiceScope) {
         for (index, state) in self.states.iter_mut().enumerate() {
             if in_scope(scope, index) {
@@ -664,6 +734,9 @@ impl PerformerEngine {
             chord_origin_beat: 0.0,
             next_chord_target: None,
             enabled: false,
+            muted: [false; VOICE_COUNT],
+            solo: None,
+            live_revoice: false,
             intensity: 0.0,
             hold_length: ChordHold::Auto,
             voice_led_bass: false,
@@ -767,6 +840,7 @@ impl PerformerEngine {
     /// Disables generation and clears internal note ownership.
     pub fn transport_stopped(&mut self) {
         self.enabled = false;
+        self.live_revoice = false;
         for state in &mut self.states {
             state.sounding = None;
             state.pending = None;
@@ -774,6 +848,7 @@ impl PerformerEngine {
             state.pending_resolution = None;
             state.force_attack = false;
             state.vary_queued = false;
+            state.sustain = false;
             state.gesture_boundary = None;
         }
     }
@@ -782,11 +857,13 @@ impl PerformerEngine {
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
+            self.live_revoice = false;
             for state in &mut self.states {
                 state.sounding = None;
                 state.pending = None;
                 state.pending_resolution = None;
                 state.force_attack = false;
+                state.sustain = false;
             }
         }
     }
@@ -803,6 +880,9 @@ impl PerformerEngine {
     pub fn snapshots(&self) -> [PerformerSnapshot; VOICE_COUNT] {
         std::array::from_fn(|index| PerformerSnapshot {
             held: self.states[index].held,
+            sustain: self.states[index].sustain,
+            muted: self.muted[index],
+            soloed: self.solo == Some(index),
             vary_queued: self.states[index].vary_queued,
             active_notes: self.states[index]
                 .sounding
@@ -826,15 +906,29 @@ impl PerformerEngine {
             return batch;
         }
 
+        let live_revoice = std::mem::take(&mut self.live_revoice);
+
         // First settle every already-scheduled event so EnsembleContext never
         // observes a note that should have been released this frame.
         for (index, voice) in voices.iter().enumerate() {
             // A muted voice must not emit an already-queued Note On.
-            if voice.parameters.density <= 0.01 {
+            if voice.parameters.density <= 0.01 || self.suppressed(index) {
                 self.mute_voice(index, &mut batch);
                 continue;
             }
+            let state = &self.states[index];
+            if state.sustain
+                && index >= 2
+                && let Some(active) = state.sounding
+                && active.sustain_eligible
+                && !active.notes.iter().all(|note| self.is_chord_tone(note))
+            {
+                self.stop_sounding_now(index, &mut batch);
+            }
             self.release_due_notes(index, now_beat, &mut batch);
+            if index == 1 && live_revoice && !self.states[index].force_attack {
+                self.revoice_sounding_chord(now_beat, beats_per_bar, voice, &mut batch);
+            }
             self.start_due_attack(index, now_beat, &mut batch);
         }
 
@@ -876,7 +970,12 @@ impl PerformerEngine {
                 );
 
             if family_changed {
-                self.stop_sounding_now(index, &mut batch);
+                let state = &self.states[index];
+                if !(state.sustain && state.sounding.is_some_and(|active| active.sustain_eligible)
+                    || role == VoiceRole::Chords && live_revoice)
+                {
+                    self.stop_sounding_now(index, &mut batch);
+                }
                 self.states[index].pending = None;
                 timing = step_timing(
                     role,
@@ -935,7 +1034,7 @@ impl PerformerEngine {
                 timing.position += timing.steps_per_cycle;
             }
 
-            let sustain = if matches!(
+            let chord_gate = if matches!(
                 state.pattern.family,
                 PatternFamily::ChordsLongSustain | PatternFamily::ChordsBarSustain
             ) {
@@ -944,7 +1043,7 @@ impl PerformerEngine {
                 None
             };
             let renew_hold =
-                sustain.is_some() && state.sounding.is_none() && state.pending.is_none();
+                chord_gate.is_some() && state.sounding.is_none() && state.pending.is_none();
             if state.last_step_key == Some(timing.step_key) && !state.force_attack && !renew_hold {
                 continue;
             }
@@ -959,15 +1058,29 @@ impl PerformerEngine {
                 }
             }
 
+            if self.suppressed(index) {
+                continue;
+            }
+            let state = &self.states[index];
+            if state.sustain
+                && !state.force_attack
+                && state.sounding.is_some_and(|active| active.sustain_eligible)
+            {
+                continue;
+            }
             let ensemble = self.ensemble_context();
             let forced = self.states[index].force_attack;
             self.states[index].force_attack = false;
-            let preserve_common = std::mem::take(&mut self.states[index].legato_harmony)
-                && matches!(
-                    self.states[index].pattern.family,
-                    PatternFamily::ChordsLongSustain | PatternFamily::ChordsBarSustain
-                );
-            let should_attack = if sustain.is_some() {
+            let legato_harmony = std::mem::take(&mut self.states[index].legato_harmony);
+            let preserve_common = self.states[index].sustain
+                || role == VoiceRole::Chords
+                    && (live_revoice
+                        || legato_harmony
+                            && matches!(
+                                self.states[index].pattern.family,
+                                PatternFamily::ChordsLongSustain | PatternFamily::ChordsBarSustain
+                            ));
+            let should_attack = if chord_gate.is_some() {
                 renew_hold
             } else {
                 self.should_attack(index, role, timing, behavior, ensemble, now_beat)
@@ -1029,10 +1142,16 @@ impl PerformerEngine {
                     timing.step_length,
                 )
             } else {
-                sustain.unwrap_or_else(|| {
+                chord_gate.unwrap_or_else(|| {
                     gate_beats(role, variant, timing, behavior.space, self.intensity)
                 })
             };
+            let sustain_eligible = notes.iter().all(|note| self.is_chord_tone(note))
+                && (role != VoiceRole::Melody
+                    || matches!(
+                        self.states[index].melody_plan.intent(timing.position),
+                        MelodyIntent::Skeleton(_)
+                    ));
             let start = now_beat + timing_offset_beats(role);
 
             self.states[index].pending = Some(PendingAttack {
@@ -1041,11 +1160,54 @@ impl PerformerEngine {
                 start_beat: start,
                 gate_beats: gate,
                 preserve_common,
+                sustain_eligible,
             });
             self.start_due_attack(index, now_beat, &mut batch);
         }
 
         batch
+    }
+
+    fn is_chord_tone(&self, note: u8) -> bool {
+        self.chord_voicing
+            .iter()
+            .any(|pitch| pitch % 12 == note % 12)
+    }
+
+    fn revoice_sounding_chord(
+        &mut self,
+        now_beat: f64,
+        beats_per_bar: f64,
+        voice: &Voice,
+        batch: &mut VoiceEventBatch,
+    ) {
+        let state = &mut self.states[1];
+        let notes = NoteSet::chord(self.chord_voicing);
+        if let Some(pending) = &mut state.pending {
+            pending.notes = notes;
+            pending.preserve_common = true;
+        }
+        let Some(active) = state.sounding else {
+            return;
+        };
+        let timing = step_timing(
+            VoiceRole::Chords,
+            state.pattern.family,
+            now_beat,
+            beats_per_bar,
+            self.chord_origin_beat,
+        );
+        state.last_step_key = Some(timing.step_key);
+        if notes != active.notes {
+            let velocity = attack_velocity(
+                VoiceRole::Chords,
+                voice.parameters.dynamics,
+                timing.position,
+                self.intensity,
+            );
+            Self::transition_notes(1, Some(active), notes, velocity, true, batch);
+            state.sounding = Some(ScheduledNotes { notes, ..active });
+        }
     }
 
     fn ensemble_context(&self) -> EnsembleContext {
@@ -1079,6 +1241,7 @@ impl PerformerEngine {
         self.states[index].pending = None;
         self.states[index].pending_resolution = None;
         self.states[index].force_attack = false;
+        self.states[index].sustain = false;
 
         self.stop_sounding_now(index, batch);
     }
@@ -1086,6 +1249,7 @@ impl PerformerEngine {
     fn release_due_notes(&mut self, index: usize, now_beat: f64, batch: &mut VoiceEventBatch) {
         if let Some(active) = self.states[index].sounding
             && now_beat + f64::EPSILON >= active.off_beat
+            && !(self.states[index].sustain && active.sustain_eligible)
         {
             for note in active.notes.iter() {
                 batch.push(VoiceEvent::NoteOff {
@@ -1116,34 +1280,19 @@ impl PerformerEngine {
         }
 
         let active = self.states[index].sounding.take();
-        if let Some(active) = active {
-            for note in active.notes.iter() {
-                if pending.preserve_common && pending.notes.iter().any(|next| next == note) {
-                    continue;
-                }
-                batch.push(VoiceEvent::NoteOff {
-                    voice_index: index,
-                    note,
-                });
-            }
-        }
-
-        for note in pending.notes.iter() {
-            if pending.preserve_common
-                && active.is_some_and(|old| old.notes.iter().any(|prior| prior == note))
-            {
-                continue;
-            }
-            batch.push(VoiceEvent::NoteOn {
-                voice_index: index,
-                note,
-                velocity: pending.velocity,
-            });
-        }
+        Self::transition_notes(
+            index,
+            active,
+            pending.notes,
+            pending.velocity,
+            pending.preserve_common,
+            batch,
+        );
 
         self.states[index].sounding = Some(ScheduledNotes {
             notes: pending.notes,
             off_beat: pending.start_beat + pending.gate_beats,
+            sustain_eligible: pending.sustain_eligible,
         });
         self.states[index].last_attack_beat = Some(now_beat);
         if pending.notes.len == 1 {
@@ -1159,6 +1308,37 @@ impl PerformerEngine {
             self.states[index].previous_note = Some(next_note);
         }
         self.states[index].pending = None;
+    }
+
+    fn transition_notes(
+        index: usize,
+        active: Option<ScheduledNotes>,
+        next: NoteSet,
+        velocity: u8,
+        preserve_common: bool,
+        batch: &mut VoiceEventBatch,
+    ) {
+        if let Some(active) = active {
+            for note in active.notes.iter() {
+                if !preserve_common || !next.iter().any(|pitch| pitch == note) {
+                    batch.push(VoiceEvent::NoteOff {
+                        voice_index: index,
+                        note,
+                    });
+                }
+            }
+        }
+        for note in next.iter() {
+            if !preserve_common
+                || !active.is_some_and(|old| old.notes.iter().any(|pitch| pitch == note))
+            {
+                batch.push(VoiceEvent::NoteOn {
+                    voice_index: index,
+                    note,
+                    velocity,
+                });
+            }
+        }
     }
 
     fn should_attack(
@@ -2742,6 +2922,155 @@ mod tests {
     }
 
     #[test]
+    fn sustain_holds_texture_across_compatible_harmony_and_releases_on_change() {
+        use crate::voice::VoiceScope;
+
+        let settings = MusicalSettings::default();
+        let mut voices = default_voices();
+        for index in [0, 1, 3] {
+            voices[index].parameters.density = 0.0;
+        }
+        let mut engine = PerformerEngine::new(
+            c_major(),
+            settings.tonal,
+            Voicing::from_slice(&[48, 52, 55]),
+        );
+        engine.transport_started(0.0);
+        engine.states[2].sounding = Some(super::ScheduledNotes {
+            notes: super::NoteSet::single(67),
+            off_beat: 0.5,
+            sustain_eligible: true,
+        });
+        engine.toggle_sustain(VoiceScope::One(2), &voices, 0.1);
+        let note_off = |event| {
+            matches!(
+                event,
+                VoiceEvent::NoteOff {
+                    voice_index: 2,
+                    note: 67
+                }
+            )
+        };
+        assert!(!engine.update(1.0, 4.0, &voices).iter().any(note_off));
+
+        let e_minor = Chord::new(
+            PitchClass::from_value(4),
+            ChordQuality::Minor,
+            ChordExtension::Triad,
+        );
+        engine.harmony_changed(
+            e_minor,
+            settings.tonal,
+            Voicing::from_slice(&[52, 55, 59]),
+            2.0,
+        );
+        assert!(!engine.update(2.0, 4.0, &voices).iter().any(note_off));
+        assert_eq!(engine.snapshots()[2].active_notes[0], Some(67));
+
+        let f_major = Chord::new(
+            PitchClass::from_value(5),
+            ChordQuality::Major,
+            ChordExtension::Triad,
+        );
+        engine.harmony_changed(
+            f_major,
+            settings.tonal,
+            Voicing::from_slice(&[53, 57, 60]),
+            3.0,
+        );
+        assert!(engine.update(3.0, 4.0, &voices).iter().any(note_off));
+        assert!(engine.snapshots()[2].sustain);
+        engine.transport_stopped();
+        assert!(!engine.snapshots()[2].sustain);
+    }
+
+    #[test]
+    fn solo_releases_sustain_and_keeps_muted_melody_at_its_phrase_position() {
+        use crate::voice::VoiceScope;
+
+        let settings = MusicalSettings::default();
+        let voices = default_voices();
+        let mut engine = PerformerEngine::new(
+            c_major(),
+            settings.tonal,
+            Voicing::from_slice(&[48, 52, 55]),
+        );
+        engine.transport_started(0.0);
+        engine.update(0.0, 4.0, &voices);
+        engine.states[2].sounding = Some(super::ScheduledNotes {
+            notes: super::NoteSet::single(64),
+            off_beat: 0.5,
+            sustain_eligible: true,
+        });
+        engine.toggle_sustain(VoiceScope::One(2), &voices, 0.1);
+        engine.toggle_mute(VoiceScope::One(3));
+        engine.toggle_solo(VoiceScope::One(1));
+        let events = engine.update(0.2, 4.0, &voices);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            VoiceEvent::NoteOff {
+                voice_index: 2,
+                note: 64
+            }
+        )));
+        assert!(!engine.snapshots()[2].sustain);
+        let muted = engine.update(8.25, 4.0, &voices);
+        assert!(muted.iter().all(|event| !matches!(
+            event,
+            VoiceEvent::NoteOn {
+                voice_index: 0 | 2 | 3,
+                ..
+            }
+        )));
+        assert_eq!(engine.states[3].melody_plan.cycle_index, 1);
+        engine.toggle_solo(VoiceScope::All);
+        engine.update(8.5, 4.0, &voices);
+        assert!(engine.snapshots()[3].muted);
+        assert!(engine.snapshots().iter().all(|state| !state.soloed));
+        assert_eq!(engine.states[3].melody_plan.cycle_index, 1);
+    }
+
+    #[test]
+    fn live_voicing_changes_only_different_pitches_of_sounding_chord() {
+        let settings = MusicalSettings::default();
+        let mut voices = default_voices();
+        voices[1].parameters.density = 0.08;
+        for index in [0, 2, 3] {
+            voices[index].parameters.density = 0.0;
+        }
+        let mut engine = PerformerEngine::new(
+            c_major(),
+            settings.tonal,
+            Voicing::from_slice(&[48, 52, 55]),
+        );
+        engine.transport_started(0.0);
+        engine.update(0.0, 4.0, &voices);
+        engine.update(0.02, 4.0, &voices);
+        let before = engine.states[1].sounding.unwrap().off_beat;
+        engine.update_anchor(settings.tonal, Voicing::from_slice(&[48, 55, 64]));
+        engine.request_live_revoice();
+        let change = engine.update(1.0, 4.0, &voices);
+        let mut events = change.iter();
+        assert!(matches!(
+            events.next(),
+            Some(VoiceEvent::NoteOff {
+                voice_index: 1,
+                note: 52
+            })
+        ));
+        assert!(matches!(
+            events.next(),
+            Some(VoiceEvent::NoteOn {
+                voice_index: 1,
+                note: 64,
+                ..
+            })
+        ));
+        assert!(events.next().is_none());
+        assert_eq!(engine.states[1].sounding.unwrap().off_beat, before);
+    }
+
+    #[test]
     fn default_reset_rules_match_new_ensemble() {
         let settings = MusicalSettings::default();
         let engine = PerformerEngine::new(
@@ -2967,10 +3296,12 @@ mod tests {
         );
 
         engine.states[2].sounding = Some(super::ScheduledNotes {
+            sustain_eligible: false,
             notes: super::NoteSet::single(76),
             off_beat: 3.0,
         });
         engine.states[3].sounding = Some(super::ScheduledNotes {
+            sustain_eligible: false,
             notes: super::NoteSet::single(79),
             off_beat: 2.0,
         });
@@ -3026,10 +3357,12 @@ mod tests {
             Voicing::from_slice(&[52, 55, 60]),
         );
         engine.states[2].sounding = Some(super::ScheduledNotes {
+            sustain_eligible: false,
             notes: super::NoteSet::single(76),
             off_beat: 4.0,
         });
         engine.states[2].pending = Some(super::PendingAttack {
+            sustain_eligible: false,
             notes: super::NoteSet::single(79),
             velocity: 90,
             start_beat: 1.0,
@@ -3054,6 +3387,7 @@ mod tests {
         );
         engine.transport_started(0.0);
         engine.states[2].pending = Some(super::PendingAttack {
+            sustain_eligible: false,
             notes: super::NoteSet::single(76),
             velocity: 90,
             start_beat: 1.0,

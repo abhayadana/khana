@@ -9,6 +9,7 @@ use crate::midi::MidiEngine;
 use crate::music::chord::Chord;
 use crate::music::recommendation::{HarmonicDirection, RecommendationClass, RecommendationSet};
 use crate::music::settings::{MusicalSettings, SettingField};
+use crate::music::voicing::VoicingStyle;
 use crate::performer::PerformerSnapshot;
 use crate::phrase::{EditGrid, Phrase, RecorderStatus};
 use crate::sync::{SyncMode, SyncStatus, SyncTransport};
@@ -56,6 +57,9 @@ pub(crate) struct Frame {
     timing: String,
     beat_flash: Option<bool>,
     options: String,
+    voicing: VoicingStyle,
+    pending_voicing: Option<VoicingStyle>,
+    can_undo_phrase: bool,
 }
 
 impl Frame {
@@ -131,6 +135,9 @@ impl Frame {
             },
             beat_flash: (sync_status.running && bar_phase.rem_euclid(beat) < beat * 0.22)
                 .then_some(beat_index == 0),
+            voicing: app.voice_engine.style,
+            pending_voicing: app.pending_voicing.map(|(style, _)| style),
+            can_undo_phrase: app.can_undo_phrase(),
             options: match app.setting_focus {
                 Some(SettingField::ChordHold) => {
                     format!("CHORD HOLD {}", app.performer_engine.hold_label())
@@ -164,6 +171,8 @@ impl Frame {
                     settings: self.settings,
                     setting_focus: self.setting_focus,
                     options: &self.options,
+                    voicing: self.voicing,
+                    pending_voicing: self.pending_voicing,
                     sync_status: self.sync_status,
                     current_chord: self.current_chord,
                     chord_elapsed_beats: self.chord_elapsed_beats,
@@ -201,6 +210,7 @@ impl Frame {
                     playing_phrase: self.playing_phrase,
                     queued_phrase: self.queued_phrase,
                     edit_grid: self.edit_grid,
+                    can_undo: self.can_undo_phrase,
                 },
             ),
         }
@@ -434,6 +444,7 @@ fn tick(
 
     if transport.take_midi_restart() {
         app.pending_chord = None;
+        app.pending_voicing = None;
         app.recorder.reset_timeline();
         if *was_running {
             app.phrase_player.stop();
@@ -450,6 +461,7 @@ fn tick(
             app.performer_engine.transport_started(now_beat);
         } else {
             app.pending_chord = None;
+            app.pending_voicing = None;
             app.phrase_player.stop();
             app.performer_engine.transport_stopped();
             midi.stop_all()?;
@@ -459,6 +471,12 @@ fn tick(
 
     let mut live_commit = false;
     if running_now {
+        let voicing_due = app.pending_voicing.filter(|&(_, at)| now_beat >= at);
+        if let Some((style, _)) = voicing_due {
+            app.pending_voicing = None;
+            app.voice_engine.style = style;
+        }
+        let mut harmony_committed = false;
         if let Some((chord, at)) = app.pending_chord
             && now_beat >= at
         {
@@ -467,6 +485,7 @@ fn tick(
             app.pending_chord = None;
             app.phrase_player.stop();
             app.set_harmony(chord, at, true, true);
+            harmony_committed = true;
         }
         advance_recorder(app, now_beat);
         let playback = app.phrase_player.update(&app.phrases, now_beat);
@@ -474,6 +493,14 @@ fn tick(
             && chord != app.current_chord
         {
             app.set_harmony(chord, at, true, false);
+            harmony_committed = true;
+        }
+        if voicing_due.is_some() {
+            if !harmony_committed {
+                app.revoice_current();
+            }
+            app.performer_engine.request_live_revoice();
+            live_commit = true;
         }
         let phrase_next = playback.next_chord.zip(playback.next_chord_beat);
         let next = match (app.pending_chord, phrase_next) {
@@ -536,6 +563,103 @@ mod tests {
         assert_eq!(recorded.events.len(), 1);
         assert_eq!(recorded.events[0].chord, replacement.0);
         assert_eq!(recorded.events[0].start_beat, 0.0);
+    }
+
+    #[test]
+    fn queued_voicing_and_chord_land_in_one_worker_update() {
+        let mut app = App::new();
+        let mut midi = MidiEngine::dry_run();
+        let mut transport = SyncTransport::new(app.settings.tempo_bpm);
+        transport.start(4.0);
+        let mut running = false;
+        let chord = app
+            .settings
+            .tonal
+            .diatonic_chord(4, crate::music::chord::ChordExtension::Seventh);
+        for _ in 0..2 {
+            handle_performance_action(InputAction::RightClick, &mut app, &mut transport, &mut midi)
+                .unwrap();
+        }
+        assert_eq!(app.pending_voicing, Some((VoicingStyle::Open, 1.0)));
+        assert_eq!(app.voice_engine.style, VoicingStyle::Smooth);
+        app.pending_chord = Some((chord, 0.0));
+        app.pending_voicing = Some((VoicingStyle::Open, 0.0));
+
+        assert!(tick(&mut app, &mut transport, &mut midi, &mut running).unwrap());
+        assert_eq!(app.current_chord, chord);
+        assert_eq!(app.voice_engine.style, VoicingStyle::Open);
+        assert!(app.pending_chord.is_none());
+        assert!(app.pending_voicing.is_none());
+    }
+
+    #[test]
+    fn phrase_undo_restores_edits_and_selection_without_affecting_other_phrases() {
+        use crate::music::chord::ChordExtension;
+        use crate::phrase::ChordEvent;
+
+        let mut app = App::new();
+        let mut midi = MidiEngine::dry_run();
+        let mut transport = SyncTransport::new(app.settings.tempo_bpm);
+        let original = vec![
+            ChordEvent {
+                chord: app.current_chord,
+                start_beat: 0.0,
+                duration_beats: 1.3,
+            },
+            ChordEvent {
+                chord: app
+                    .settings
+                    .tonal
+                    .diatonic_chord(1, ChordExtension::Seventh),
+                start_beat: 1.3,
+                duration_beats: 1.0,
+            },
+        ];
+        for id in [1, 2] {
+            app.phrases.push(Phrase {
+                id,
+                looping: true,
+                events: original.clone(),
+            });
+        }
+        app.screen = Screen::PhraseEditor;
+        app.editor_event_index = 1;
+        dispatch_action(InputAction::EditExtend, &mut app, &mut transport, &mut midi).unwrap();
+        let after_size = app.phrases[0].events.clone();
+        assert_eq!(after_size[1].duration_beats, 2.0);
+        dispatch_action(
+            InputAction::EditDuplicate,
+            &mut app,
+            &mut transport,
+            &mut midi,
+        )
+        .unwrap();
+        let after_duplicate = app.phrases[0].events.clone();
+        dispatch_action(InputAction::EditDelete, &mut app, &mut transport, &mut midi).unwrap();
+        assert_eq!(app.phrases[0].events, after_size);
+        dispatch_action(InputAction::PhraseNext, &mut app, &mut transport, &mut midi).unwrap();
+        dispatch_action(InputAction::EditUndo, &mut app, &mut transport, &mut midi).unwrap();
+        assert_eq!(app.phrases[1].events, original);
+        dispatch_action(
+            InputAction::PhrasePrevious,
+            &mut app,
+            &mut transport,
+            &mut midi,
+        )
+        .unwrap();
+        dispatch_action(InputAction::EditUndo, &mut app, &mut transport, &mut midi).unwrap();
+        assert_eq!(app.phrases[0].events, after_duplicate);
+        assert_eq!(app.editor_event_index, 2);
+        dispatch_action(InputAction::EditUndo, &mut app, &mut transport, &mut midi).unwrap();
+        assert_eq!(app.phrases[0].events, after_size);
+        assert_eq!(app.editor_event_index, 1);
+        assert!(app.edit_phrase(|phrase, index| phrase.replace_chord(index, original[0].chord)));
+        dispatch_action(InputAction::EditUndo, &mut app, &mut transport, &mut midi).unwrap();
+        assert_eq!(app.phrases[0].events, after_size);
+        dispatch_action(InputAction::EditUndo, &mut app, &mut transport, &mut midi).unwrap();
+        assert_eq!(app.phrases[0].events, original);
+        assert!(!app.can_undo_phrase());
+        assert!(app.phrases[0].looping);
     }
 
     #[test]
@@ -621,7 +745,7 @@ mod tests {
     fn stopped_settings_assign_channels_and_midi_input_blocks_clock_out() {
         let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
         worker.action(InputAction::ToggleSettings).unwrap();
-        for _ in 0..11 {
+        for _ in 0..8 {
             worker.action(InputAction::NavigateLeft).unwrap();
         }
         let settings = worker.snapshot().unwrap();
@@ -638,7 +762,7 @@ mod tests {
         assert_eq!(transpose.midi_transpose, [1, 0, 0, 0]);
         worker.action(InputAction::MenuTap).unwrap();
         worker.action(InputAction::ToggleSettings).unwrap();
-        for _ in 0..4 {
+        for _ in 0..7 {
             worker.action(InputAction::NavigateRight).unwrap();
         }
         worker.action(InputAction::NavigateUp).unwrap();

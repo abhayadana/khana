@@ -24,9 +24,11 @@ use music::recommendation::{
     HarmonicDirection, RecommendationClass, RecommendationEngine, RecommendationSet,
 };
 use music::settings::{MusicalSettings, SettingField};
+use music::voicing::VoicingStyle;
 use performer::PerformerEngine;
-use phrase::{EditGrid, LiveGrid, Phrase, PhrasePlayer, PhraseRecorder};
+use phrase::{ChordEvent, EditGrid, LiveGrid, Phrase, PhrasePlayer, PhraseRecorder};
 use sdl2::event::Event;
+use std::collections::{HashMap, VecDeque};
 use sync::{SyncMode, SyncTransport};
 use ui::Ui;
 use voice::{MacroKind, Voice, VoiceEngine, VoiceRender, VoiceScope, adjust_macro, default_voices};
@@ -38,6 +40,11 @@ const WINDOW_HEIGHT: u32 = 768;
 enum Screen {
     Performance,
     PhraseEditor,
+}
+
+struct PhraseEdit {
+    events: Vec<ChordEvent>,
+    selection: usize,
 }
 
 struct App {
@@ -61,12 +68,14 @@ struct App {
     recorder: PhraseRecorder,
     phrase_player: PhrasePlayer,
     phrases: Vec<Phrase>,
+    phrase_undo: HashMap<u32, VecDeque<PhraseEdit>>,
     editor_phrase_index: usize,
     editor_event_index: usize,
     editor_zoom: f32,
     editor_grid: EditGrid,
     live_grid: LiveGrid,
     pending_chord: Option<(Chord, f64)>,
+    pending_voicing: Option<(VoicingStyle, f64)>,
 }
 
 impl App {
@@ -115,12 +124,14 @@ impl App {
             recorder: PhraseRecorder::new(),
             phrase_player: PhrasePlayer::new(),
             phrases: Vec::new(),
+            phrase_undo: HashMap::new(),
             editor_phrase_index: 0,
             editor_event_index: 0,
             editor_zoom: 82.0,
             editor_grid: EditGrid::Quarter,
             live_grid: LiveGrid::Immediate,
             pending_chord: None,
+            pending_voicing: None,
         }
     }
 
@@ -207,6 +218,47 @@ impl App {
 
     fn selected_phrase_mut(&mut self) -> Option<&mut Phrase> {
         self.phrases.get_mut(self.editor_phrase_index)
+    }
+
+    fn edit_phrase(&mut self, edit: impl FnOnce(&mut Phrase, usize)) -> bool {
+        const UNDO_LIMIT: usize = 32;
+        let selection = self.editor_event_index;
+        let Some(phrase) = self.phrases.get_mut(self.editor_phrase_index) else {
+            return false;
+        };
+        let events = phrase.events.clone();
+        edit(phrase, selection);
+        if events == phrase.events {
+            return false;
+        }
+        let history = self.phrase_undo.entry(phrase.id).or_default();
+        if history.len() == UNDO_LIMIT {
+            history.pop_front();
+        }
+        history.push_back(PhraseEdit { events, selection });
+        self.phrase_player.phrase_edited(self.editor_phrase_index);
+        true
+    }
+
+    fn undo_phrase_edit(&mut self) {
+        let Some(phrase) = self.phrases.get_mut(self.editor_phrase_index) else {
+            return;
+        };
+        if let Some(edit) = self
+            .phrase_undo
+            .get_mut(&phrase.id)
+            .and_then(VecDeque::pop_back)
+        {
+            phrase.events = edit.events;
+            self.editor_event_index = edit.selection;
+            self.phrase_player.phrase_edited(self.editor_phrase_index);
+        }
+    }
+
+    fn can_undo_phrase(&self) -> bool {
+        self.selected_phrase()
+            .and_then(|phrase| self.phrase_undo.get(&phrase.id))
+            .is_some_and(|history| !history.is_empty())
     }
 
     fn clamp_editor_selection(&mut self) {
@@ -366,7 +418,7 @@ fn main() -> Result<(), String> {
             let action = if brick {
                 handheld.event(&event, worker.input_page(), Instant::now())
             } else {
-                desktop_event(&event, &controllers)
+                desktop_event(&event, &controllers, worker.input_page())
             };
             if let Some(action) = action
                 && worker.action(action)?
@@ -453,6 +505,7 @@ fn toggle_transport(app: &mut App, transport: &mut SyncTransport) {
     }
     if transport.is_running() || transport.start_pending() {
         app.pending_chord = None;
+        app.pending_voicing = None;
         transport.stop();
     } else {
         transport.start(app.settings.meter.beats_per_bar());
@@ -498,8 +551,30 @@ fn handle_performance_action(
                 app.set_harmony(chord, now_beat, transport.is_running(), true);
             }
         }
-        InputAction::RightClick => app.live_grid = app.live_grid.next(),
-        InputAction::LeftClick => app.performer_engine.toggle_hold(app.scope),
+        InputAction::CycleLiveGrid => app.live_grid = app.live_grid.next(),
+        InputAction::PatternHold => app.performer_engine.toggle_hold(app.scope),
+        InputAction::ToggleMute => app.performer_engine.toggle_mute(app.scope),
+        InputAction::ToggleSolo => app.performer_engine.toggle_solo(app.scope),
+        InputAction::LeftClick if transport.is_running() => {
+            app.performer_engine
+                .toggle_sustain(app.scope, &app.voices, now_beat);
+        }
+        InputAction::RightClick => {
+            let current = app.voice_engine.style;
+            let next = app
+                .pending_voicing
+                .map_or(current, |(style, _)| style)
+                .next(1);
+            if transport.is_running() {
+                let meter = app.settings.meter;
+                let quantum = EditGrid::Beat.beats(meter.numerator, meter.denominator);
+                app.pending_voicing = (next != current)
+                    .then(|| (next, phrase::next_strict_boundary(now_beat, quantum)));
+            } else {
+                app.voice_engine.style = next;
+                app.revoice_current();
+            }
+        }
         InputAction::Vary => app.performer_engine.request_variation(app.scope),
         InputAction::Secondary => {
             app.recommendation_engine.reroll();
@@ -758,38 +833,25 @@ fn handle_editor_action(
             replace_selected_with_safe_choice(app);
         }
         InputAction::EditDuplicate => {
-            let index = app.editor_event_index;
-            if let Some(phrase) = app.selected_phrase_mut() {
-                phrase.duplicate_event(index);
+            if app.edit_phrase(Phrase::duplicate_event) {
+                app.editor_event_index += 1;
+                app.clamp_editor_selection();
             }
-            app.editor_event_index = app.editor_event_index.saturating_add(1);
-            app.clamp_editor_selection();
         }
         InputAction::EditDelete => {
-            let index = app.editor_event_index;
-            if let Some(phrase) = app.selected_phrase_mut() {
-                phrase.delete_event(index);
+            if app.edit_phrase(Phrase::delete_event) {
+                app.clamp_editor_selection();
             }
-            app.clamp_editor_selection();
         }
-        InputAction::EditShorten => {
-            let index = app.editor_event_index;
+        InputAction::EditShorten | InputAction::EditExtend => {
             let grid = app
                 .editor_grid
                 .beats(app.settings.meter.numerator, app.settings.meter.denominator);
-            if let Some(phrase) = app.selected_phrase_mut() {
-                phrase.snap_resize_event(index, grid, false);
-            }
+            app.edit_phrase(|phrase, index| {
+                phrase.snap_resize_event(index, grid, action == InputAction::EditExtend);
+            });
         }
-        InputAction::EditExtend => {
-            let index = app.editor_event_index;
-            let grid = app
-                .editor_grid
-                .beats(app.settings.meter.numerator, app.settings.meter.denominator);
-            if let Some(phrase) = app.selected_phrase_mut() {
-                phrase.snap_resize_event(index, grid, true);
-            }
-        }
+        InputAction::EditUndo => app.undo_phrase_edit(),
         InputAction::GridPrevious | InputAction::NavigateUp => {
             app.editor_grid = app.editor_grid.previous();
         }
@@ -841,9 +903,7 @@ fn replace_selected_with_safe_choice(app: &mut App) {
     );
     let replacement = set.get(RecommendationClass::Safe, 0);
 
-    if let Some(phrase) = app.phrases.get_mut(phrase_index) {
-        phrase.replace_chord(event_index, replacement);
-    }
+    app.edit_phrase(|phrase, index| phrase.replace_chord(index, replacement));
 }
 
 fn print_controls() {
@@ -854,7 +914,8 @@ fn print_controls() {
     println!("PERFORMANCE:");
     println!("  arrows  browse Safe / Colorful / Bold");
     println!("  Z       commit highlighted chord");
-    println!("  F5 / F6 / F7  Hold scoped pattern / live grid / Vary");
+    println!("  F5/F6/F7  Sustain / voicing / Vary");
+    println!("  F8/F9/F10/F11  Pattern Hold / live grid / Mute / Solo");
     println!("  X       reroll same vocabulary");
     println!("  S       surprise / broaden vocabulary");
     println!("  Q/E/W   Resolve / Neutral / Tension bias");
@@ -868,8 +929,7 @@ fn print_controls() {
     println!("  M       settings (stopped), or tempo (playing on internal clock)");
     println!("SETTINGS:");
     println!("  Left/Right field   Up/Down value   Z/M exit");
-    println!("  SYNC INTERNAL/MIDI IN/LINK; STARTSYNC OFF/ON");
-    println!("  MIDI CHANNEL: Up/Down change; CLOCK OUT: Up/Down toggle");
+    println!("  MIDI Rig: from Tonic, Left once. Channel, transpose, MIDI In/Out, Link");
     println!("  MIDI PANIC: Z sends on assigned channels");
     println!("PERFORMERS:");
     println!("  Bass CHD | Chords BAR | Texture 2BAR | Melody PHR");
@@ -883,15 +943,18 @@ fn print_controls() {
     println!("  F/R        snap shorter/longer to edit grid");
     println!("  Up/Down    previous/next edit grid");
     println!("  [/]        previous/next edit grid");
-    println!("  -/+        zoom");
-    println!("BRICK BRING-UP:");
+    println!("  -/=        zoom");
+    println!("  F5/F6/F12  Loop / clear queue / Undo");
+    println!("BRICK PRO:");
     println!("  MENU tap: page, hold: exit; never SELECT+MENU");
-    println!("  Performance: A commit B reroll X surprise Y neutral L/R1 scope L/R2 bias");
+    println!("  Performance: A commit B reroll X surprise L/R1 scope");
+    println!("  L2 Resolve, L2+R2 or Y Neutral, R2 Tension");
     println!("  SELECT+A record, SELECT+B arm next, SELECT+X settings / live internal tempo");
     println!("  Sticks: left X/Y density/dynamics, right X/Y spread/color");
-    println!("  Performance: SELECT+L1 Hold, SELECT+R1 live grid, SELECT+Y Vary");
+    println!("  Performance: L3 Sustain, R3 voicing, SELECT+L/R2 Mute/Solo");
+    println!("  SELECT+L/R1 Pattern Hold/live grid, SELECT+R3 or SELECT+Y Vary");
     println!("  Editor: A play B change X duplicate Y back; SELECT+Y delete");
-    println!("  Editor: SELECT+X Loop, SELECT+B clear queue (desktop F5 / F6)");
+    println!("  Editor: L3 or SELECT+X Loop, R3 or SELECT+B clear queue, SELECT+A Undo");
     println!("  L/R1 phrase, L/R2 duration, SELECT+L/R1 zoom, D-pad grid/event");
 }
 

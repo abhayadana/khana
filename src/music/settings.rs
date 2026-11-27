@@ -269,6 +269,9 @@ impl SettingField {
         Self::Mode,
         Self::Tempo,
         Self::Meter,
+        Self::ChordHold,
+        Self::BassArrival,
+        Self::Voicing,
         Self::Sync,
         Self::StartStopSync,
         Self::MidiChannel(0),
@@ -279,13 +282,23 @@ impl SettingField {
         Self::MidiTranspose(1),
         Self::MidiTranspose(2),
         Self::MidiTranspose(3),
-        Self::ChordHold,
-        Self::BassArrival,
-        Self::Voicing,
         Self::MidiClockOut,
         Self::MidiPanic,
         Self::MidiOutput,
     ];
+
+    pub const fn is_rig(self) -> bool {
+        matches!(
+            self,
+            Self::Sync
+                | Self::StartStopSync
+                | Self::MidiChannel(_)
+                | Self::MidiTranspose(_)
+                | Self::MidiClockOut
+                | Self::MidiPanic
+                | Self::MidiOutput
+        )
+    }
 
     /// Moves focus one field to the right.
     pub fn next(self) -> Self {
