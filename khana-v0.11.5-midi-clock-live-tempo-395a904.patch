@@ -1,0 +1,1310 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 45d36dcdbf1ac8c8d7c7dc1c2c22764378c2e751..121826177664af0ec0c4c939fd5eea322125cd4b 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -337,7 +337,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "khana"
+-version = "0.11.4"
++version = "0.11.5"
+ dependencies = [
+  "midir",
+  "rusty_link",
+diff --git a/Cargo.toml b/Cargo.toml
+index 52cdb028909bedfce0c1f872621a22c2fce62b15..34ff8917badfea9d43ead172f3aaec0da40a1e42 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "khana"
+-version = "0.11.4"
++version = "0.11.5"
+ edition = "2024"
+ 
+ [features]
+diff --git a/README.md b/README.md
+index 94935a0bc5603589b4d33cd763ea17f71e7d0266..74c2bd2a7353965d64d8bb0d162a5b6e6cd254c0 100644
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,12 @@
+-# Khaṇa v0.11.4
++# Khaṇa v0.11.5
++
++With transport stopped, hold **Select** and press **X** on Performance
++(desktop **M**) to edit tonic, mode, tempo, meter, and sync settings. Use
++left/right to select a field and up/down to change it. During internal-clock
++playback, the same shortcut opens live tempo editing.
++
++See [v0.11.5 MIDI Clock Out](docs/BRICK_V0.11.5.md) for clock routing,
++Start/Continue behavior, MIDI panic, and the Brick and desktop test plan.
+ 
+ See [v0.11.4 musical timing worker](docs/BRICK_V0.11.4.md) for thread ownership,
+ MIDI output selection, NextUI runtime setup and acceptance tests.
+diff --git a/docs/BRICK_V0.11.5.md b/docs/BRICK_V0.11.5.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ff5ae3b5173d58ba7f7ec068ecf9f0bc0b2b0c5
+--- /dev/null
++++ b/docs/BRICK_V0.11.5.md
+@@ -0,0 +1,77 @@
++# Khaṇa v0.11.5 MIDI Clock Out and live tempo
++
++Baseline `395a904530a25ce9c7d079a589e43788326eea77` on GitHub main.
++
++## Settings and controls
++
++From Performance, hold Select and press X on Brick or press M on desktop.
++With playback stopped, Settings opens on Tonic. Left/right selects a field
++and up/down changes its value.
++
++| From Tonic | Field | Action |
++|---|---|---|
++| Left once | MIDI OUTPUT | Up/down selects the raw destination or OFF. |
++| Left twice | MIDI PANIC | A on Brick or Z on desktop sends on channels 1–4. |
++| Left three times | CLOCK OUT | Up/down toggles MIDI Clock Out on the selected output. |
++
++B or a Menu tap closes Brick Settings from any field. A closes ordinary
++Settings and sends panic when MIDI PANIC is focused. On desktop, use M to
++cancel or close Settings. Panic releases owned notes and sends All Sound Off
++and All Notes Off (CC120/CC123) on channels 1–4. Stop first if playback is
++still running. An unavailable output cannot receive the panic messages.
++
++During internal-clock playback, Select+X or M opens live tempo on Performance.
++Up/down changes the tempo by 1 BPM from 30 to 300 without moving the beat.
++Close with A, B, or a Menu tap on Brick or Z/M on desktop. Start/Space stops
++transport and closes live tempo. Link tempo edits remain in stopped Settings.
++
++## Clock and transport
++
++- Clock Out defaults to OFF at launch. The setting applies to the current
++  session and uses the same MIDI destination as performed notes. Selecting raw
++  MIDI OFF suppresses both. Dry-run trace shows intended bytes.
++- The music worker derives `F8` at 24 pulses per quarter note from the active
++  beat timeline. A normal stop or app exit sends `FC` for an active outgoing
++  transport. Clock pulses run during playback.
++- On internal clock, the first launch sends `FA` and an uninterrupted stop
++  and resume on the same destination sends `FB`. The first clock follows on the
++  next pulse boundary. Khaṇa's Start button retains its local stop/resume
++  behavior. If a new `FA` is needed at a nonzero local beat, the receiver
++  starts its sequence from zero. Song Position Pointer is a future feature.
++- In a Link-enabled desktop build, the outgoing transport sends a fresh `FA`
++  ahead of the next bar boundary in Khaṇa's meter, with the first `F8` at that
++  boundary. Khaṇa's own Link playback behavior continues as before. Standard
++  Brick packaging builds without Link. MIDI Clock In is also future work.
++- A raw-port fault interrupts clock delivery. Reconnecting during playback
++  leaves clock transport waiting for a deliberate stop and start. Existing
++  raw note routing and pinned-device cleanup still apply. A disconnected
++  receiver may need to be stopped locally.
++- The worker skips missed pulses instead of sending a burst. The raw queue
++  retains at most one pending `F8` during backpressure. The worker logs skipped
++  pulses and uses a fresh `FA` on the next internal launch after a skipped
++  pulse. Use `MIDI CLOCK OUT` diagnostics to spot stalls. The raw queue spaces
++  the first clock after a delayed Start/Continue write. These checks describe
++  scheduling and writes, while wire-level jitter requires hardware measurement.
++
++## Acceptance checks
++
++1. Build with `./scripts/package-khana.sh` and launch from NextUI. Confirm
++   `0.11.5`, CLOCK OUT OFF, and the original four-role output on QT-2host.
++2. Switch to CLOCK OUT and enable it. Use a MIDI monitor or a receiver set to
++   external MIDI sync. Verify `FA`, `F8` spacing, `FC`, then `FB` on an
++   uninterrupted resume. At 120 BPM expect about 20.8 ms between pulses.
++   A normal exit from playback should also send `FC`.
++3. Change live tempo during playback. Verify the BPM display, receiver tempo,
++   and continuity of the performance. Compare 30 and 60 FPS with tracing off
++   while changing screens, chord choices, and macros.
++4. Unplug and reconnect QT-2host during playback. Check the clock status and
++   verify a fresh `FA` after stop/start. Select MIDI OUTPUT OFF and verify
++   silence. Restore a destination and use MIDI PANIC while stopped to verify
++   CC120/123 on channels 1–4.
++5. On desktop, test default ALSA, raw-only, and `--features ableton-link`.
++   In a real Link session verify BPM changes, first-clock alignment to the
++   configured meter, and shared start/stop with both peers opted in.
++
++For a desktop trace without external MIDI, launch with
++`KHANA_MIDI_DRY_RUN=1 KHANA_MIDI_TRACE=1 cargo run --locked --no-default-features`.
++Enable Clock Out in stopped Settings, then start playback.
+diff --git a/packaging/NextUI/Tools/tg5040/Khana.pak/launch.sh b/packaging/NextUI/Tools/tg5040/Khana.pak/launch.sh
+index dd3c15e1fdf2459369c866998633a31b725c18a8..18b2a8464bc56cb6d42b645a5c1ff1cd366121fb 100755
+--- a/packaging/NextUI/Tools/tg5040/Khana.pak/launch.sh
++++ b/packaging/NextUI/Tools/tg5040/Khana.pak/launch.sh
+@@ -10,7 +10,7 @@ export KHANA_MIDI_BACKEND="${KHANA_MIDI_BACKEND:-raw}"
+ export BRICK_UI_FPS="${BRICK_UI_FPS:-30}"
+ # Use the firmware's native SDL2; preserve the existing search path and video backend.
+ export LD_LIBRARY_PATH="/usr/trimui/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+-echo "Khana v0.11.4 NextUI launch"
++echo "Khana v0.11.5 NextUI launch"
+ date
+ printf 'PAK=%s PLATFORM=%s SDL_VIDEODRIVER=%s UI_FPS=%s\n' "$PAK_DIR" "${PLATFORM:-unknown}" "${SDL_VIDEODRIVER:-auto}" "$BRICK_UI_FPS"
+ if [ ! -x ./khana ]; then
+diff --git a/packaging/NextUI/Tools/tg5040/Khana.pak/pak.json b/packaging/NextUI/Tools/tg5040/Khana.pak/pak.json
+index 4cd0af76855fbcc3e5002887bbde4097b0c511f2..9ec7c5ea6af85dd14f5d4691f8453706ef3f06c6 100644
+--- a/packaging/NextUI/Tools/tg5040/Khana.pak/pak.json
++++ b/packaging/NextUI/Tools/tg5040/Khana.pak/pak.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "Khana",
+-  "version": "0.11.4",
++  "version": "0.11.5",
+   "type": "tool",
+   "platform": "tg5040",
+   "description": "Performance-oriented MIDI harmony and phrase instrument"
+diff --git a/src/input.rs b/src/input.rs
+index 09358ee7ba4d9a2ee4a91c039ed887e2847aab3c..c980845efd38e300a4c8d62618488de539a4fd38 100644
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -460,7 +460,8 @@ fn brick_button(page: InputPage, button: u8, select: bool) -> Option<InputAction
+         (InputPage::Editor, true, 2) => Some(EditDelete),
+         (InputPage::Editor, true, 4) => Some(ZoomOut),
+         (InputPage::Editor, true, 5) => Some(ZoomIn),
+-        (InputPage::Settings, false, 0 | 1) => Some(ToggleSettings),
++        (InputPage::Settings, false, 0) => Some(ToggleSettings),
++        (InputPage::Settings, false, 1) => Some(Primary),
+         _ => None,
+     }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index d02c3efbda2c66aae67ca020048341eede844d91..6a2838a04f441e1d65a1bae069df93533a2a61d3 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,4 +1,4 @@
+-//! Khaṇa v0.11.4 independent musical runtime.
++//! Khaṇa v0.11.5 MIDI Clock Out and live tempo.
+ //!
+ //! v0.11 adds complete semantic chord voicings, rhythmic/gated Melody phrases,
+ //! persistent cyclic Texture, and lightweight performer-to-performer awareness.
+@@ -441,10 +441,10 @@ fn dispatch_action(
+ }
+ 
+ fn toggle_transport(app: &mut App, transport: &mut SyncTransport) {
++    app.setting_focus = None;
+     if transport.is_running() {
+         transport.stop();
+     } else {
+-        app.setting_focus = None;
+         transport.start();
+     }
+ }
+@@ -537,6 +537,9 @@ fn handle_performance_action(
+         InputAction::ToggleSettings if !transport.is_running() => {
+             app.setting_focus = Some(SettingField::Tonic);
+         }
++        InputAction::ToggleSettings if transport.mode() == SyncMode::Internal => {
++            app.setting_focus = Some(SettingField::Tempo);
++        }
+         InputAction::ToggleSettings => {}
+         _ => {}
+     }
+@@ -551,20 +554,25 @@ fn handle_setting_action(
+     transport: &mut SyncTransport,
+     midi: &mut MidiEngine,
+ ) -> Result<(), String> {
++    let running = transport.is_running();
+     match action {
++        InputAction::Primary if !running && field == SettingField::MidiPanic => {
++            midi.panic()?;
++            app.setting_focus = None;
++        }
+         InputAction::ToggleSettings | InputAction::Primary => {
+             app.setting_focus = None;
+         }
+-        InputAction::NavigateLeft => {
++        InputAction::NavigateLeft if !running => {
+             app.setting_focus = Some(field.previous());
+         }
+-        InputAction::NavigateRight => {
++        InputAction::NavigateRight if !running => {
+             app.setting_focus = Some(field.next());
+         }
+-        InputAction::NavigateUp => {
++        InputAction::NavigateUp if !running || live_tempo(field, transport) => {
+             adjust_setting(1, field, app, transport, midi)?;
+         }
+-        InputAction::NavigateDown => {
++        InputAction::NavigateDown if !running || live_tempo(field, transport) => {
+             adjust_setting(-1, field, app, transport, midi)?;
+         }
+         _ => {}
+@@ -573,6 +581,10 @@ fn handle_setting_action(
+     Ok(())
+ }
+ 
++fn live_tempo(field: SettingField, transport: &SyncTransport) -> bool {
++    field == SettingField::Tempo && transport.mode() == SyncMode::Internal
++}
++
+ fn adjust_setting(
+     direction: i32,
+     field: SettingField,
+@@ -619,7 +631,9 @@ fn adjust_setting(
+                 SyncMode::Link => SyncMode::Internal,
+             };
+ 
+-            if !transport.set_mode(next_mode, app.settings.meter.beats_per_bar()) {
++            if transport.set_mode(next_mode, app.settings.meter.beats_per_bar()) {
++                midi.reset_clock_position();
++            } else {
+                 eprintln!("Ableton Link is not compiled in. Rebuild with --features ableton-link");
+             }
+ 
+@@ -629,6 +643,8 @@ fn adjust_setting(
+             let status = transport.status();
+             transport.set_link_start_stop_sync(!status.link_start_stop_sync);
+         }
++        SettingField::MidiClockOut => midi.toggle_clock_out(),
++        SettingField::MidiPanic => {}
+         SettingField::MidiOutput => {
+             if !transport.is_running() {
+                 midi.cycle_raw_destination(direction)?;
+@@ -792,10 +808,11 @@ fn print_controls() {
+     println!("  I/K     color -/+ (role-specific note pool)");
+     println!("  P       quantized record start/stop");
+     println!("  N       arm next phrase");
+-    println!("  M       edit tonic/mode/tempo/meter/sync (stopped)");
++    println!("  M       settings (stopped), or tempo (playing on internal clock)");
+     println!("SETTINGS:");
+     println!("  Left/Right field   Up/Down value   Z/M exit");
+     println!("  SYNC INTERNAL/LINK; STARTSYNC OFF/ON");
++    println!("  CLOCK OUT: Up/Down toggle; MIDI PANIC: Z send on channels 1-4");
+     println!("PERFORMERS:");
+     println!("  Bass CHD | Chords BAR | Texture 2BAR | Melody PHR");
+     println!("PHRASE EDITOR:");
+@@ -812,7 +829,7 @@ fn print_controls() {
+     println!("BRICK BRING-UP:");
+     println!("  MENU tap: page, hold: exit; never SELECT+MENU");
+     println!("  Performance: A commit B reroll X surprise Y neutral L/R1 scope L/R2 bias");
+-    println!("  SELECT+A record, SELECT+B arm next, SELECT+X settings (stopped)");
++    println!("  SELECT+A record, SELECT+B arm next, SELECT+X settings / live internal tempo");
+     println!("  Sticks: left X/Y density/dynamics, right X/Y spread/color");
+     println!("  Editor: A play B change X duplicate Y back; SELECT+Y delete");
+     println!("  L/R1 phrase, L/R2 duration, SELECT+L/R1 zoom, D-pad grid/event");
+diff --git a/src/midi.rs b/src/midi.rs
+index f00bc91167ad27accb9a84825c65904544ae2260..e1a09f95ac4c226ccff28bba961ff89edecc04da 100644
+--- a/src/midi.rs
++++ b/src/midi.rs
+@@ -5,12 +5,14 @@
+ //! tracks a set of active notes for every channel so stale Note Off messages
+ //! cannot terminate unrelated notes.
+ 
++mod clock;
+ mod raw;
+ 
+ use std::path::PathBuf;
+ use std::time::{Duration, Instant};
+ 
+ use crate::performer::VoiceEvent;
++use clock::{ClockOut, Realtime};
+ #[cfg(feature = "alsa-sequencer")]
+ use midir::os::unix::VirtualOutput;
+ #[cfg(feature = "alsa-sequencer")]
+@@ -19,6 +21,30 @@ use raw::{RawOutput, Selection};
+ 
+ const VOICE_COUNT: usize = 4;
+ 
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum Message {
++    Channel([u8; 3]),
++    Realtime(u8),
++}
++
++impl Message {
++    fn bytes(&self) -> &[u8] {
++        match self {
++            Self::Channel(bytes) => bytes,
++            Self::Realtime(byte) => std::slice::from_ref(byte),
++        }
++    }
++
++    fn is_clock(self) -> bool {
++        self == Self::Realtime(Realtime::Clock as u8)
++    }
++
++    fn starts_clock(self) -> bool {
++        self == Self::Realtime(Realtime::Start as u8)
++            || self == Self::Realtime(Realtime::Continue as u8)
++    }
++}
++
+ #[derive(Clone, Copy, Debug)]
+ struct NoteOwnership {
+     active: [u128; VOICE_COUNT],
+@@ -62,6 +88,7 @@ enum MidiSink {
+ pub struct MidiEngine {
+     connection: MidiSink,
+     ownership: NoteOwnership,
++    clock: ClockOut,
+     destination_name: String,
+     trace: bool,
+ }
+@@ -82,6 +109,7 @@ impl MidiEngine {
+         Ok(Self {
+             connection: MidiSink::Alsa(connection),
+             ownership: NoteOwnership::new(),
++            clock: ClockOut::default(),
+             destination_name: format!("VIRTUAL: {port_name}"),
+             trace: trace_enabled(),
+         })
+@@ -145,6 +173,7 @@ impl MidiEngine {
+             return Ok(Self {
+                 connection: MidiSink::Alsa(connection),
+                 ownership: NoteOwnership::new(),
++                clock: ClockOut::default(),
+                 destination_name: name,
+                 trace: trace_enabled(),
+             });
+@@ -163,6 +192,7 @@ impl MidiEngine {
+         Self {
+             connection: MidiSink::DryRun,
+             ownership: NoteOwnership::new(),
++            clock: ClockOut::default(),
+             destination_name: "DRY RUN - NO OUTPUT".to_owned(),
+             trace: trace_enabled(),
+         }
+@@ -200,6 +230,7 @@ impl MidiEngine {
+                 Ok(Self {
+                     connection: MidiSink::Raw(Box::new(RawOutput::new(selection))),
+                     ownership: NoteOwnership::new(),
++                    clock: ClockOut::default(),
+                     destination_name: String::new(),
+                     trace: trace_enabled(),
+                 })
+@@ -228,6 +259,7 @@ impl MidiEngine {
+             return Ok(());
+         }
+         self.stop_all()?;
++        self.clock.forget_position();
+         if let MidiSink::Raw(output) = &mut self.connection {
+             output.cycle(direction);
+         }
+@@ -245,10 +277,65 @@ impl MidiEngine {
+         }
+     }
+ 
+-    pub fn report(&self) {
++    pub fn report(&mut self) {
+         if let MidiSink::Raw(output) = &self.connection {
+             output.report();
+         }
++        let skipped = self.clock.take_skipped();
++        if skipped > 0 {
++            eprintln!("MIDI CLOCK OUT | skipped pulses={skipped}");
++        }
++    }
++
++    pub fn toggle_clock_out(&mut self) {
++        self.clock.toggle();
++    }
++
++    pub fn reset_clock_position(&mut self) {
++        self.clock.forget_position();
++    }
++
++    pub fn clock_label(&self) -> &'static str {
++        self.clock.label(self.available())
++    }
++
++    /// Queue realtime transport and clocks before performer events for this beat.
++    pub fn update_clock(
++        &mut self,
++        beat: f64,
++        running: bool,
++        link_quantum: Option<f64>,
++    ) -> Result<(), String> {
++        let available = self.available();
++        if let Some(message) =
++            self.clock
++                .update(beat, running, available, link_quantum, Instant::now())
++        {
++            self.send_realtime(message)?;
++        }
++        Ok(())
++    }
++
++    /// Finish an active outgoing transport before the worker releases notes.
++    pub fn stop_clock(&mut self) -> Result<(), String> {
++        if let Some(message) = self.clock.stop(false) {
++            self.send_realtime(message)?;
++        }
++        Ok(())
++    }
++
++    fn send_realtime(&mut self, message: Realtime) -> Result<(), String> {
++        if !self.available() {
++            return Ok(());
++        }
++        match self.send_message(Message::Realtime(message as u8)) {
++            Ok(false) => Ok(()),
++            Ok(true) => {
++                self.clock.drop_queued_pulse();
++                Ok(())
++            }
++            Err(error) => self.recover_raw(error),
++        }
+     }
+ 
+     fn available(&self) -> bool {
+@@ -376,20 +463,50 @@ impl MidiEngine {
+         }
+     }
+ 
++    /// Explicitly silence all four reserved channels, including unowned notes.
++    pub fn panic(&mut self) -> Result<(), String> {
++        self.stop_all()?;
++        if !self.available() {
++            eprintln!("MIDI panic: output unavailable");
++            return Ok(());
++        }
++        for channel in 0..VOICE_COUNT {
++            for control in [120, 123] {
++                let status = 0xB0 | channel_nibble(channel);
++                if let Err(error) = self.send([status, control, 0]) {
++                    return self.recover_raw(error);
++                }
++            }
++        }
++        if let Err(error) = self.flush_output() {
++            return self.recover_raw(error);
++        }
++        println!("MIDI panic: cleared channels 1-4");
++        Ok(())
++    }
++
+     fn send(&mut self, message: [u8; 3]) -> Result<(), String> {
++        self.send_message(Message::Channel(message)).map(|_| ())
++    }
++
++    /// Returns whether a new clock superseded a queued, undelivered clock.
++    fn send_message(&mut self, message: Message) -> Result<bool, String> {
+         if self.trace {
+-            println!(
+-                "MIDI {:02X} {:02X} {:02X}",
+-                message[0], message[1], message[2]
+-            );
++            match message {
++                Message::Channel([status, data1, data2]) => {
++                    println!("MIDI {status:02X} {data1:02X} {data2:02X}");
++                }
++                Message::Realtime(status) => println!("MIDI {status:02X}"),
++            }
+         }
+         match &mut self.connection {
+             #[cfg(feature = "alsa-sequencer")]
+-            MidiSink::Alsa(connection) => {
+-                connection.send(&message).map_err(|error| error.to_string())
+-            }
++            MidiSink::Alsa(connection) => connection
++                .send(message.bytes())
++                .map(|()| false)
++                .map_err(|error| error.to_string()),
+             MidiSink::Raw(output) => output.enqueue(message),
+-            MidiSink::DryRun => Ok(()),
++            MidiSink::DryRun => Ok(false),
+         }
+     }
+ }
+diff --git a/src/midi/clock.rs b/src/midi/clock.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..3101375f30f024e02c8e33a29a834f05d52fea6c
+--- /dev/null
++++ b/src/midi/clock.rs
+@@ -0,0 +1,288 @@
++//! MIDI Clock Out scheduling on the music worker's quarter-note timeline.
++
++use std::time::{Duration, Instant};
++
++const PULSES_PER_QUARTER: f64 = 24.0;
++pub(super) const TRANSPORT_LEAD: Duration = Duration::from_millis(1);
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++#[repr(u8)]
++pub(super) enum Realtime {
++    Clock = 0xF8,
++    Start = 0xFA,
++    Continue = 0xFB,
++    Stop = 0xFC,
++}
++
++#[derive(Debug, Default)]
++enum Phase {
++    #[default]
++    Stopped,
++    Waiting {
++        pulse: i64,
++        command: Realtime,
++    },
++    Armed {
++        pulse: i64,
++        first_clock_after: Instant,
++    },
++    Sending {
++        next_pulse: i64,
++        can_resume: bool,
++    },
++    Interrupted,
++}
++
++#[derive(Debug, Default)]
++pub(super) struct ClockOut {
++    enabled: bool,
++    phase: Phase,
++    resume_at: Option<i64>,
++    skipped: u64,
++}
++
++impl ClockOut {
++    pub(super) fn toggle(&mut self) {
++        self.enabled = !self.enabled;
++        self.forget_position();
++    }
++
++    /// Called while stopped when the destination or sync source changes.
++    pub(super) fn forget_position(&mut self) {
++        self.resume_at = None;
++    }
++
++    pub(super) fn label(&self, available: bool) -> &'static str {
++        match (&self.phase, self.enabled, available) {
++            (_, false, _) => "CLOCK OUT OFF",
++            (_, _, false) => "CLOCK OUT NO PORT",
++            (Phase::Interrupted, _, _) => "CLOCK OUT STOP/START",
++            (Phase::Waiting { .. } | Phase::Armed { .. }, _, _) => "CLOCK OUT WAIT BEAT",
++            (Phase::Sending { .. }, _, _) => "CLOCK OUT SENDING",
++            (Phase::Stopped, _, _) => "CLOCK OUT READY",
++        }
++    }
++
++    pub(super) fn take_skipped(&mut self) -> u64 {
++        std::mem::take(&mut self.skipped)
++    }
++
++    pub(super) fn drop_queued_pulse(&mut self) {
++        self.skipped = self.skipped.saturating_add(1);
++        if let Phase::Sending { can_resume, .. } = &mut self.phase {
++            *can_resume = false;
++        }
++    }
++
++    /// Internal transport freezes on stop and can resume on an unchanged port.
++    /// Link keeps moving, so each fresh Link launch waits for its bar boundary.
++    pub(super) fn update(
++        &mut self,
++        beat: f64,
++        running: bool,
++        available: bool,
++        link_quantum: Option<f64>,
++        now: Instant,
++    ) -> Option<Realtime> {
++        if !self.enabled {
++            return None;
++        }
++        if !available {
++            self.forget_position();
++            self.phase = if running {
++                Phase::Interrupted
++            } else {
++                Phase::Stopped
++            };
++            return None;
++        }
++        let current = (beat * PULSES_PER_QUARTER).floor() as i64;
++        if !running {
++            if let Phase::Sending { next_pulse, .. } = self.phase
++                && current >= next_pulse
++            {
++                self.skipped = self
++                    .skipped
++                    .saturating_add((current - next_pulse + 1) as u64);
++                return self.stop(false);
++            }
++            return self.stop(link_quantum.is_none());
++        }
++
++        if matches!(self.phase, Phase::Stopped) {
++            let (pulse, command) = if let Some(quantum) = link_quantum {
++                let bar = ((beat / quantum).floor() + 1.0) * quantum;
++                ((bar * PULSES_PER_QUARTER).round() as i64, Realtime::Start)
++            } else if let Some(resume_at) = self.resume_at {
++                (resume_at.max(current + 1), Realtime::Continue)
++            } else {
++                (current + 1, Realtime::Start)
++            };
++            self.phase = Phase::Waiting { pulse, command };
++        }
++
++        match self.phase {
++            Phase::Waiting { pulse, command } if current >= pulse - 1 => {
++                self.phase = Phase::Armed {
++                    pulse,
++                    first_clock_after: now + TRANSPORT_LEAD,
++                };
++                Some(command)
++            }
++            Phase::Armed {
++                pulse,
++                first_clock_after,
++            } if current >= pulse && now >= first_clock_after => {
++                self.resume_at = None;
++                let missed = (current - pulse) as u64;
++                self.skipped = self.skipped.saturating_add(missed);
++                self.phase = Phase::Sending {
++                    next_pulse: current + 1,
++                    can_resume: missed == 0,
++                };
++                Some(Realtime::Clock)
++            }
++            Phase::Sending {
++                next_pulse,
++                can_resume,
++            } if current >= next_pulse => {
++                let missed = (current - next_pulse) as u64;
++                self.skipped = self.skipped.saturating_add(missed);
++                // Send at most one pulse per poll. A burst cannot restore the
++                // timing of clocks that were missed during a scheduling stall.
++                self.phase = Phase::Sending {
++                    next_pulse: current + 1,
++                    can_resume: can_resume && missed == 0,
++                };
++                Some(Realtime::Clock)
++            }
++            Phase::Sending { next_pulse, .. } if current < next_pulse - 1 => {
++                // A backwards jump in the source invalidates the outgoing phase.
++                self.phase = Phase::Interrupted;
++                Some(Realtime::Stop)
++            }
++            _ => None,
++        }
++    }
++
++    pub(super) fn stop(&mut self, preserve_position: bool) -> Option<Realtime> {
++        let phase = std::mem::take(&mut self.phase);
++        match phase {
++            Phase::Sending {
++                next_pulse,
++                can_resume,
++            } => {
++                self.resume_at = (preserve_position && can_resume).then_some(next_pulse);
++                Some(Realtime::Stop)
++            }
++            Phase::Armed { .. } => Some(Realtime::Stop),
++            _ => None,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn enabled() -> ClockOut {
++        let mut clock = ClockOut::default();
++        clock.toggle();
++        clock
++    }
++
++    #[test]
++    fn internal_clock_starts_resumes_and_sends_24_pulses_per_quarter() {
++        let mut clock = enabled();
++        let now = Instant::now();
++        let later = now + TRANSPORT_LEAD;
++        assert_eq!(
++            clock.update(0.0, true, true, None, now),
++            Some(Realtime::Start)
++        );
++        assert_eq!(clock.update(0.05, true, true, None, now), None);
++        for pulse in 1..=24 {
++            let beat = (f64::from(pulse) + 0.001) / PULSES_PER_QUARTER;
++            assert_eq!(
++                clock.update(beat, true, true, None, later),
++                Some(Realtime::Clock)
++            );
++            assert_eq!(clock.update(beat, true, true, None, later), None);
++        }
++        assert_eq!(
++            clock.update(1.01, false, true, None, later),
++            Some(Realtime::Stop)
++        );
++        assert_eq!(
++            clock.update(1.01, true, true, None, later),
++            Some(Realtime::Continue)
++        );
++        assert_eq!(
++            clock.update(1.05, true, true, None, later + TRANSPORT_LEAD),
++            Some(Realtime::Clock)
++        );
++    }
++
++    #[test]
++    fn dropped_connection_requires_a_deliberate_restart() {
++        let mut clock = enabled();
++        let now = Instant::now();
++        clock.update(0.0, true, true, None, now);
++        assert_eq!(clock.update(0.5, true, false, None, now), None);
++        assert_eq!(clock.update(1.0, true, true, None, now), None);
++        assert_eq!(clock.update(1.0, false, true, None, now), None);
++        assert_eq!(
++            clock.update(1.0, true, true, None, now),
++            Some(Realtime::Start)
++        );
++    }
++
++    #[test]
++    fn late_poll_does_not_burst_and_invalidates_continue() {
++        let mut clock = enabled();
++        let now = Instant::now();
++        let later = now + TRANSPORT_LEAD;
++        clock.update(0.0, true, true, None, now);
++        assert_eq!(
++            clock.update(0.5, true, true, None, later),
++            Some(Realtime::Clock)
++        );
++        assert_eq!(clock.update(0.5, true, true, None, later), None);
++        assert_eq!(clock.take_skipped(), 11);
++        assert_eq!(clock.stop(true), Some(Realtime::Stop));
++        assert_eq!(
++            clock.update(0.51, true, true, None, later),
++            Some(Realtime::Start)
++        );
++    }
++
++    #[test]
++    fn link_waits_for_the_local_meter_boundary_on_each_launch() {
++        let mut clock = enabled();
++        let quantum = Some(3.0);
++        let now = Instant::now();
++        let later = now + TRANSPORT_LEAD;
++        assert_eq!(clock.update(1.5, true, true, quantum, now), None);
++        assert_eq!(
++            clock.update(2.99, true, true, quantum, now),
++            Some(Realtime::Start)
++        );
++        assert_eq!(
++            clock.update(3.0, true, true, quantum, later),
++            Some(Realtime::Clock)
++        );
++        assert_eq!(
++            clock.update(3.1, false, true, quantum, later),
++            Some(Realtime::Stop)
++        );
++        assert_eq!(clock.update(3.2, true, true, quantum, later), None);
++        assert_eq!(
++            clock.update(5.99, true, true, quantum, later),
++            Some(Realtime::Start)
++        );
++        assert_eq!(
++            clock.update(6.0, true, true, quantum, later + TRANSPORT_LEAD),
++            Some(Realtime::Clock)
++        );
++    }
++}
+diff --git a/src/midi/raw.rs b/src/midi/raw.rs
+index 9f8173b47fb63018646de84b3bdd02d183f4cfd0..1ae607da35f93d9fb9c6e29a255a0b9a3fecf9b2 100644
+--- a/src/midi/raw.rs
++++ b/src/midi/raw.rs
+@@ -10,6 +10,9 @@ use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+ use std::path::{Path, PathBuf};
+ use std::time::{Duration, Instant};
+ 
++use super::Message;
++use super::clock::TRANSPORT_LEAD;
++
+ const RESCAN: Duration = Duration::from_secs(1);
+ const MAX_AGE: Duration = Duration::from_millis(30);
+ const QUEUE_CAPACITY: usize = 128;
+@@ -233,7 +236,7 @@ fn select<'a>(
+ 
+ #[derive(Debug)]
+ struct Pending {
+-    bytes: [u8; 3],
++    message: Message,
+     offset: usize,
+     queued_at: Instant,
+ }
+@@ -245,6 +248,7 @@ fn drain(
+     queue: &mut VecDeque<Pending>,
+     now: Instant,
+     sent_bytes: &mut u64,
++    first_clock_after: &mut Option<Instant>,
+ ) -> io::Result<()> {
+     while let Some(message) = queue.front_mut() {
+         if now.saturating_duration_since(message.queued_at) >= MAX_AGE {
+@@ -253,12 +257,23 @@ fn drain(
+                 "MIDI queue expired",
+             ));
+         }
+-        match writer.write(&message.bytes[message.offset..]) {
++        if message.message.is_clock() && first_clock_after.is_some_and(|after| now < after) {
++            return Ok(());
++        }
++        let bytes = message.message.bytes();
++        match writer.write(&bytes[message.offset..]) {
+             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+             Ok(count) => {
+                 message.offset += count;
+                 *sent_bytes = sent_bytes.saturating_add(count as u64);
+-                if message.offset == message.bytes.len() {
++                if message.offset == bytes.len() {
++                    if message.message.starts_clock() {
++                        // Backpressure can delay Start/Continue beyond its
++                        // scheduled send time. Leave the gap after the write.
++                        *first_clock_after = Some(Instant::now() + TRANSPORT_LEAD);
++                    } else if message.message.is_clock() {
++                        *first_clock_after = None;
++                    }
+                     let _ = queue.pop_front();
+                 }
+             }
+@@ -276,6 +291,31 @@ fn drain(
+     Ok(())
+ }
+ 
++fn queue_message(
++    queue: &mut VecDeque<Pending>,
++    message: Message,
++    now: Instant,
++) -> Result<bool, String> {
++    // Keep only the newest pending clock during backpressure. A one-byte
++    // clock cannot be partially written, so removing it preserves framing.
++    let mut skipped_clock = false;
++    if message.is_clock()
++        && let Some(index) = queue.iter().position(|pending| pending.message.is_clock())
++    {
++        queue.remove(index);
++        skipped_clock = true;
++    }
++    if queue.len() >= QUEUE_CAPACITY {
++        return Err("Raw MIDI queue full".to_owned());
++    }
++    queue.push_back(Pending {
++        message,
++        offset: 0,
++        queued_at: now,
++    });
++    Ok(skipped_clock)
++}
++
+ pub(super) struct RawOutput {
+     selection: Selection,
+     pinned: Option<Identity>,
+@@ -285,6 +325,7 @@ pub(super) struct RawOutput {
+     next_scan: Instant,
+     label: String,
+     needs_cleanup: bool,
++    first_clock_after: Option<Instant>,
+     sent_bytes: u64,
+     faults: u64,
+ }
+@@ -300,6 +341,7 @@ impl RawOutput {
+             next_scan: Instant::now(),
+             label: "RAW WAIT".to_owned(),
+             needs_cleanup: false,
++            first_clock_after: None,
+             sent_bytes: 0,
+             faults: 0,
+         };
+@@ -322,19 +364,11 @@ impl RawOutput {
+         }
+     }
+ 
+-    pub(super) fn enqueue(&mut self, bytes: [u8; 3]) -> Result<(), String> {
++    pub(super) fn enqueue(&mut self, message: Message) -> Result<bool, String> {
+         if !self.connected() {
+             return Err("Raw MIDI disconnected".to_owned());
+         }
+-        if self.queue.len() >= QUEUE_CAPACITY {
+-            return Err("Raw MIDI queue full".to_owned());
+-        }
+-        self.queue.push_back(Pending {
+-            bytes,
+-            offset: 0,
+-            queued_at: Instant::now(),
+-        });
+-        Ok(())
++        queue_message(&mut self.queue, message, Instant::now())
+     }
+ 
+     /// Called only after the MIDI engine has flushed owned note releases.
+@@ -376,6 +410,7 @@ impl RawOutput {
+         self.file = None;
+         self.bound_path = None;
+         self.queue.clear();
++        self.first_clock_after = None;
+         self.pinned = None;
+         self.needs_cleanup = false;
+         self.selection = choices.swap_remove(next);
+@@ -431,7 +466,7 @@ impl RawOutput {
+                 if self.needs_cleanup {
+                     for channel in 0_u8..4 {
+                         self.queue.push_back(Pending {
+-                            bytes: [0xB0 | channel, 120, 0],
++                            message: Message::Channel([0xB0 | channel, 120, 0]),
+                             offset: 0,
+                             queued_at: now,
+                         });
+@@ -452,6 +487,7 @@ impl RawOutput {
+         self.file = None;
+         self.bound_path = None;
+         self.queue.clear();
++        self.first_clock_after = None;
+         self.next_scan = Instant::now() + RESCAN;
+         self.needs_cleanup = true;
+         self.faults = self.faults.saturating_add(1);
+@@ -481,7 +517,13 @@ impl RawOutput {
+             }
+         }
+         if let Some(file) = &mut self.file
+-            && let Err(error) = drain(file, &mut self.queue, now, &mut self.sent_bytes)
++            && let Err(error) = drain(
++                file,
++                &mut self.queue,
++                now,
++                &mut self.sent_bytes,
++                &mut self.first_clock_after,
++            )
+         {
+             self.fault(&error.to_string());
+         }
+@@ -545,44 +587,88 @@ mod tests {
+     #[test]
+     fn short_writes_and_backpressure_preserve_byte_order() {
+         let now = Instant::now();
+-        let mut queue = VecDeque::from([
+-            Pending {
+-                bytes: [0x90, 60, 100],
+-                offset: 0,
+-                queued_at: now,
+-            },
+-            Pending {
+-                bytes: [0x80, 60, 0],
+-                offset: 0,
+-                queued_at: now,
+-            },
+-        ]);
++        let mut queue = VecDeque::new();
++        for message in [
++            Message::Realtime(0xFA),
++            Message::Channel([0x90, 60, 100]),
++            Message::Realtime(0xF8),
++            Message::Channel([0x80, 60, 0]),
++        ] {
++            assert!(!queue_message(&mut queue, message, now).unwrap());
++        }
++        assert!(queue_message(&mut queue, Message::Realtime(0xF8), now).unwrap());
++        assert!(!queue_message(&mut queue, Message::Realtime(0xFC), now).unwrap());
+         let mut writer = ShortWriter {
+             bytes: Vec::new(),
+             block_next: false,
+         };
+         let mut sent = 0;
+-        for _ in 0..6 {
+-            drain(&mut writer, &mut queue, now, &mut sent).unwrap();
++        let mut first_clock_after = None;
++        for _ in 0..9 {
++            let drain_at = first_clock_after.unwrap_or(now);
++            drain(
++                &mut writer,
++                &mut queue,
++                drain_at,
++                &mut sent,
++                &mut first_clock_after,
++            )
++            .unwrap();
+         }
+         assert!(queue.is_empty());
+-        assert_eq!(writer.bytes, [0x90, 60, 100, 0x80, 60, 0]);
+-        assert_eq!(sent, 6);
++        assert_eq!(writer.bytes, [0xFA, 0x90, 60, 100, 0x80, 60, 0, 0xF8, 0xFC]);
++        assert_eq!(sent, 9);
++    }
++
++    #[test]
++    fn first_clock_waits_after_a_delayed_transport_write() {
++        let now = Instant::now();
++        let mut queue = VecDeque::new();
++        queue_message(&mut queue, Message::Realtime(0xFB), now).unwrap();
++        queue_message(&mut queue, Message::Realtime(0xF8), now).unwrap();
++        let mut sent = 0;
++        let mut first_clock_after = None;
++        let mut bytes = Vec::new();
++        drain(
++            &mut bytes,
++            &mut queue,
++            now,
++            &mut sent,
++            &mut first_clock_after,
++        )
++        .unwrap();
++        assert_eq!(bytes, [0xFB]);
++        let ready = first_clock_after.unwrap();
++        drain(
++            &mut bytes,
++            &mut queue,
++            ready,
++            &mut sent,
++            &mut first_clock_after,
++        )
++        .unwrap();
++        assert_eq!(bytes, [0xFB, 0xF8]);
+     }
+ 
+     #[test]
+     fn stale_queue_is_not_replayed() {
+         let now = Instant::now();
+         let mut queue = VecDeque::from([Pending {
+-            bytes: [0x90, 60, 100],
++            message: Message::Channel([0x90, 60, 100]),
+             offset: 0,
+             queued_at: now,
+         }]);
+         let mut sent = 0;
+         assert_eq!(
+-            drain(&mut Vec::new(), &mut queue, now + MAX_AGE, &mut sent)
+-                .unwrap_err()
+-                .kind(),
++            drain(
++                &mut Vec::new(),
++                &mut queue,
++                now + MAX_AGE,
++                &mut sent,
++                &mut None
++            )
++            .unwrap_err()
++            .kind(),
+             io::ErrorKind::TimedOut
+         );
+         assert_eq!(sent, 0);
+diff --git a/src/music/settings.rs b/src/music/settings.rs
+index 4992ad9b6edcba1941a5cccae89dfd232c238137..5f70d5311851af3ac53c8c4ec940a2116a812ed1 100644
+--- a/src/music/settings.rs
++++ b/src/music/settings.rs
+@@ -243,17 +243,21 @@ pub enum SettingField {
+     Meter,
+     Sync,
+     StartStopSync,
++    MidiClockOut,
++    MidiPanic,
+     MidiOutput,
+ }
+ 
+ impl SettingField {
+-    pub const ALL: [Self; 7] = [
++    pub const ALL: [Self; 9] = [
+         Self::Tonic,
+         Self::Mode,
+         Self::Tempo,
+         Self::Meter,
+         Self::Sync,
+         Self::StartStopSync,
++        Self::MidiClockOut,
++        Self::MidiPanic,
+         Self::MidiOutput,
+     ];
+ 
+diff --git a/src/runtime.rs b/src/runtime.rs
+index 378740192ef7ad1cd0e1d0d17ab6d5bdd31a097f..a44fb4501a5789dc360c82c77f6ca3a025f4d348 100644
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -11,7 +11,7 @@ use crate::music::recommendation::{HarmonicDirection, RecommendationClass, Recom
+ use crate::music::settings::{MusicalSettings, SettingField};
+ use crate::performer::PerformerSnapshot;
+ use crate::phrase::{EditGrid, Phrase, RecorderStatus};
+-use crate::sync::{SyncStatus, SyncTransport};
++use crate::sync::{SyncMode, SyncStatus, SyncTransport};
+ use crate::ui::{PerformanceView, PhraseEditorView, Ui};
+ use crate::voice::{Voice, VoiceRender, VoiceScope};
+ use crate::{App, Screen, dispatch_action};
+@@ -42,6 +42,7 @@ pub(crate) struct Frame {
+     quantize_beats: f64,
+     phrase_count: usize,
+     midi_destination: String,
++    midi_clock: &'static str,
+     phrase: Option<Phrase>,
+     phrase_index: usize,
+     selected_event: usize,
+@@ -83,6 +84,7 @@ impl Frame {
+             quantize_beats: app.recorder.quantize_beats(),
+             phrase_count: app.phrases.len(),
+             midi_destination: midi.destination_name().to_owned(),
++            midi_clock: midi.clock_label(),
+             phrase: if app.screen == Screen::PhraseEditor {
+                 app.selected_phrase().cloned()
+             } else {
+@@ -128,6 +130,7 @@ impl Frame {
+                     quantize_beats: self.quantize_beats,
+                     phrase_count: self.phrase_count,
+                     midi_destination: &self.midi_destination,
++                    midi_clock: self.midi_clock,
+                 },
+             ),
+             Screen::PhraseEditor => ui.draw_phrase_editor(
+@@ -185,8 +188,9 @@ impl Worker {
+                     return Ok(());
+                 }
+                 let result = run(&rx, &mut app, &mut transport, &mut midi);
++                let stop_clock = midi.stop_clock();
+                 let cleanup = midi.stop_all();
+-                result.and(cleanup)
++                result.and(stop_clock).and(cleanup)
+             })
+             .map_err(|error| format!("Cannot start music worker: {error}"))?;
+         let mut worker = Self {
+@@ -319,11 +323,15 @@ fn tick(
+     midi: &mut MidiEngine,
+     was_running: &mut bool,
+ ) -> Result<(), String> {
+-    let now_beat = transport.beat(app.settings.meter.beats_per_bar());
++    let bar_beats = app.settings.meter.beats_per_bar();
++    let now_beat = transport.beat(bar_beats);
+     let running_now = transport.is_running();
++    let link_quantum = (transport.mode() == SyncMode::Link).then_some(bar_beats);
++    midi.update_clock(now_beat, running_now, link_quantum)?;
+ 
+     if running_now != *was_running {
+         if running_now {
++            app.setting_focus = None;
+             app.chord_started_beat = now_beat;
+             app.performer_engine.transport_started(now_beat);
+         } else {
+@@ -396,4 +404,52 @@ mod tests {
+         assert!(worker.action(InputAction::Quit).unwrap());
+         worker.shutdown().unwrap();
+     }
++
++    #[test]
++    fn internal_live_tempo_cannot_navigate_to_stopped_settings() {
++        let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
++        worker.action(InputAction::ToggleTransport).unwrap();
++        worker.action(InputAction::ToggleSettings).unwrap();
++        worker.action(InputAction::NavigateRight).unwrap();
++        worker.action(InputAction::NavigateUp).unwrap();
++        let live = worker.snapshot().unwrap();
++        assert_eq!(live.setting_focus, Some(SettingField::Tempo));
++        assert_eq!(live.sync_status.tempo_bpm, 121.0);
++        assert!(live.sync_status.running);
++        worker.action(InputAction::ToggleTransport).unwrap();
++        assert_eq!(worker.input_page(), InputPage::Performance);
++        worker.action(InputAction::ToggleSettings).unwrap();
++        assert_eq!(
++            worker.snapshot().unwrap().setting_focus,
++            Some(SettingField::Tonic)
++        );
++        worker.shutdown().unwrap();
++    }
++
++    #[test]
++    fn clock_out_and_panic_are_accessible_from_stopped_settings() {
++        let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
++        assert_eq!(worker.snapshot().unwrap().midi_clock, "CLOCK OUT OFF");
++        worker.action(InputAction::ToggleSettings).unwrap();
++        for _ in 0..3 {
++            worker.action(InputAction::NavigateLeft).unwrap();
++        }
++        worker.action(InputAction::NavigateUp).unwrap();
++        assert_eq!(worker.snapshot().unwrap().midi_clock, "CLOCK OUT READY");
++        worker.action(InputAction::NavigateRight).unwrap();
++        assert_eq!(
++            worker.snapshot().unwrap().setting_focus,
++            Some(SettingField::MidiPanic)
++        );
++        worker.action(InputAction::Primary).unwrap();
++        assert_eq!(worker.input_page(), InputPage::Performance);
++        worker.action(InputAction::ToggleTransport).unwrap();
++        thread::sleep(Duration::from_millis(50));
++        assert_eq!(worker.snapshot().unwrap().midi_clock, "CLOCK OUT SENDING");
++        worker.action(InputAction::ToggleTransport).unwrap();
++        let stopped = worker.snapshot().unwrap();
++        assert_eq!(stopped.midi_clock, "CLOCK OUT READY");
++        assert_eq!(stopped.active_midi, [0; 4]);
++        worker.shutdown().unwrap();
++    }
+ }
+diff --git a/src/ui.rs b/src/ui.rs
+index 7f38849cec3a7e1a1a8e0e3b6d020d9bb1349812..be25d948faef2dd7fc271c9c3cbd9f7e760b6b68 100644
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -31,6 +31,7 @@ pub struct PerformanceView<'a> {
+     pub quantize_beats: f64,
+     pub phrase_count: usize,
+     pub midi_destination: &'a str,
++    pub midi_clock: &'static str,
+ }
+ 
+ /// All state needed to render the Phrase Editor screen.
+@@ -82,23 +83,40 @@ impl Ui {
+             quantize_beats,
+             phrase_count,
+             midi_destination,
++            midi_clock,
+         } = view;
+ 
+         canvas.set_draw_color(background());
+         canvas.clear();
+ 
+         draw_header(canvas, settings, setting_focus, sync_status, "PERFORMANCE")?;
+-        if setting_focus == Some(SettingField::MidiOutput) {
+-            let label: String = midi_destination.chars().take(42).collect();
+-            draw_text(
+-                canvas,
+-                360,
+-                52,
+-                &format!("MIDI OUTPUT: {label}"),
+-                1,
+-                accent(),
+-            )?;
++        let settings_hint = match setting_focus {
++            Some(SettingField::MidiOutput) => {
++                let label: String = midi_destination.chars().take(42).collect();
++                Some(format!("MIDI OUTPUT: {label}"))
++            }
++            Some(SettingField::MidiClockOut) => Some("UP/DOWN TOGGLE MIDI CLOCK".to_owned()),
++            Some(SettingField::MidiPanic) => Some(if self.brick {
++                "MIDI PANIC: A SENDS ON CH 1-4".to_owned()
++            } else {
++                "MIDI PANIC: Z SENDS ON CH 1-4".to_owned()
++            }),
++            Some(SettingField::Tempo) if sync_status.running => {
++                Some("LIVE TEMPO: UP/DOWN 1 BPM".to_owned())
++            }
++            _ => None,
++        };
++        if let Some(hint) = settings_hint {
++            draw_text(canvas, 360, 52, &hint, 1, accent())?;
+         }
++        draw_text(
++            canvas,
++            815,
++            52,
++            midi_clock,
++            1,
++            field_color(setting_focus, SettingField::MidiClockOut),
++        )?;
+ 
+         draw_panel(canvas, Rect::new(32, 82, 250, 220), panel())?;
+         draw_text(canvas, 54, 100, "CURRENT", 2, dim_text())?;
+@@ -163,7 +181,11 @@ impl Ui {
+             midi_destination,
+         )?;
+         if self.brick {
+-            let hints = if setting_focus.is_some() {
++            let hints = if setting_focus.is_some() && sync_status.running {
++                "U/D BPM  A/B/MENU CLOSE  START STOP"
++            } else if setting_focus == Some(SettingField::MidiPanic) {
++                "L/R FIELD  A SEND  B/MENU CLOSE"
++            } else if setting_focus.is_some() {
+                 "L/R FIELD  U/D VALUE  A/B/MENU CLOSE  MENU HOLD EXIT"
+             } else {
+                 "A COMMIT B REROLL X SURPRISE Y NEUTRAL SEL+A REC SEL+B ARM SEL+X SETUP MENU PAGE/HOLD EXIT"
+@@ -395,7 +417,13 @@ fn draw_header(
+         },
+     )?;
+ 
+-    if focus.is_some() && focus != Some(SettingField::MidiOutput) {
++    if focus.is_some()
++        && !sync_status.running
++        && !matches!(
++            focus,
++            Some(SettingField::MidiOutput | SettingField::MidiClockOut | SettingField::MidiPanic)
++        )
++    {
+         let link_text = if sync_status.link_available {
+             format!(
+                 "SETTINGS  STARTSYNC {}",

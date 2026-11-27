@@ -1,4 +1,12 @@
-# Khaṇa v0.11.4
+# Khaṇa v0.11.5
+
+With transport stopped, hold **Select** and press **X** on Performance
+(desktop **M**) to edit tonic, mode, tempo, meter, and sync settings. Use
+left/right to select a field and up/down to change it. During internal-clock
+playback, the same shortcut opens live tempo editing.
+
+See [v0.11.5 MIDI Clock Out](docs/BRICK_V0.11.5.md) for clock routing,
+Start/Continue behavior, MIDI panic, and the Brick and desktop test plan.
 
 See [v0.11.4 musical timing worker](docs/BRICK_V0.11.4.md) for thread ownership,
 MIDI output selection, NextUI runtime setup and acceptance tests.

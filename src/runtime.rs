@@ -11,7 +11,7 @@ use crate::music::recommendation::{HarmonicDirection, RecommendationClass, Recom
 use crate::music::settings::{MusicalSettings, SettingField};
 use crate::performer::PerformerSnapshot;
 use crate::phrase::{EditGrid, Phrase, RecorderStatus};
-use crate::sync::{SyncStatus, SyncTransport};
+use crate::sync::{SyncMode, SyncStatus, SyncTransport};
 use crate::ui::{PerformanceView, PhraseEditorView, Ui};
 use crate::voice::{Voice, VoiceRender, VoiceScope};
 use crate::{App, Screen, dispatch_action};
@@ -42,6 +42,7 @@ pub(crate) struct Frame {
     quantize_beats: f64,
     phrase_count: usize,
     midi_destination: String,
+    midi_clock: &'static str,
     phrase: Option<Phrase>,
     phrase_index: usize,
     selected_event: usize,
@@ -83,6 +84,7 @@ impl Frame {
             quantize_beats: app.recorder.quantize_beats(),
             phrase_count: app.phrases.len(),
             midi_destination: midi.destination_name().to_owned(),
+            midi_clock: midi.clock_label(),
             phrase: if app.screen == Screen::PhraseEditor {
                 app.selected_phrase().cloned()
             } else {
@@ -128,6 +130,7 @@ impl Frame {
                     quantize_beats: self.quantize_beats,
                     phrase_count: self.phrase_count,
                     midi_destination: &self.midi_destination,
+                    midi_clock: self.midi_clock,
                 },
             ),
             Screen::PhraseEditor => ui.draw_phrase_editor(
@@ -185,8 +188,9 @@ impl Worker {
                     return Ok(());
                 }
                 let result = run(&rx, &mut app, &mut transport, &mut midi);
+                let stop_clock = midi.stop_clock();
                 let cleanup = midi.stop_all();
-                result.and(cleanup)
+                result.and(stop_clock).and(cleanup)
             })
             .map_err(|error| format!("Cannot start music worker: {error}"))?;
         let mut worker = Self {
@@ -319,11 +323,15 @@ fn tick(
     midi: &mut MidiEngine,
     was_running: &mut bool,
 ) -> Result<(), String> {
-    let now_beat = transport.beat(app.settings.meter.beats_per_bar());
+    let bar_beats = app.settings.meter.beats_per_bar();
+    let now_beat = transport.beat(bar_beats);
     let running_now = transport.is_running();
+    let link_quantum = (transport.mode() == SyncMode::Link).then_some(bar_beats);
+    midi.update_clock(now_beat, running_now, link_quantum)?;
 
     if running_now != *was_running {
         if running_now {
+            app.setting_focus = None;
             app.chord_started_beat = now_beat;
             app.performer_engine.transport_started(now_beat);
         } else {
@@ -394,6 +402,54 @@ mod tests {
         worker.action(InputAction::MenuTap).unwrap();
         assert_eq!(worker.input_page(), InputPage::Performance);
         assert!(worker.action(InputAction::Quit).unwrap());
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn internal_live_tempo_cannot_navigate_to_stopped_settings() {
+        let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
+        worker.action(InputAction::ToggleTransport).unwrap();
+        worker.action(InputAction::ToggleSettings).unwrap();
+        worker.action(InputAction::NavigateRight).unwrap();
+        worker.action(InputAction::NavigateUp).unwrap();
+        let live = worker.snapshot().unwrap();
+        assert_eq!(live.setting_focus, Some(SettingField::Tempo));
+        assert_eq!(live.sync_status.tempo_bpm, 121.0);
+        assert!(live.sync_status.running);
+        worker.action(InputAction::ToggleTransport).unwrap();
+        assert_eq!(worker.input_page(), InputPage::Performance);
+        worker.action(InputAction::ToggleSettings).unwrap();
+        assert_eq!(
+            worker.snapshot().unwrap().setting_focus,
+            Some(SettingField::Tonic)
+        );
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn clock_out_and_panic_are_accessible_from_stopped_settings() {
+        let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
+        assert_eq!(worker.snapshot().unwrap().midi_clock, "CLOCK OUT OFF");
+        worker.action(InputAction::ToggleSettings).unwrap();
+        for _ in 0..3 {
+            worker.action(InputAction::NavigateLeft).unwrap();
+        }
+        worker.action(InputAction::NavigateUp).unwrap();
+        assert_eq!(worker.snapshot().unwrap().midi_clock, "CLOCK OUT READY");
+        worker.action(InputAction::NavigateRight).unwrap();
+        assert_eq!(
+            worker.snapshot().unwrap().setting_focus,
+            Some(SettingField::MidiPanic)
+        );
+        worker.action(InputAction::Primary).unwrap();
+        assert_eq!(worker.input_page(), InputPage::Performance);
+        worker.action(InputAction::ToggleTransport).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(worker.snapshot().unwrap().midi_clock, "CLOCK OUT SENDING");
+        worker.action(InputAction::ToggleTransport).unwrap();
+        let stopped = worker.snapshot().unwrap();
+        assert_eq!(stopped.midi_clock, "CLOCK OUT READY");
+        assert_eq!(stopped.active_midi, [0; 4]);
         worker.shutdown().unwrap();
     }
 }

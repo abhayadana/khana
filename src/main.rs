@@ -1,4 +1,4 @@
-//! Khaṇa v0.11.4 independent musical runtime.
+//! Khaṇa v0.11.5 MIDI Clock Out and live tempo.
 //!
 //! v0.11 adds complete semantic chord voicings, rhythmic/gated Melody phrases,
 //! persistent cyclic Texture, and lightweight performer-to-performer awareness.
@@ -441,10 +441,10 @@ fn dispatch_action(
 }
 
 fn toggle_transport(app: &mut App, transport: &mut SyncTransport) {
+    app.setting_focus = None;
     if transport.is_running() {
         transport.stop();
     } else {
-        app.setting_focus = None;
         transport.start();
     }
 }
@@ -537,6 +537,9 @@ fn handle_performance_action(
         InputAction::ToggleSettings if !transport.is_running() => {
             app.setting_focus = Some(SettingField::Tonic);
         }
+        InputAction::ToggleSettings if transport.mode() == SyncMode::Internal => {
+            app.setting_focus = Some(SettingField::Tempo);
+        }
         InputAction::ToggleSettings => {}
         _ => {}
     }
@@ -551,26 +554,35 @@ fn handle_setting_action(
     transport: &mut SyncTransport,
     midi: &mut MidiEngine,
 ) -> Result<(), String> {
+    let running = transport.is_running();
     match action {
+        InputAction::Primary if !running && field == SettingField::MidiPanic => {
+            midi.panic()?;
+            app.setting_focus = None;
+        }
         InputAction::ToggleSettings | InputAction::Primary => {
             app.setting_focus = None;
         }
-        InputAction::NavigateLeft => {
+        InputAction::NavigateLeft if !running => {
             app.setting_focus = Some(field.previous());
         }
-        InputAction::NavigateRight => {
+        InputAction::NavigateRight if !running => {
             app.setting_focus = Some(field.next());
         }
-        InputAction::NavigateUp => {
+        InputAction::NavigateUp if !running || live_tempo(field, transport) => {
             adjust_setting(1, field, app, transport, midi)?;
         }
-        InputAction::NavigateDown => {
+        InputAction::NavigateDown if !running || live_tempo(field, transport) => {
             adjust_setting(-1, field, app, transport, midi)?;
         }
         _ => {}
     }
 
     Ok(())
+}
+
+fn live_tempo(field: SettingField, transport: &SyncTransport) -> bool {
+    field == SettingField::Tempo && transport.mode() == SyncMode::Internal
 }
 
 fn adjust_setting(
@@ -619,7 +631,9 @@ fn adjust_setting(
                 SyncMode::Link => SyncMode::Internal,
             };
 
-            if !transport.set_mode(next_mode, app.settings.meter.beats_per_bar()) {
+            if transport.set_mode(next_mode, app.settings.meter.beats_per_bar()) {
+                midi.reset_clock_position();
+            } else {
                 eprintln!("Ableton Link is not compiled in. Rebuild with --features ableton-link");
             }
 
@@ -629,6 +643,8 @@ fn adjust_setting(
             let status = transport.status();
             transport.set_link_start_stop_sync(!status.link_start_stop_sync);
         }
+        SettingField::MidiClockOut => midi.toggle_clock_out(),
+        SettingField::MidiPanic => {}
         SettingField::MidiOutput => {
             if !transport.is_running() {
                 midi.cycle_raw_destination(direction)?;
@@ -792,10 +808,11 @@ fn print_controls() {
     println!("  I/K     color -/+ (role-specific note pool)");
     println!("  P       quantized record start/stop");
     println!("  N       arm next phrase");
-    println!("  M       edit tonic/mode/tempo/meter/sync (stopped)");
+    println!("  M       settings (stopped), or tempo (playing on internal clock)");
     println!("SETTINGS:");
     println!("  Left/Right field   Up/Down value   Z/M exit");
     println!("  SYNC INTERNAL/LINK; STARTSYNC OFF/ON");
+    println!("  CLOCK OUT: Up/Down toggle; MIDI PANIC: Z send on channels 1-4");
     println!("PERFORMERS:");
     println!("  Bass CHD | Chords BAR | Texture 2BAR | Melody PHR");
     println!("PHRASE EDITOR:");
@@ -812,7 +829,7 @@ fn print_controls() {
     println!("BRICK BRING-UP:");
     println!("  MENU tap: page, hold: exit; never SELECT+MENU");
     println!("  Performance: A commit B reroll X surprise Y neutral L/R1 scope L/R2 bias");
-    println!("  SELECT+A record, SELECT+B arm next, SELECT+X settings (stopped)");
+    println!("  SELECT+A record, SELECT+B arm next, SELECT+X settings / live internal tempo");
     println!("  Sticks: left X/Y density/dynamics, right X/Y spread/color");
     println!("  Editor: A play B change X duplicate Y back; SELECT+Y delete");
     println!("  L/R1 phrase, L/R2 duration, SELECT+L/R1 zoom, D-pad grid/event");

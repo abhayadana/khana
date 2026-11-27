@@ -460,7 +460,8 @@ fn brick_button(page: InputPage, button: u8, select: bool) -> Option<InputAction
         (InputPage::Editor, true, 2) => Some(EditDelete),
         (InputPage::Editor, true, 4) => Some(ZoomOut),
         (InputPage::Editor, true, 5) => Some(ZoomIn),
-        (InputPage::Settings, false, 0 | 1) => Some(ToggleSettings),
+        (InputPage::Settings, false, 0) => Some(ToggleSettings),
+        (InputPage::Settings, false, 1) => Some(Primary),
         _ => None,
     }
 }

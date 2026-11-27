@@ -31,6 +31,7 @@ pub struct PerformanceView<'a> {
     pub quantize_beats: f64,
     pub phrase_count: usize,
     pub midi_destination: &'a str,
+    pub midi_clock: &'static str,
 }
 
 /// All state needed to render the Phrase Editor screen.
@@ -82,23 +83,40 @@ impl Ui {
             quantize_beats,
             phrase_count,
             midi_destination,
+            midi_clock,
         } = view;
 
         canvas.set_draw_color(background());
         canvas.clear();
 
         draw_header(canvas, settings, setting_focus, sync_status, "PERFORMANCE")?;
-        if setting_focus == Some(SettingField::MidiOutput) {
-            let label: String = midi_destination.chars().take(42).collect();
-            draw_text(
-                canvas,
-                360,
-                52,
-                &format!("MIDI OUTPUT: {label}"),
-                1,
-                accent(),
-            )?;
+        let settings_hint = match setting_focus {
+            Some(SettingField::MidiOutput) => {
+                let label: String = midi_destination.chars().take(42).collect();
+                Some(format!("MIDI OUTPUT: {label}"))
+            }
+            Some(SettingField::MidiClockOut) => Some("UP/DOWN TOGGLE MIDI CLOCK".to_owned()),
+            Some(SettingField::MidiPanic) => Some(if self.brick {
+                "MIDI PANIC: A SENDS ON CH 1-4".to_owned()
+            } else {
+                "MIDI PANIC: Z SENDS ON CH 1-4".to_owned()
+            }),
+            Some(SettingField::Tempo) if sync_status.running => {
+                Some("LIVE TEMPO: UP/DOWN 1 BPM".to_owned())
+            }
+            _ => None,
+        };
+        if let Some(hint) = settings_hint {
+            draw_text(canvas, 360, 52, &hint, 1, accent())?;
         }
+        draw_text(
+            canvas,
+            815,
+            52,
+            midi_clock,
+            1,
+            field_color(setting_focus, SettingField::MidiClockOut),
+        )?;
 
         draw_panel(canvas, Rect::new(32, 82, 250, 220), panel())?;
         draw_text(canvas, 54, 100, "CURRENT", 2, dim_text())?;
@@ -163,7 +181,11 @@ impl Ui {
             midi_destination,
         )?;
         if self.brick {
-            let hints = if setting_focus.is_some() {
+            let hints = if setting_focus.is_some() && sync_status.running {
+                "U/D BPM  A/B/MENU CLOSE  START STOP"
+            } else if setting_focus == Some(SettingField::MidiPanic) {
+                "L/R FIELD  A SEND  B/MENU CLOSE"
+            } else if setting_focus.is_some() {
                 "L/R FIELD  U/D VALUE  A/B/MENU CLOSE  MENU HOLD EXIT"
             } else {
                 "A COMMIT B REROLL X SURPRISE Y NEUTRAL SEL+A REC SEL+B ARM SEL+X SETUP MENU PAGE/HOLD EXIT"
@@ -395,7 +417,13 @@ fn draw_header(
         },
     )?;
 
-    if focus.is_some() && focus != Some(SettingField::MidiOutput) {
+    if focus.is_some()
+        && !sync_status.running
+        && !matches!(
+            focus,
+            Some(SettingField::MidiOutput | SettingField::MidiClockOut | SettingField::MidiPanic)
+        )
+    {
         let link_text = if sync_status.link_available {
             format!(
                 "SETTINGS  STARTSYNC {}",

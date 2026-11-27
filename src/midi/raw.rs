@@ -10,6 +10,9 @@ use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use super::Message;
+use super::clock::TRANSPORT_LEAD;
+
 const RESCAN: Duration = Duration::from_secs(1);
 const MAX_AGE: Duration = Duration::from_millis(30);
 const QUEUE_CAPACITY: usize = 128;
@@ -233,7 +236,7 @@ fn select<'a>(
 
 #[derive(Debug)]
 struct Pending {
-    bytes: [u8; 3],
+    message: Message,
     offset: usize,
     queued_at: Instant,
 }
@@ -245,6 +248,7 @@ fn drain(
     queue: &mut VecDeque<Pending>,
     now: Instant,
     sent_bytes: &mut u64,
+    first_clock_after: &mut Option<Instant>,
 ) -> io::Result<()> {
     while let Some(message) = queue.front_mut() {
         if now.saturating_duration_since(message.queued_at) >= MAX_AGE {
@@ -253,12 +257,23 @@ fn drain(
                 "MIDI queue expired",
             ));
         }
-        match writer.write(&message.bytes[message.offset..]) {
+        if message.message.is_clock() && first_clock_after.is_some_and(|after| now < after) {
+            return Ok(());
+        }
+        let bytes = message.message.bytes();
+        match writer.write(&bytes[message.offset..]) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(count) => {
                 message.offset += count;
                 *sent_bytes = sent_bytes.saturating_add(count as u64);
-                if message.offset == message.bytes.len() {
+                if message.offset == bytes.len() {
+                    if message.message.starts_clock() {
+                        // Backpressure can delay Start/Continue beyond its
+                        // scheduled send time. Leave the gap after the write.
+                        *first_clock_after = Some(Instant::now() + TRANSPORT_LEAD);
+                    } else if message.message.is_clock() {
+                        *first_clock_after = None;
+                    }
                     let _ = queue.pop_front();
                 }
             }
@@ -276,6 +291,31 @@ fn drain(
     Ok(())
 }
 
+fn queue_message(
+    queue: &mut VecDeque<Pending>,
+    message: Message,
+    now: Instant,
+) -> Result<bool, String> {
+    // Keep only the newest pending clock during backpressure. A one-byte
+    // clock cannot be partially written, so removing it preserves framing.
+    let mut skipped_clock = false;
+    if message.is_clock()
+        && let Some(index) = queue.iter().position(|pending| pending.message.is_clock())
+    {
+        queue.remove(index);
+        skipped_clock = true;
+    }
+    if queue.len() >= QUEUE_CAPACITY {
+        return Err("Raw MIDI queue full".to_owned());
+    }
+    queue.push_back(Pending {
+        message,
+        offset: 0,
+        queued_at: now,
+    });
+    Ok(skipped_clock)
+}
+
 pub(super) struct RawOutput {
     selection: Selection,
     pinned: Option<Identity>,
@@ -285,6 +325,7 @@ pub(super) struct RawOutput {
     next_scan: Instant,
     label: String,
     needs_cleanup: bool,
+    first_clock_after: Option<Instant>,
     sent_bytes: u64,
     faults: u64,
 }
@@ -300,6 +341,7 @@ impl RawOutput {
             next_scan: Instant::now(),
             label: "RAW WAIT".to_owned(),
             needs_cleanup: false,
+            first_clock_after: None,
             sent_bytes: 0,
             faults: 0,
         };
@@ -322,19 +364,11 @@ impl RawOutput {
         }
     }
 
-    pub(super) fn enqueue(&mut self, bytes: [u8; 3]) -> Result<(), String> {
+    pub(super) fn enqueue(&mut self, message: Message) -> Result<bool, String> {
         if !self.connected() {
             return Err("Raw MIDI disconnected".to_owned());
         }
-        if self.queue.len() >= QUEUE_CAPACITY {
-            return Err("Raw MIDI queue full".to_owned());
-        }
-        self.queue.push_back(Pending {
-            bytes,
-            offset: 0,
-            queued_at: Instant::now(),
-        });
-        Ok(())
+        queue_message(&mut self.queue, message, Instant::now())
     }
 
     /// Called only after the MIDI engine has flushed owned note releases.
@@ -376,6 +410,7 @@ impl RawOutput {
         self.file = None;
         self.bound_path = None;
         self.queue.clear();
+        self.first_clock_after = None;
         self.pinned = None;
         self.needs_cleanup = false;
         self.selection = choices.swap_remove(next);
@@ -431,7 +466,7 @@ impl RawOutput {
                 if self.needs_cleanup {
                     for channel in 0_u8..4 {
                         self.queue.push_back(Pending {
-                            bytes: [0xB0 | channel, 120, 0],
+                            message: Message::Channel([0xB0 | channel, 120, 0]),
                             offset: 0,
                             queued_at: now,
                         });
@@ -452,6 +487,7 @@ impl RawOutput {
         self.file = None;
         self.bound_path = None;
         self.queue.clear();
+        self.first_clock_after = None;
         self.next_scan = Instant::now() + RESCAN;
         self.needs_cleanup = true;
         self.faults = self.faults.saturating_add(1);
@@ -481,7 +517,13 @@ impl RawOutput {
             }
         }
         if let Some(file) = &mut self.file
-            && let Err(error) = drain(file, &mut self.queue, now, &mut self.sent_bytes)
+            && let Err(error) = drain(
+                file,
+                &mut self.queue,
+                now,
+                &mut self.sent_bytes,
+                &mut self.first_clock_after,
+            )
         {
             self.fault(&error.to_string());
         }
@@ -545,44 +587,88 @@ mod tests {
     #[test]
     fn short_writes_and_backpressure_preserve_byte_order() {
         let now = Instant::now();
-        let mut queue = VecDeque::from([
-            Pending {
-                bytes: [0x90, 60, 100],
-                offset: 0,
-                queued_at: now,
-            },
-            Pending {
-                bytes: [0x80, 60, 0],
-                offset: 0,
-                queued_at: now,
-            },
-        ]);
+        let mut queue = VecDeque::new();
+        for message in [
+            Message::Realtime(0xFA),
+            Message::Channel([0x90, 60, 100]),
+            Message::Realtime(0xF8),
+            Message::Channel([0x80, 60, 0]),
+        ] {
+            assert!(!queue_message(&mut queue, message, now).unwrap());
+        }
+        assert!(queue_message(&mut queue, Message::Realtime(0xF8), now).unwrap());
+        assert!(!queue_message(&mut queue, Message::Realtime(0xFC), now).unwrap());
         let mut writer = ShortWriter {
             bytes: Vec::new(),
             block_next: false,
         };
         let mut sent = 0;
-        for _ in 0..6 {
-            drain(&mut writer, &mut queue, now, &mut sent).unwrap();
+        let mut first_clock_after = None;
+        for _ in 0..9 {
+            let drain_at = first_clock_after.unwrap_or(now);
+            drain(
+                &mut writer,
+                &mut queue,
+                drain_at,
+                &mut sent,
+                &mut first_clock_after,
+            )
+            .unwrap();
         }
         assert!(queue.is_empty());
-        assert_eq!(writer.bytes, [0x90, 60, 100, 0x80, 60, 0]);
-        assert_eq!(sent, 6);
+        assert_eq!(writer.bytes, [0xFA, 0x90, 60, 100, 0x80, 60, 0, 0xF8, 0xFC]);
+        assert_eq!(sent, 9);
+    }
+
+    #[test]
+    fn first_clock_waits_after_a_delayed_transport_write() {
+        let now = Instant::now();
+        let mut queue = VecDeque::new();
+        queue_message(&mut queue, Message::Realtime(0xFB), now).unwrap();
+        queue_message(&mut queue, Message::Realtime(0xF8), now).unwrap();
+        let mut sent = 0;
+        let mut first_clock_after = None;
+        let mut bytes = Vec::new();
+        drain(
+            &mut bytes,
+            &mut queue,
+            now,
+            &mut sent,
+            &mut first_clock_after,
+        )
+        .unwrap();
+        assert_eq!(bytes, [0xFB]);
+        let ready = first_clock_after.unwrap();
+        drain(
+            &mut bytes,
+            &mut queue,
+            ready,
+            &mut sent,
+            &mut first_clock_after,
+        )
+        .unwrap();
+        assert_eq!(bytes, [0xFB, 0xF8]);
     }
 
     #[test]
     fn stale_queue_is_not_replayed() {
         let now = Instant::now();
         let mut queue = VecDeque::from([Pending {
-            bytes: [0x90, 60, 100],
+            message: Message::Channel([0x90, 60, 100]),
             offset: 0,
             queued_at: now,
         }]);
         let mut sent = 0;
         assert_eq!(
-            drain(&mut Vec::new(), &mut queue, now + MAX_AGE, &mut sent)
-                .unwrap_err()
-                .kind(),
+            drain(
+                &mut Vec::new(),
+                &mut queue,
+                now + MAX_AGE,
+                &mut sent,
+                &mut None
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::TimedOut
         );
         assert_eq!(sent, 0);

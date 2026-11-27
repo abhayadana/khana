@@ -5,12 +5,14 @@
 //! tracks a set of active notes for every channel so stale Note Off messages
 //! cannot terminate unrelated notes.
 
+mod clock;
 mod raw;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::performer::VoiceEvent;
+use clock::{ClockOut, Realtime};
 #[cfg(feature = "alsa-sequencer")]
 use midir::os::unix::VirtualOutput;
 #[cfg(feature = "alsa-sequencer")]
@@ -18,6 +20,30 @@ use midir::{MidiOutput, MidiOutputConnection};
 use raw::{RawOutput, Selection};
 
 const VOICE_COUNT: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Message {
+    Channel([u8; 3]),
+    Realtime(u8),
+}
+
+impl Message {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Channel(bytes) => bytes,
+            Self::Realtime(byte) => std::slice::from_ref(byte),
+        }
+    }
+
+    fn is_clock(self) -> bool {
+        self == Self::Realtime(Realtime::Clock as u8)
+    }
+
+    fn starts_clock(self) -> bool {
+        self == Self::Realtime(Realtime::Start as u8)
+            || self == Self::Realtime(Realtime::Continue as u8)
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct NoteOwnership {
@@ -62,6 +88,7 @@ enum MidiSink {
 pub struct MidiEngine {
     connection: MidiSink,
     ownership: NoteOwnership,
+    clock: ClockOut,
     destination_name: String,
     trace: bool,
 }
@@ -82,6 +109,7 @@ impl MidiEngine {
         Ok(Self {
             connection: MidiSink::Alsa(connection),
             ownership: NoteOwnership::new(),
+            clock: ClockOut::default(),
             destination_name: format!("VIRTUAL: {port_name}"),
             trace: trace_enabled(),
         })
@@ -145,6 +173,7 @@ impl MidiEngine {
             return Ok(Self {
                 connection: MidiSink::Alsa(connection),
                 ownership: NoteOwnership::new(),
+                clock: ClockOut::default(),
                 destination_name: name,
                 trace: trace_enabled(),
             });
@@ -163,6 +192,7 @@ impl MidiEngine {
         Self {
             connection: MidiSink::DryRun,
             ownership: NoteOwnership::new(),
+            clock: ClockOut::default(),
             destination_name: "DRY RUN - NO OUTPUT".to_owned(),
             trace: trace_enabled(),
         }
@@ -200,6 +230,7 @@ impl MidiEngine {
                 Ok(Self {
                     connection: MidiSink::Raw(Box::new(RawOutput::new(selection))),
                     ownership: NoteOwnership::new(),
+                    clock: ClockOut::default(),
                     destination_name: String::new(),
                     trace: trace_enabled(),
                 })
@@ -228,6 +259,7 @@ impl MidiEngine {
             return Ok(());
         }
         self.stop_all()?;
+        self.clock.forget_position();
         if let MidiSink::Raw(output) = &mut self.connection {
             output.cycle(direction);
         }
@@ -245,9 +277,64 @@ impl MidiEngine {
         }
     }
 
-    pub fn report(&self) {
+    pub fn report(&mut self) {
         if let MidiSink::Raw(output) = &self.connection {
             output.report();
+        }
+        let skipped = self.clock.take_skipped();
+        if skipped > 0 {
+            eprintln!("MIDI CLOCK OUT | skipped pulses={skipped}");
+        }
+    }
+
+    pub fn toggle_clock_out(&mut self) {
+        self.clock.toggle();
+    }
+
+    pub fn reset_clock_position(&mut self) {
+        self.clock.forget_position();
+    }
+
+    pub fn clock_label(&self) -> &'static str {
+        self.clock.label(self.available())
+    }
+
+    /// Queue realtime transport and clocks before performer events for this beat.
+    pub fn update_clock(
+        &mut self,
+        beat: f64,
+        running: bool,
+        link_quantum: Option<f64>,
+    ) -> Result<(), String> {
+        let available = self.available();
+        if let Some(message) =
+            self.clock
+                .update(beat, running, available, link_quantum, Instant::now())
+        {
+            self.send_realtime(message)?;
+        }
+        Ok(())
+    }
+
+    /// Finish an active outgoing transport before the worker releases notes.
+    pub fn stop_clock(&mut self) -> Result<(), String> {
+        if let Some(message) = self.clock.stop(false) {
+            self.send_realtime(message)?;
+        }
+        Ok(())
+    }
+
+    fn send_realtime(&mut self, message: Realtime) -> Result<(), String> {
+        if !self.available() {
+            return Ok(());
+        }
+        match self.send_message(Message::Realtime(message as u8)) {
+            Ok(false) => Ok(()),
+            Ok(true) => {
+                self.clock.drop_queued_pulse();
+                Ok(())
+            }
+            Err(error) => self.recover_raw(error),
         }
     }
 
@@ -376,20 +463,50 @@ impl MidiEngine {
         }
     }
 
+    /// Explicitly silence all four reserved channels, including unowned notes.
+    pub fn panic(&mut self) -> Result<(), String> {
+        self.stop_all()?;
+        if !self.available() {
+            eprintln!("MIDI panic: output unavailable");
+            return Ok(());
+        }
+        for channel in 0..VOICE_COUNT {
+            for control in [120, 123] {
+                let status = 0xB0 | channel_nibble(channel);
+                if let Err(error) = self.send([status, control, 0]) {
+                    return self.recover_raw(error);
+                }
+            }
+        }
+        if let Err(error) = self.flush_output() {
+            return self.recover_raw(error);
+        }
+        println!("MIDI panic: cleared channels 1-4");
+        Ok(())
+    }
+
     fn send(&mut self, message: [u8; 3]) -> Result<(), String> {
+        self.send_message(Message::Channel(message)).map(|_| ())
+    }
+
+    /// Returns whether a new clock superseded a queued, undelivered clock.
+    fn send_message(&mut self, message: Message) -> Result<bool, String> {
         if self.trace {
-            println!(
-                "MIDI {:02X} {:02X} {:02X}",
-                message[0], message[1], message[2]
-            );
+            match message {
+                Message::Channel([status, data1, data2]) => {
+                    println!("MIDI {status:02X} {data1:02X} {data2:02X}");
+                }
+                Message::Realtime(status) => println!("MIDI {status:02X}"),
+            }
         }
         match &mut self.connection {
             #[cfg(feature = "alsa-sequencer")]
-            MidiSink::Alsa(connection) => {
-                connection.send(&message).map_err(|error| error.to_string())
-            }
+            MidiSink::Alsa(connection) => connection
+                .send(message.bytes())
+                .map(|()| false)
+                .map_err(|error| error.to_string()),
             MidiSink::Raw(output) => output.enqueue(message),
-            MidiSink::DryRun => Ok(()),
+            MidiSink::DryRun => Ok(false),
         }
     }
 }

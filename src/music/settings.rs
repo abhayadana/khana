@@ -243,17 +243,21 @@ pub enum SettingField {
     Meter,
     Sync,
     StartStopSync,
+    MidiClockOut,
+    MidiPanic,
     MidiOutput,
 }
 
 impl SettingField {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Tonic,
         Self::Mode,
         Self::Tempo,
         Self::Meter,
         Self::Sync,
         Self::StartStopSync,
+        Self::MidiClockOut,
+        Self::MidiPanic,
         Self::MidiOutput,
     ];
 
