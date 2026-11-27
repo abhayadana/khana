@@ -1,5 +1,7 @@
 //! Semantic phrase capture, editing, and playback.
 
+use std::collections::VecDeque;
+
 use crate::music::chord::Chord;
 
 /// One performed chord event with phrase-relative timing.
@@ -155,7 +157,11 @@ impl Phrase {
             return;
         };
 
-        self.events.insert(index + 1, event);
+        self.insert_event(index + 1, event);
+    }
+
+    pub fn insert_event(&mut self, index: usize, event: ChordEvent) {
+        self.events.insert(index.min(self.events.len()), event);
         self.reflow();
     }
 
@@ -389,17 +395,58 @@ impl Default for PhraseRecorder {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Transition {
+    #[default]
+    PhraseEnd,
+    Bar,
+}
+
+impl Transition {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PhraseEnd => "PHRASE END",
+            Self::Bar => "BAR",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
+pub struct ChainSection {
+    pub phrase_index: usize,
+    pub passes: u8,
+    pub transition: Transition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PhrasePass {
+    pub phrase_index: usize,
+    pub phrase_id: u32,
+    pub start: f64,
+    pub end: f64,
+}
+
+#[derive(Debug)]
 struct PlayingPhrase {
-    phrase_index: usize,
-    started_beat: f64,
+    pass: PhrasePass,
+    phrase: Phrase,
     next_event_index: usize,
+    passes_left: Option<u8>,
+    edits_pending: bool,
+}
+
+impl PlayingPhrase {
+    fn repeats(&self) -> bool {
+        self.passes_left
+            .map_or(self.phrase.looping, |left| left > 1)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ScheduledPhrase {
     phrase_index: usize,
     start_beat: f64,
+    passes: Option<u8>,
 }
 
 /// Position within the current pass, in quarter-note beats.
@@ -430,163 +477,250 @@ pub struct PhrasePlaybackUpdate {
     pub position: Option<PhrasePosition>,
 }
 
-/// Semantic phrase player supporting one-shot playback, loops, and bar-quantized replacement.
+/// Plays a stable snapshot for each pass of a phrase.
 pub struct PhrasePlayer {
     playing: Option<PlayingPhrase>,
     queued: Option<ScheduledPhrase>,
+    chain: VecDeque<ChainSection>,
+    bar: f64,
 }
 
 impl PhrasePlayer {
+    pub const CHAIN_LIMIT: usize = 16;
+
     pub const fn new() -> Self {
         Self {
             playing: None,
             queued: None,
+            chain: VecDeque::new(),
+            bar: 4.0,
         }
     }
 
-    pub fn loop_window(&self, phrases: &[Phrase], now: f64) -> Option<(f64, f64, u32)> {
-        let playing = self.playing?;
-        let phrase = phrases.get(playing.phrase_index)?;
-        let duration = phrase.duration_beats();
-        if !phrase.looping || duration <= 0.0 {
+    pub fn loop_window(&self, now: f64) -> Option<(f64, f64, u32)> {
+        let playing = self.playing.as_ref()?;
+        let duration = playing.phrase.duration_beats();
+        if playing.edits_pending || !playing.repeats() || duration <= 0.0 {
             return None;
         }
-        let start =
-            playing.started_beat + next_strict_boundary(now - playing.started_beat, duration);
-        Some((start, start + duration, phrase.id))
+        let start = playing.pass.start + next_strict_boundary(now - playing.pass.start, duration);
+        if self
+            .queued
+            .is_some_and(|entry| entry.start_beat < start + duration)
+        {
+            return None;
+        }
+        Some((start, start + duration, playing.pass.phrase_id))
+    }
+
+    pub fn pass(&self) -> Option<PhrasePass> {
+        self.playing.as_ref().map(|playing| playing.pass)
     }
 
     pub fn playing_phrase(&self) -> Option<usize> {
-        self.playing.map(|state| state.phrase_index)
+        self.pass().map(|pass| pass.phrase_index)
+    }
+
+    pub fn edit_pending(&self, phrase_index: usize) -> bool {
+        self.playing.as_ref().is_some_and(|playing| {
+            playing.pass.phrase_index == phrase_index && playing.edits_pending
+        })
     }
 
     pub fn phrase_edited(&mut self, phrase_index: usize) {
         if let Some(playing) = &mut self.playing
-            && playing.phrase_index == phrase_index
+            && playing.pass.phrase_index == phrase_index
         {
-            // Re-read the edited timeline at the current playhead.
-            playing.next_event_index = 0;
+            playing.edits_pending = true;
         }
     }
 
     pub fn clear_queue(&mut self) {
         self.queued = None;
+        self.chain.clear();
     }
 
     pub fn queued_phrase(&self) -> Option<usize> {
-        self.queued.map(|state| state.phrase_index)
+        self.queued
+            .map(|state| state.phrase_index)
+            .or_else(|| self.chain.front().map(|section| section.phrase_index))
     }
 
-    /// Starts immediately when idle; otherwise queues for the next bar boundary.
+    pub fn chain_sections(&self) -> impl Iterator<Item = ChainSection> + '_ {
+        self.chain.iter().copied()
+    }
+
+    pub fn section_passes_left(&self) -> Option<u8> {
+        self.playing.as_ref()?.passes_left
+    }
+
+    /// Starts immediately when idle; otherwise replaces the queue at the next bar.
     pub fn request(&mut self, phrase_index: usize, now_beat: f64, beats_per_bar: f64) {
+        self.clear_queue();
+        self.bar = beats_per_bar;
         let start_beat = if self.playing.is_some() {
-            next_strict_boundary(now_beat, beats_per_bar)
+            next_strict_boundary(now_beat, self.bar)
         } else {
             now_beat
         };
-
         self.queued = Some(ScheduledPhrase {
             phrase_index,
             start_beat,
+            passes: None,
         });
     }
 
-    /// Cancels phrase playback and queue state.
-    pub fn stop(&mut self) {
-        self.playing = None;
-        self.queued = None;
+    pub fn append_section(&mut self, section: ChainSection) -> bool {
+        if self.chain.len() >= Self::CHAIN_LIMIT {
+            return false;
+        }
+        self.chain.push_back(section);
+        true
     }
 
-    /// Advances semantic playback and emits the most recent due chord.
-    pub fn update(&mut self, phrases: &[Phrase], now_beat: f64) -> PhrasePlaybackUpdate {
-        if let Some(queued) = self.queued
-            && now_beat >= queued.start_beat
-        {
-            self.queued = None;
-            self.playing = Some(PlayingPhrase {
-                phrase_index: queued.phrase_index,
-                started_beat: queued.start_beat,
-                next_event_index: 0,
-            });
+    pub fn arm_chain(&mut self, now: f64, bar: f64) {
+        self.bar = bar;
+        self.arm_section(now);
+    }
+
+    fn arm_section(&mut self, now: f64) {
+        if self.queued.is_some() {
+            return;
         }
-
-        let Some(mut playing) = self.playing else {
-            return PhrasePlaybackUpdate::default();
+        let Some(section) = self.chain.front() else {
+            return;
         };
+        let start_beat = match &self.playing {
+            Some(playing) if playing.passes_left.is_some_and(|passes| passes > 1) => return,
+            Some(playing) => match section.transition {
+                Transition::PhraseEnd => playing.pass.end,
+                Transition::Bar if playing.repeats() => next_strict_boundary(now, self.bar),
+                Transition::Bar => next_boundary(playing.pass.end, self.bar),
+            },
+            None => now,
+        };
+        self.queued = Some(ScheduledPhrase {
+            phrase_index: section.phrase_index,
+            start_beat,
+            passes: Some(section.passes),
+        });
+    }
 
-        let Some(phrase) = phrases.get(playing.phrase_index) else {
-            self.playing = None;
-            return PhrasePlaybackUpdate {
-                ended: true,
-                ..PhrasePlaybackUpdate::default()
+    pub fn stop(&mut self) {
+        self.playing = None;
+        self.clear_queue();
+    }
+
+    /// Advances playback and emits the most recent due chord.
+    pub fn update(&mut self, phrases: &[Phrase], now: f64) -> PhrasePlaybackUpdate {
+        self.arm_section(now);
+        let mut ended = false;
+        loop {
+            if let Some(queued) = self.queued
+                && now >= queued.start_beat
+                && self
+                    .playing
+                    .as_ref()
+                    .is_none_or(|playing| queued.start_beat <= playing.pass.end)
+            {
+                self.queued = None;
+                if queued.passes.is_some() {
+                    self.chain.pop_front();
+                }
+                self.playing = phrases
+                    .get(queued.phrase_index)
+                    .filter(|phrase| phrase.duration_beats() > 0.0)
+                    .map(|phrase| PlayingPhrase {
+                        phrase: phrase.clone(),
+                        pass: PhrasePass {
+                            phrase_index: queued.phrase_index,
+                            phrase_id: phrase.id,
+                            start: queued.start_beat,
+                            end: queued.start_beat + phrase.duration_beats(),
+                        },
+                        next_event_index: 0,
+                        passes_left: queued.passes,
+                        edits_pending: false,
+                    });
+                ended = self.playing.is_none();
+                self.arm_section(queued.start_beat);
+                continue;
+            }
+            let Some(playing) = &mut self.playing else {
+                break;
             };
-        };
-
-        let duration = phrase.duration_beats();
-        if phrase.looping && duration > 0.0 && now_beat >= playing.started_beat + duration {
-            let loops = ((now_beat - playing.started_beat) / duration)
-                .floor()
-                .max(1.0);
-            playing.started_beat += loops * duration;
-            playing.next_event_index = 0;
-        }
-        let mut current = None;
-
-        while let Some(event) = phrase.events.get(playing.next_event_index) {
-            let start = playing.started_beat + event.start_beat;
-            if now_beat < start {
+            if now < playing.pass.end {
                 break;
             }
-
-            current = Some((event.chord, start));
-            playing.next_event_index += 1;
+            if playing.edits_pending
+                && let Some(phrase) = phrases.get(playing.pass.phrase_index)
+            {
+                playing.phrase = phrase.clone();
+                playing.edits_pending = false;
+            }
+            if !playing.repeats() || playing.phrase.duration_beats() <= 0.0 {
+                self.playing = None;
+                ended = true;
+                continue;
+            }
+            if let Some(passes_left) = &mut playing.passes_left {
+                *passes_left -= 1;
+            }
+            let start = playing.pass.end;
+            let duration = playing.phrase.duration_beats();
+            // Fast-forward unscheduled, unbounded loops after a transport jump.
+            let skipped = if playing.passes_left.is_none() && self.queued.is_none() {
+                ((now - start) / duration).floor()
+            } else {
+                0.0
+            };
+            playing.pass.start = start + skipped * duration;
+            playing.pass.end = playing.pass.start + duration;
+            playing.next_event_index = 0;
+            self.arm_section(start);
         }
 
-        let ended = now_beat >= playing.started_beat + duration;
-
-        let next_event = if ended {
-            None
-        } else {
-            phrase.events.get(playing.next_event_index)
+        let mut result = PhrasePlaybackUpdate {
+            ended,
+            ..Default::default()
         };
-        let next = next_event
-            .map(|event| (event.chord, playing.started_beat + event.start_beat))
-            .or_else(|| {
-                phrase
-                    .looping
-                    .then(|| phrase.events.first())
-                    .flatten()
-                    .map(|event| (event.chord, playing.started_beat + duration))
-            });
         let queued = self.queued.and_then(|entry| {
             let chord = phrases.get(entry.phrase_index)?.events.first()?.chord;
             Some((chord, entry.start_beat))
         });
+        let mut next = None;
+        if let Some(playing) = &mut self.playing {
+            while let Some(event) = playing.phrase.events.get(playing.next_event_index) {
+                let start = playing.pass.start + event.start_beat;
+                if now < start {
+                    next = Some((event.chord, start));
+                    break;
+                }
+                result.chord = Some(event.chord);
+                result.chord_beat = Some(start);
+                playing.next_event_index += 1;
+            }
+            let upcoming = &phrases[playing.pass.phrase_index];
+            let repeats = playing
+                .passes_left
+                .map_or(upcoming.looping, |left| left > 1);
+            if next.is_none() && repeats {
+                next = upcoming
+                    .events
+                    .first()
+                    .map(|event| (event.chord, playing.pass.end));
+            }
+            result.position = Some(PhrasePosition {
+                elapsed: now - playing.pass.start,
+                remaining: playing.pass.end - now,
+            });
+        }
         let next = match (next, queued) {
             (Some(a), Some(b)) => Some(if a.1 < b.1 { a } else { b }),
             (a, b) => a.or(b),
         };
-        let (next_chord, next_chord_beat) = next.unzip();
-
-        if ended {
-            self.playing = None;
-        } else {
-            self.playing = Some(playing);
-        }
-
-        let position = (!ended).then_some(PhrasePosition {
-            elapsed: now_beat - playing.started_beat,
-            remaining: playing.started_beat + duration - now_beat,
-        });
-        let (chord, chord_beat) = current.unzip();
-        PhrasePlaybackUpdate {
-            chord,
-            chord_beat,
-            next_chord,
-            next_chord_beat,
-            ended,
-            position,
-        }
+        (result.next_chord, result.next_chord_beat) = next.unzip();
+        result
     }
 }
 
@@ -720,7 +854,7 @@ mod tests {
         let mut player = PhrasePlayer::new();
         player.request(0, 4.0, 4.0);
         assert_eq!(player.update(&phrases, 4.0).chord, Some(c_major()));
-        let (start, stop, id) = player.loop_window(&phrases, 5.0).unwrap();
+        let (start, stop, id) = player.loop_window(5.0).unwrap();
         assert!((start - 6.3).abs() < 1.0e-9);
         assert!((stop - 8.6).abs() < 1.0e-9);
         assert_eq!(id, 1);
@@ -743,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn resizing_a_playing_phrase_resolves_the_chord_at_the_current_beat() {
+    fn resizing_a_playing_phrase_applies_at_the_original_loop_seam() {
         let mut phrases = [Phrase {
             looping: true,
             id: 1,
@@ -766,9 +900,75 @@ mod tests {
         phrases[0].snap_resize_event(0, 1.0, true);
         player.phrase_edited(0);
         let update = player.update(&phrases, 5.5);
-        assert_eq!(update.chord, Some(c_major()));
-        assert_eq!(update.next_chord, Some(d_minor()));
-        assert_eq!(update.next_chord_beat, Some(6.0));
+        assert_eq!(update.chord, None);
+        assert_eq!(update.next_chord_beat, Some(7.0));
+        let seam = player.update(&phrases, 7.0);
+        assert_eq!(seam.chord, Some(c_major()));
+        assert_eq!(seam.next_chord_beat, Some(9.0));
+    }
+
+    #[test]
+    fn chain_honors_full_pass_counts_and_bar_transitions() {
+        use super::{ChainSection, Transition};
+        let phrases = [c_major(), d_minor(), c_major()].map(|chord| Phrase {
+            id: u32::from(chord.root.value()) + 1,
+            looping: true,
+            events: vec![ChordEvent {
+                chord,
+                start_beat: 0.0,
+                duration_beats: 2.5,
+            }],
+        });
+        let mut player = PhrasePlayer::new();
+        for (phrase_index, passes, transition) in [
+            (0, 2, Transition::PhraseEnd),
+            (1, 1, Transition::Bar),
+            (2, 1, Transition::PhraseEnd),
+        ] {
+            assert!(player.append_section(ChainSection {
+                phrase_index,
+                passes,
+                transition
+            }));
+        }
+        player.arm_chain(0.0, 4.0);
+        assert_eq!(player.update(&phrases, 0.0).chord, Some(c_major()));
+        assert_eq!(player.section_passes_left(), Some(2));
+        assert_eq!(player.update(&phrases, 2.5).chord_beat, Some(2.5));
+        assert_eq!(player.section_passes_left(), Some(1));
+        assert_eq!(player.update(&phrases, 4.5).next_chord_beat, Some(8.0));
+        assert!(player.update(&phrases, 5.0).ended);
+        assert!(player.update(&phrases, 7.0).position.is_none());
+        assert_eq!(player.update(&phrases, 8.0).chord, Some(d_minor()));
+        assert_eq!(player.update(&phrases, 10.5).chord, Some(c_major()));
+        assert_eq!(player.playing_phrase(), Some(2));
+        assert!(player.update(&phrases, 13.0).ended);
+        assert_eq!(player.playing_phrase(), None);
+    }
+
+    #[test]
+    fn next_bar_can_exit_an_unbounded_loop_before_its_seam() {
+        use super::{ChainSection, Transition};
+        let phrases = [c_major(), d_minor()].map(|chord| Phrase {
+            id: u32::from(chord.root.value()) + 1,
+            looping: true,
+            events: vec![ChordEvent {
+                chord,
+                start_beat: 0.0,
+                duration_beats: 6.5,
+            }],
+        });
+        let mut player = PhrasePlayer::new();
+        player.request(0, 0.0, 4.0);
+        player.update(&phrases, 0.0);
+        assert!(player.append_section(ChainSection {
+            phrase_index: 1,
+            passes: 1,
+            transition: Transition::Bar,
+        }));
+        player.arm_chain(1.0, 4.0);
+        assert_eq!(player.update(&phrases, 4.0).chord, Some(d_minor()));
+        assert_eq!(player.pass().unwrap().start, 4.0);
     }
 
     #[test]

@@ -269,6 +269,7 @@ fn map_hat(state: HatState) -> Option<InputAction> {
 pub enum InputPage {
     Performance,
     Editor,
+    EditorModal,
     Settings,
     Workspace,
 }
@@ -552,9 +553,9 @@ fn brick_button(page: InputPage, button: u8, select: bool) -> Option<InputAction
         (InputPage::Editor, true, 1) => Some(EditUndo),
         (InputPage::Editor, true, 3) => Some(ToggleSettings),
         (InputPage::Editor, true, 0) => Some(RightClick),
-        (InputPage::Editor, false, 1) => Some(Primary),
-        (InputPage::Editor, false, 0) => Some(Secondary),
-        (InputPage::Editor, false, 3) => Some(EditDuplicate),
+        (InputPage::Editor | InputPage::EditorModal, false, 1) => Some(Primary),
+        (InputPage::Editor | InputPage::EditorModal, false, 0) => Some(Secondary),
+        (InputPage::Editor | InputPage::EditorModal, false, 3) => Some(Tertiary),
         (InputPage::Editor, false, 2) => Some(ToggleScreen),
         (InputPage::Editor, false, 4) => Some(PhrasePrevious),
         (InputPage::Editor, false, 5) => Some(PhraseNext),

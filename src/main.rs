@@ -3,6 +3,7 @@
 //! v0.11 adds complete semantic chord voicings, rhythmic/gated Melody phrases,
 //! persistent cyclic Texture, and lightweight performer-to-performer awareness.
 
+mod editor;
 mod input;
 mod midi;
 mod music;
@@ -18,6 +19,7 @@ mod workspace;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use editor::{ChordEdit, EditorModal};
 use input::{HandheldInput, InputAction, InputPage, desktop_event, open_input_devices};
 use midi::MidiEngine;
 use music::chord::Chord;
@@ -27,7 +29,7 @@ use music::recommendation::{
 use music::settings::{MusicalSettings, SettingField};
 use music::voicing::VoicingStyle;
 use performer::PerformerEngine;
-use phrase::{ChordEvent, EditGrid, LiveGrid, Phrase, PhrasePlayer, PhraseRecorder};
+use phrase::{ChainSection, ChordEvent, EditGrid, LiveGrid, Phrase, PhrasePlayer, PhraseRecorder};
 use sdl2::event::Event;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -61,6 +63,8 @@ struct App {
     take_mode: bool,
     take_armed_at: Option<workspace::TakeArm>,
     recording_take: Option<TakeRecording>,
+    retrospective_recording: Option<TakeRecording>,
+    retrospective_take: Option<Arc<Take>>,
     playing_take: Option<TakePlayback>,
     active_notes: ActiveNotes,
     panic_confirm: bool,
@@ -86,6 +90,10 @@ struct App {
     editor_phrase_index: usize,
     editor_event_index: usize,
     editor_zoom: f32,
+    editor_fit: bool,
+    editor_modal: Option<EditorModal>,
+    editor_clipboard: Option<ChordEvent>,
+    editor_message: &'static str,
     editor_grid: EditGrid,
     live_grid: LiveGrid,
     pending_chord: Option<(Chord, f64)>,
@@ -100,6 +108,8 @@ impl App {
             InputPage::Settings
         } else if self.screen == Screen::Performance {
             InputPage::Performance
+        } else if self.editor_modal.is_some() {
+            InputPage::EditorModal
         } else {
             InputPage::Editor
         }
@@ -130,6 +140,8 @@ impl App {
             take_mode: false,
             take_armed_at: None,
             recording_take: None,
+            retrospective_recording: None,
+            retrospective_take: None,
             playing_take: None,
             active_notes: ActiveNotes::default(),
             panic_confirm: false,
@@ -155,6 +167,10 @@ impl App {
             editor_phrase_index: 0,
             editor_event_index: 0,
             editor_zoom: 82.0,
+            editor_fit: false,
+            editor_modal: None,
+            editor_clipboard: None,
+            editor_message: "",
             editor_grid: EditGrid::Quarter,
             live_grid: LiveGrid::Immediate,
             pending_chord: None,
@@ -173,6 +189,19 @@ impl App {
             true
         } else {
             false
+        }
+    }
+
+    fn finish_retrospective_pass(&mut self, now: f64) {
+        if let Some(stop) = self
+            .retrospective_recording
+            .as_ref()
+            .and_then(|take| take.stop)
+            && now >= stop
+            && let Some(take) = self.retrospective_recording.take()
+            && let Some(take) = take.finish_phrase_pass(stop)
+        {
+            self.retrospective_take = Some(take);
         }
     }
 
@@ -226,7 +255,10 @@ impl App {
         );
         self.performer_engine.set_enabled(transport_running);
 
-        if let Some(take) = &mut self.recording_take {
+        for take in [&mut self.recording_take, &mut self.retrospective_recording]
+            .into_iter()
+            .flatten()
+        {
             take.chord(now_beat, chord);
         }
         if record {
@@ -273,7 +305,10 @@ impl App {
 
         for event in batch.iter() {
             self.active_notes.apply(event);
-            if let Some(take) = &mut self.recording_take {
+            for take in [&mut self.recording_take, &mut self.retrospective_recording]
+                .into_iter()
+                .flatten()
+            {
                 take.event(now_beat, event);
             }
             midi.apply_event(event)?;
@@ -559,6 +594,12 @@ fn dispatch_action(
         workspace::handle_action(action, app, transport, midi)?;
         return Ok(false);
     }
+    if app.editor_modal.is_some() && action != InputAction::ToggleTransport {
+        if let Some(section) = app.handle_editor_modal(action) {
+            queue_editor_section(app, transport, section);
+        }
+        return Ok(false);
+    }
     if action == InputAction::MenuTap {
         action = if app.setting_focus.is_some() {
             InputAction::ToggleSettings
@@ -598,11 +639,20 @@ fn toggle_transport(app: &mut App, transport: &mut SyncTransport) {
         app.playing_take = None;
     }
     if transport.is_running() || transport.start_pending() {
+        let beat = transport.beat(app.settings.meter.beats_per_bar());
+        app.finish_retrospective_pass(beat);
         app.pending_chord = None;
         app.pending_voicing = None;
         transport.stop();
     } else {
-        transport.start(app.settings.meter.beats_per_bar());
+        let bar = app.settings.meter.beats_per_bar();
+        transport.start(bar);
+        if transport.is_running() || transport.start_pending() {
+            let now = transport
+                .pending_beat(bar)
+                .unwrap_or_else(|| transport.beat(bar));
+            app.phrase_player.arm_chain(now, bar);
+        }
     }
 }
 
@@ -641,6 +691,8 @@ fn handle_performance_action(
                 app.pending_chord = Some((chord, phrase::next_strict_boundary(now_beat, quantum)));
             } else {
                 app.pending_chord = None;
+                app.finish_retrospective_pass(now_beat);
+                app.retrospective_recording = None;
                 app.phrase_player.stop();
                 app.set_harmony(chord, now_beat, transport.is_running(), true);
             }
@@ -910,6 +962,7 @@ fn handle_editor_action(
     transport: &mut SyncTransport,
     midi: &mut MidiEngine,
 ) -> Result<(), String> {
+    app.editor_message = "";
     match action {
         InputAction::ToggleScreen => {
             app.screen = Screen::Performance;
@@ -934,53 +987,25 @@ fn handle_editor_action(
                 app.editor_event_index = 0;
             }
         }
-        InputAction::Primary => {
-            if app.selected_phrase().is_some() {
-                if app.playing_take.take().is_some() {
-                    app.stop_notes(midi)?;
-                }
-                if !transport.is_running() {
-                    if transport.mode() == SyncMode::MidiIn {
-                        return Ok(());
-                    }
-                    transport.start(app.settings.meter.beats_per_bar());
-                }
-
-                app.pending_chord = None;
-                app.performer_engine.set_enabled(true);
-                app.phrase_player.request(
-                    app.editor_phrase_index,
-                    transport
-                        .pending_beat(app.settings.meter.beats_per_bar())
-                        .unwrap_or_else(|| transport.beat(app.settings.meter.beats_per_bar())),
-                    app.settings.meter.beats_per_bar(),
-                );
-            }
-        }
+        InputAction::Primary => launch_editor_phrase(app, transport, midi)?,
         InputAction::LeftClick => {
             if let Some(phrase) = app.selected_phrase_mut() {
                 phrase.looping = !phrase.looping;
+                app.phrase_player.phrase_edited(app.editor_phrase_index);
             }
         }
-        InputAction::RightClick => app.phrase_player.clear_queue(),
-        InputAction::Secondary => {
-            replace_selected_with_safe_choice(app);
+        InputAction::RightClick => {
+            app.phrase_player.clear_queue();
+            app.editor_message = "QUEUE CLEARED";
         }
-        InputAction::EditDuplicate => {
-            if app.edit_phrase(Phrase::duplicate_event) {
-                app.editor_event_index += 1;
-                app.clamp_editor_selection();
-            }
+        InputAction::Secondary => app.open_chord_picker(ChordEdit::Replace),
+        InputAction::Tertiary if app.selected_phrase().is_some() => {
+            app.editor_modal = Some(EditorModal::Edit(0));
         }
-        InputAction::EditDelete => {
-            if app.edit_phrase(Phrase::delete_event) {
-                app.clamp_editor_selection();
-            }
-        }
+        InputAction::EditDuplicate => app.duplicate_editor_event(),
+        InputAction::EditDelete => app.delete_editor_event(),
         InputAction::EditShorten | InputAction::EditExtend => {
-            let grid = app
-                .editor_grid
-                .beats(app.settings.meter.numerator, app.settings.meter.denominator);
+            let grid = app.duration_grid_beats();
             app.edit_phrase(|phrase, index| {
                 phrase.snap_resize_event(index, grid, action == InputAction::EditExtend);
             });
@@ -993,9 +1018,11 @@ fn handle_editor_action(
             app.editor_grid = app.editor_grid.next();
         }
         InputAction::ZoomOut => {
+            app.editor_fit = false;
             app.editor_zoom = (app.editor_zoom - 12.0).max(24.0);
         }
         InputAction::ZoomIn => {
+            app.editor_fit = false;
             app.editor_zoom = (app.editor_zoom + 12.0).min(180.0);
         }
         _ => {}
@@ -1004,35 +1031,50 @@ fn handle_editor_action(
     Ok(())
 }
 
-fn replace_selected_with_safe_choice(app: &mut App) {
-    let phrase_index = app.editor_phrase_index;
-    let event_index = app.editor_event_index;
+fn launch_editor_phrase(
+    app: &mut App,
+    transport: &mut SyncTransport,
+    midi: &mut MidiEngine,
+) -> Result<(), String> {
+    if app.selected_phrase().is_none() {
+        return Ok(());
+    }
+    let bar = app.settings.meter.beats_per_bar();
+    if !transport.is_running() && !transport.start_pending() {
+        if transport.mode() == SyncMode::MidiIn {
+            app.editor_message = "START EXTERNAL TRANSPORT";
+            return Ok(());
+        }
+        transport.start(bar);
+    }
+    let now = transport
+        .pending_beat(bar)
+        .unwrap_or_else(|| transport.beat(bar));
+    app.pending_chord = None;
+    app.phrase_player.request(app.editor_phrase_index, now, bar);
+    if app.playing_take.take().is_some() {
+        app.stop_notes(midi)?;
+    }
+    Ok(())
+}
 
-    let Some(phrase) = app.phrases.get(phrase_index) else {
-        return;
-    };
-    if phrase.events.get(event_index).is_none() {
+fn queue_editor_section(app: &mut App, transport: &mut SyncTransport, section: ChainSection) {
+    if !app.phrase_player.append_section(section) {
+        app.editor_message = "CHAIN FULL";
         return;
     }
-
-    let mut history = phrase.events[..event_index]
-        .iter()
-        .map(|event| event.chord)
-        .collect::<Vec<_>>();
-
-    if history.is_empty() {
-        history.push(app.settings.tonal.tonic_chord());
+    let bar = app.settings.meter.beats_per_bar();
+    if transport.is_running() || transport.start_pending() {
+        let now = transport
+            .pending_beat(bar)
+            .unwrap_or_else(|| transport.beat(bar));
+        app.phrase_player.arm_chain(now, bar);
+        app.editor_message = "SECTION QUEUED";
+    } else if transport.mode() == SyncMode::MidiIn {
+        app.editor_message = "SECTION ADDED   START MIDI TRANSPORT";
+    } else {
+        app.editor_message = "SECTION ADDED   START TO PLAY CHAIN";
     }
-
-    let set = app.recommendation_engine.recommend(
-        &history,
-        app.settings.tonal,
-        HarmonicDirection::Neutral,
-        false,
-    );
-    let replacement = set.get(RecommendationClass::Safe, 0);
-
-    app.edit_phrase(|phrase, index| phrase.replace_chord(index, replacement));
 }
 
 fn print_controls() {
@@ -1065,7 +1107,8 @@ fn print_controls() {
     println!("PHRASE EDITOR:");
     println!("  A/L        previous/next phrase");
     println!("  Z          play selected / queue at next bar");
-    println!("  X          change selected chord");
+    println!("  X          change selected chord; S toggles manual entry in the picker");
+    println!("  S          edit menu (includes Fit Phrase and Queue Section)");
     println!("  Left/Right select chord event");
     println!("  D          duplicate event");
     println!("  Backspace  delete event");
@@ -1083,7 +1126,9 @@ fn print_controls() {
     println!("  Performance: L3 Sustain, R3 voicing, SELECT+L/R1 Mute/Solo");
     println!("  SELECT+L/R2 Pattern Hold/live grid, SELECT+R3 or SELECT+Y Vary");
     println!("  SELECT+L3 cycles polyphony on Texture or Melody; SELECT+START opens Workspace");
-    println!("  Editor: A play B change X duplicate Y back; SELECT+Y delete");
+    println!("  Editor: A play B change X edit Y back; SELECT+Y delete");
+    println!("  Editor: Queue Section builds a chain; START plays the chain while stopped");
+    println!("  Workspace Takes: R3 / F6 recovers the last complete phrase pass");
     println!("  Editor: L3 Loop, R3 clear queue, SELECT+A Undo, SELECT+X Setup");
     println!("  L/R1 phrase, L/R2 duration, SELECT+L/R1 zoom, D-pad grid/event");
 }

@@ -1,11 +1,12 @@
 //! SDL rendering for Khaṇa's two 1024×768 MVP screens.
 
+use crate::editor::{EditItem, EditorModal};
 use crate::music::chord::Chord;
 use crate::music::recommendation::{HarmonicDirection, RecommendationClass, RecommendationSet};
 use crate::music::settings::{MusicalSettings, SettingField};
 use crate::music::voicing::{MAX_VOICING_NOTES, VoicingStyle};
 use crate::performer::PerformerSnapshot;
-use crate::phrase::{EditGrid, Phrase, RecorderStatus};
+use crate::phrase::{EditGrid, Phrase, RecorderStatus, Transition};
 use crate::sync::{SyncMode, SyncStatus};
 use crate::voice::{Voice, VoiceRender, VoiceScope};
 use crate::workspace::{NAME_LEN, Tab};
@@ -59,12 +60,20 @@ pub struct PhraseEditorView<'a> {
     pub settings: MusicalSettings,
     pub sync_status: SyncStatus,
     pub phrase: Option<&'a Phrase>,
-    pub phrase_index: usize,
-    pub phrase_count: usize,
+    pub previous_phrase: Option<u32>,
+    pub following_phrase: Option<u32>,
     pub selected_event: usize,
     pub pixels_per_beat: f32,
-    pub playing_phrase: Option<usize>,
-    pub queued_phrase: Option<usize>,
+    pub playing_phrase: Option<u32>,
+    pub queued_phrase: Option<u32>,
+    pub playhead: Option<f64>,
+    pub next_sections: &'a [(u32, u8, Transition)],
+    pub section_passes: Option<u8>,
+    pub fit: bool,
+    pub modal: Option<&'a EditorModal>,
+    pub has_clipboard: bool,
+    pub message: &'a str,
+    pub edit_pending: bool,
     pub edit_grid: EditGrid,
     pub can_undo: bool,
     pub select_held: bool,
@@ -78,6 +87,7 @@ pub struct WorkspaceView {
     pub message: String,
     pub take_mode: bool,
     pub project: Option<String>,
+    pub retrospective_ready: bool,
 }
 
 /// Stateless 1024×768 renderer.
@@ -404,10 +414,14 @@ impl Ui {
         let footer = if view.name.is_some() {
             String::new()
         } else if view.tab == Tab::Takes {
-            format!(
-                "LEFT/RIGHT TABS   {back} BACK   CAPTURE {}",
-                if view.take_mode { "TAKE" } else { "PHRASE" }
-            )
+            let key = if self.brick { "R3" } else { "F6" };
+            let status = if view.retrospective_ready {
+                "READY"
+            } else {
+                "WAITING"
+            };
+            let mode = if view.take_mode { "TAKE" } else { "PHRASE" };
+            format!("{key} RECOVER LAST PASS [{status}]   {back} BACK   CAPTURE {mode}")
         } else {
             "LEFT/RIGHT TABS   UP/DOWN SELECT".into()
         };
@@ -425,15 +439,15 @@ impl Ui {
             settings,
             sync_status,
             phrase,
-            phrase_index,
-            phrase_count,
+            previous_phrase,
+            following_phrase,
             selected_event,
-            pixels_per_beat,
             playing_phrase,
             queued_phrase,
             edit_grid,
             can_undo,
             select_held,
+            ..
         } = view;
 
         canvas.set_draw_color(background());
@@ -459,17 +473,13 @@ impl Ui {
             return Ok(());
         };
 
-        let previous = if phrase_index > 0 {
-            format!("P{:02}", phrase_index)
-        } else {
-            "--".to_owned()
-        };
+        if let Some(modal) = view.modal {
+            return self.draw_editor_modal(canvas, &view, phrase, modal);
+        }
+
+        let previous = previous_phrase.map_or("--".into(), |id| format!("P{id:02}"));
         let current = format!("P{:02}", phrase.id);
-        let next = if phrase_index + 1 < phrase_count {
-            format!("P{:02}", phrase_index + 2)
-        } else {
-            "--".to_owned()
-        };
+        let next = following_phrase.map_or("--".into(), |id| format!("P{id:02}"));
 
         draw_text(canvas, 42, 90, &previous, 3, dim_text())?;
         draw_text(canvas, 130, 90, &format!("[{}]", current), 3, text_color())?;
@@ -498,14 +508,21 @@ impl Ui {
             dim_text(),
         )?;
 
-        draw_timeline(
-            canvas,
-            settings.tonal,
-            phrase,
-            selected_event,
-            pixels_per_beat,
-            self.width,
-        )?;
+        draw_timeline(canvas, &view, phrase, self.width)?;
+        draw_sections(canvas, view.next_sections)?;
+        if view.edit_pending {
+            draw_text(canvas, 46, 576, "EDIT APPLIES AFTER THIS PASS", 2, accent())?;
+        }
+        if let Some(passes) = view.section_passes {
+            draw_text(
+                canvas,
+                682,
+                576,
+                &format!("{passes} PASS(ES) LEFT"),
+                2,
+                dim_text(),
+            )?;
+        }
 
         if let Some(event) = phrase.events.get(selected_event) {
             draw_panel(canvas, Rect::new(32, 610, 960, 112), panel())?;
@@ -539,9 +556,9 @@ impl Ui {
                 535,
                 635,
                 if self.brick {
-                    "A PLAY  B CHANGE  X DUP"
+                    "A PLAY  B CHANGE  X EDIT"
                 } else {
-                    "Z PLAY/QUEUE   X CHANGE   D DUP"
+                    "Z PLAY/QUEUE   X CHANGE   S EDIT"
                 },
                 2,
                 accent(),
@@ -572,6 +589,9 @@ impl Ui {
             )?;
         }
 
+        if !view.message.is_empty() {
+            draw_text(canvas, 44, 467, view.message, 2, accent())?;
+        }
         draw_text(
             canvas,
             32,
@@ -601,6 +621,144 @@ impl Ui {
             if can_undo { accent() } else { dim_text() },
         )?;
         Ok(())
+    }
+    fn draw_editor_modal(
+        &self,
+        canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+        view: &PhraseEditorView<'_>,
+        phrase: &Phrase,
+        modal: &EditorModal,
+    ) -> Result<(), String> {
+        let (apply, cancel, switch) = if self.brick {
+            ("A", "B", "X")
+        } else {
+            ("Z", "X", "S")
+        };
+        draw_panel(canvas, Rect::new(32, 104, 960, 556), panel())?;
+        let footer = match modal {
+            EditorModal::Edit(row) => {
+                draw_text(canvas, 60, 132, "EDIT PHRASE", 4, text_color())?;
+                for (index, item) in EditItem::ALL.into_iter().enumerate() {
+                    let y = 202 + index as i32 * 45;
+                    draw_setup_value(canvas, 62, y, 480, item.label(view.fit), index == *row)?;
+                    if !item.enabled(phrase, view.has_clipboard) {
+                        let reason = if matches!(item, EditItem::Paste) {
+                            "CLIPBOARD EMPTY"
+                        } else {
+                            "KEEP ONE CHORD"
+                        };
+                        draw_text(canvas, 576, y, reason, 2, dim_text())?;
+                    }
+                }
+                format!("UP/DOWN SELECT   {apply} OPEN   {cancel} BACK")
+            }
+            EditorModal::Chord(picker) => {
+                let tonal = view.settings.tonal;
+                let previous = picker
+                    .previous
+                    .map_or("--".into(), |chord| tonal.chord_symbol(chord));
+                let following = picker
+                    .following
+                    .map_or("--".into(), |chord| tonal.chord_symbol(chord));
+                draw_text(canvas, 60, 132, picker.operation.title(), 4, text_color())?;
+                draw_text(
+                    canvas,
+                    62,
+                    198,
+                    &format!("PREV {previous}   NEXT {following}"),
+                    2,
+                    dim_text(),
+                )?;
+                draw_text(
+                    canvas,
+                    662,
+                    198,
+                    &format!("{:.2} BEATS", picker.duration),
+                    2,
+                    dim_text(),
+                )?;
+                if picker.manual {
+                    for (i, (label, value)) in ["ROOT", "QUALITY", "EXTENSION"]
+                        .into_iter()
+                        .zip(picker.manual_values())
+                        .enumerate()
+                    {
+                        let x = 62 + i as i32 * 301;
+                        draw_text(canvas, x, 294, label, 2, dim_text())?;
+                        draw_setup_value(canvas, x, 344, 264, value, i == picker.field)?;
+                    }
+                    draw_text(
+                        canvas,
+                        62,
+                        466,
+                        &tonal.chord_symbol(picker.chord),
+                        5,
+                        accent(),
+                    )?;
+                } else {
+                    for (col, class) in RecommendationClass::ALL.into_iter().enumerate() {
+                        let x = 62 + col as i32 * 301;
+                        draw_text(canvas, x, 256, class.label(), 2, dim_text())?;
+                        for row in 0..3 {
+                            let chord = tonal.chord_symbol(picker.options.get(class, row));
+                            draw_setup_value(
+                                canvas,
+                                x,
+                                320 + row as i32 * 74,
+                                264,
+                                &chord,
+                                col == picker.class && row == picker.row,
+                            )?;
+                        }
+                    }
+                }
+                let next_mode = if picker.manual {
+                    "SUGGESTIONS"
+                } else {
+                    "MANUAL"
+                };
+                format!("{apply} APPLY   {cancel} CANCEL   {switch} {next_mode}")
+            }
+            EditorModal::Chain {
+                passes,
+                transition,
+                choose_transition,
+            } => {
+                draw_text(
+                    canvas,
+                    60,
+                    132,
+                    &format!("QUEUE SECTION P{:02}", phrase.id),
+                    4,
+                    text_color(),
+                )?;
+                draw_text(canvas, 62, 254, "FULL PASSES", 2, dim_text())?;
+                draw_text(canvas, 362, 254, "ENTER SECTION AT", 2, dim_text())?;
+                draw_setup_value(
+                    canvas,
+                    62,
+                    306,
+                    248,
+                    &passes.to_string(),
+                    !*choose_transition,
+                )?;
+                draw_setup_value(
+                    canvas,
+                    362,
+                    306,
+                    336,
+                    transition.label(),
+                    *choose_transition,
+                )?;
+                let detail = match transition {
+                    Transition::PhraseEnd => "WAIT FOR THE PREVIOUS PASS TO END",
+                    Transition::Bar => "START ON A TRANSPORT BAR",
+                };
+                draw_text(canvas, 62, 422, detail, 2, dim_text())?;
+                format!("ARROWS ADJUST   {apply} ADD   {cancel} CANCEL")
+            }
+        };
+        draw_text(canvas, 36, 714, &footer, 2, dim_text())
     }
 }
 
@@ -889,12 +1047,12 @@ fn field_color(focus: Option<SettingField>, field: SettingField) -> Color {
     }
 }
 
-fn playback_label(playing_phrase: Option<usize>, queued_phrase: Option<usize>) -> String {
+fn playback_label(playing_phrase: Option<u32>, queued_phrase: Option<u32>) -> String {
     let playing = playing_phrase
-        .map(|index| format!("PLAY P{:02}", index + 1))
+        .map(|id| format!("PLAY P{id:02}"))
         .unwrap_or_else(|| "PLAY --".to_owned());
     let queued = queued_phrase
-        .map(|index| format!("QUEUE P{:02}", index + 1))
+        .map(|id| format!("QUEUE P{id:02}"))
         .unwrap_or_else(|| "QUEUE --".to_owned());
 
     format!("{playing}  {queued}")
@@ -1110,71 +1268,145 @@ fn draw_recording_strip(
     )
 }
 
+fn draw_sections(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    sections: &[(u32, u8, Transition)],
+) -> Result<(), String> {
+    if sections.is_empty() {
+        return Ok(());
+    }
+    draw_text(canvas, 45, 508, "CHAIN", 2, dim_text())?;
+    for (index, &(id, passes, transition)) in sections.iter().take(5).enumerate() {
+        let x = 130 + index as i32 * 160;
+        draw_text(
+            canvas,
+            x,
+            507,
+            &format!("P{id:02} X{passes}"),
+            2,
+            if index == 0 { accent() } else { text_color() },
+        )?;
+        draw_text(canvas, x, 534, transition.label(), 1, dim_text())?;
+    }
+    if sections.len() > 5 {
+        draw_text(
+            canvas,
+            934,
+            529,
+            &format!("+{}", sections.len() - 5),
+            2,
+            dim_text(),
+        )?;
+    }
+    Ok(())
+}
+
 fn draw_timeline(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
-    context: crate::music::settings::TonalContext,
+    view: &PhraseEditorView<'_>,
     phrase: &Phrase,
-    selected_event: usize,
-    pixels_per_beat: f32,
     screen_width: u32,
 ) -> Result<(), String> {
-    let left = 44_f32;
-    let right = screen_width as f32 - 44.0;
-    let visible_width = right - left;
-
+    let left = 44.0;
+    let right = f64::from(screen_width) - 44.0;
+    let width = right - left;
+    let duration = phrase.duration_beats();
+    let pixels = if view.fit && duration > 0.0 {
+        width / duration
+    } else {
+        f64::from(view.pixels_per_beat)
+    };
     let selected_start = phrase
         .events
-        .get(selected_event)
-        .map(|event| event.start_beat as f32)
-        .unwrap_or(0.0);
+        .get(view.selected_event)
+        .map_or(0.0, |event| event.start_beat);
+    let visible_beats = width / pixels;
+    let view_start =
+        (selected_start - visible_beats * 0.35).clamp(0.0, (duration - visible_beats).max(0.0));
+    let view_end = (view_start + visible_beats).min(duration);
+    let x_at = |beat: f64| (left + (beat - view_start) * pixels).round() as i32;
 
-    let visible_beats = visible_width / pixels_per_beat;
-    let view_start = (selected_start - visible_beats * 0.35).max(0.0);
-    let view_end = view_start + visible_beats;
-
-    draw_text(canvas, 44, 160, "CHORD TIMELINE", 2, dim_text())?;
-    canvas.set_draw_color(grid_line());
-    canvas.draw_line((44, 520), (screen_width as i32 - 44, 520))?;
+    draw_text(
+        canvas,
+        44,
+        151,
+        if view.fit {
+            "WHOLE PHRASE"
+        } else {
+            "CHORD TIMELINE"
+        },
+        2,
+        dim_text(),
+    )?;
+    let bar = view.settings.meter.beats_per_bar();
+    let beat = EditGrid::Beat.beats(
+        view.settings.meter.numerator,
+        view.settings.meter.denominator,
+    );
+    let bar_stride = (64.0 / (pixels * bar)).ceil().max(1.0);
+    let step = if pixels * beat >= 20.0 {
+        beat
+    } else {
+        bar * bar_stride
+    };
+    let mut mark = (view_start / step).ceil() * step;
+    while mark <= view_end + 1.0e-8 {
+        let x = x_at(mark);
+        let bar_mark = (mark / bar - (mark / bar).round()).abs() < 1.0e-7;
+        canvas.set_draw_color(grid_line());
+        canvas.draw_line((x, if bar_mark { 208 } else { 222 }), (x, 437))?;
+        if bar_mark && f64::from(x) + 44.0 <= right {
+            draw_text(
+                canvas,
+                x + 4,
+                184,
+                &format!("{}", (mark / bar).round() as u64 + 1),
+                1,
+                dim_text(),
+            )?;
+        }
+        mark += step;
+    }
 
     for (index, event) in phrase.events.iter().enumerate() {
-        let start = event.start_beat as f32;
-        let end = start + event.duration_beats as f32;
-
-        if end < view_start || start > view_end {
+        let start = event.start_beat;
+        let end = start + event.duration_beats;
+        if end <= view_start || start >= view_end {
             continue;
         }
-
-        let x = left + (start - view_start) * pixels_per_beat;
-        let width = (event.duration_beats as f32 * pixels_per_beat).max(18.0);
-        let selected = index == selected_event;
-
+        let x = x_at(start.max(view_start));
+        let block_width = (x_at(end.min(view_end)) - x).max(1);
+        let selected = index == view.selected_event;
         draw_panel(
             canvas,
-            Rect::new(x as i32, 245, width as u32, 175),
+            Rect::new(x, 245, (block_width - 1).max(1) as u32, 175),
             if selected {
                 timeline_selected()
             } else {
                 timeline_block()
             },
         )?;
-        draw_text(
-            canvas,
-            x as i32 + 10,
-            275,
-            &context.chord_symbol(event.chord),
-            3,
-            if selected { background() } else { text_color() },
-        )?;
-        draw_text(
-            canvas,
-            x as i32 + 10,
-            370,
-            &format!("{:.1}", event.duration_beats),
-            2,
-            if selected { background() } else { dim_text() },
-        )?;
+        let symbol = view.settings.tonal.chord_symbol(event.chord);
+        if block_width >= 16 + symbol.len() as i32 * 18 {
+            draw_text(
+                canvas,
+                x + 8,
+                274,
+                &symbol,
+                3,
+                if selected { background() } else { text_color() },
+            )?;
+        }
     }
-
+    if let Some(playhead) = view
+        .playhead
+        .filter(|beat| (view_start..=view_end).contains(beat))
+    {
+        let x = x_at(playhead);
+        canvas.set_draw_color(text_color());
+        canvas.draw_line((x, 213), (x, 451))?;
+        canvas.draw_line((x - 4, 451), (x + 4, 451))?;
+    }
     Ok(())
 }
 

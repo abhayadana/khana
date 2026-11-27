@@ -159,6 +159,11 @@ impl Project {
         app.live_grid = self.live_grid;
         app.editor_grid = self.edit_grid;
         app.phrase_player.stop();
+        app.retrospective_recording = None;
+        app.retrospective_take = None;
+        app.editor_modal = None;
+        app.editor_clipboard = None;
+        app.editor_message = "";
         app.recorder.reset_timeline();
         app.recorder.continue_numbering(&app.phrases);
         app.phrase_undo.clear();
@@ -325,6 +330,19 @@ impl TakeRecording {
         }
     }
 
+    pub fn finish_phrase_pass(self, beat: f64) -> Option<Arc<Take>> {
+        if self.full()
+            || !self
+                .take
+                .events
+                .iter()
+                .any(|entry| matches!(entry.event, VoiceEvent::NoteOn { .. }))
+        {
+            return None;
+        }
+        self.finish(beat)
+    }
+
     pub fn finish(mut self, beat: f64) -> Option<Arc<Take>> {
         if beat <= self.start {
             return None;
@@ -447,7 +465,7 @@ pub fn toggle_capture(app: &mut App, transport: &mut SyncTransport) {
         }
         transport.start(bar);
     }
-    let arm = app.phrase_player.loop_window(&app.phrases, beat).map_or(
+    let arm = app.phrase_player.loop_window(beat).map_or(
         TakeArm {
             start: transport
                 .pending_beat(bar)
@@ -665,6 +683,17 @@ pub fn handle_action(
             }
             Tab::Takes => unreachable!(),
         },
+        RightClick if ui.tab == Tab::Takes => {
+            if app.takes.len() >= MAX_LIBRARY_ITEMS {
+                ui.message = "TAKE LIST FULL".into();
+            } else if let Some(take) = app.retrospective_take.take() {
+                ui.row = app.takes.len();
+                app.takes.push(take);
+                ui.message = "LAST PHRASE PASS SAVED".into();
+            } else {
+                ui.message = "PLAY A COMPLETE PHRASE FIRST".into();
+            }
+        }
         WorkspaceRecall if ui.tab == Tab::Takes && !playing => {
             if let Some(take) = app.takes.get(ui.row) {
                 take.ensemble.apply(app);

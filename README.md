@@ -1,4 +1,4 @@
-# Khaṇa v0.13.0
+# Khaṇa v0.14.0
 
 Khaṇa is a playable MIDI instrument for TrimUI Brick Pro with NextUI and for
 Linux desktop. Choose a chord, shape the four performers, then record and
@@ -15,7 +15,7 @@ toolchain. This guide uses the local PIC image for both build and deploy.
 
 When installing a patch, start from its stated GitHub commit and use
 `git apply --check /path/to/patch` followed by `git apply /path/to/patch`.
-The v0.13.0 patch is based on `6d73dc143ea3420b49bd98538b432c96114e8bd6`.
+The v0.14.0 patch is based on `1c5ea79883039db2733f23384307099d890bde68`.
 
 From the repository root, build a Link-enabled Pak or deploy it over SSH:
 
@@ -182,29 +182,76 @@ phrase, the current performer settings supply the arrangement.
 | Previous / next phrase | L1 / R1 | A / L |
 | Select previous / next chord event | D-pad ← / → | Left / Right |
 | Play or queue the selected phrase | A | Z |
-| Replace selected chord with a Safe suggestion | B | X |
-| Duplicate event | X | D |
+| Open the selected chord in the chord picker | B | X |
+| Open Edit menu | X | S |
+| Duplicate event | X → Duplicate | D |
 | Delete event | Select+Y | Backspace |
 | Shorten / lengthen to the next edit boundary | L2 / R2 | F / R |
 | Previous / next duration grid | D-pad ↑ / ↓ | Up / Down or [ / ] |
 | Zoom out / in | Select+L1 / Select+R1 | - / = |
+| Fit whole phrase / return to previous zoom | X → Fit Phrase / Restore Zoom | S → Fit Phrase / Restore Zoom |
 | Toggle selected phrase loop | L3 | F5 |
 | Open Workspace | Select+Start | F2 |
-| Clear queued phrase | R3 or Select+B | F6 |
+| Clear pending phrase or section chain | R3 or Select+B | F6 |
 | Undo the selected phrase's last edit | Select+A | F12 |
 | Return to Performance | Y or tap Menu | Tab |
 | Settings when stopped / BPM during Internal playback | Select+X | M |
 
+### Change, insert, and move chords
+
+Press **B** (**X** on desktop) on a selected event to open Change Chord.
+Use Left/Right for Safe, Colorful, and Bold, and Up/Down for the choices in
+each column. Press **X** (**S** on desktop) inside the picker for Manual.
+Left/Right selects root, quality, or extension. Up/Down changes the value.
+The picker shows the adjacent chords. **A** (**Z**) applies the displayed
+choice and **B** (**X**) cancels. Changing the chord preserves its duration.
+
+**Edit** groups Insert Before, Insert After, Duplicate, Copy, Cut, Paste
+After, Delete, Fit Phrase, and Queue Section. Insert opens the same picker
+and adds one unit of the current Duration Grid. Copy and Cut put the event's
+chord and exact duration on a clipboard shared between phrases. Paste After
+or Duplicate inserts after the selection. The following chords move to
+make room or close the gap. Delete and Cut require at least two chords.
+
 The duration grid offers 1/16, 1/8, 1/4, 1/2, Beat, and Bar. On-grid
 durations move one increment. Off-grid durations snap down when shortened
-and up when lengthened. An enabled phrase loop wraps at its full length,
-including off-grid lengths. A new phrase queued during playback replaces
-the playing phrase at the next transport bar. Clear Queue leaves the
-playing phrase in place.
+and up when lengthened. **Fit Phrase** shows the full progression. Use zoom
+to work on individual chords. The ruler marks bars and draws beat divisions
+when there is room. A moving line shows the current playback position when
+viewing the playing phrase.
 
-Undo restores duration edits, chord replacements, duplicates, and deletions
-in reverse order for the selected phrase. It restores the selection for
-that edit. Each phrase keeps up to 32 edits in the current session.
+**L3** loops the whole phrase at its recorded or edited length, including
+off-grid endings. The playing pass uses the chords and durations it started
+with. Edits and undo take effect on the next pass or when you next launch
+the phrase. Undo restores the event list and selection for up to 32 edits
+per phrase. Cut, paste, and insert each use one undo step.
+
+### Chain sections
+
+Choose a phrase and open **Edit → Queue Section**. Use Left/Right to
+highlight Full Passes or Enter Section At, then Up/Down to change the
+highlighted value. **A** (**Z**) adds the section to the end of the queue.
+You can queue up to 16 pending sections and give each section 1–16 full
+passes. A chain uses the specified count regardless of the phrase's Loop
+setting.
+
+Build the chain while stopped and press **Start** (**Space**) to play it.
+With MIDI In selected, start the external transport. You can also add
+sections while playing. The first section starts with the transport if
+there is no phrase already playing.
+
+| Entry setting | When the next section starts |
+|---|---|
+| Phrase End | At the end of the preceding section's last pass, or the end of the current pass of a regular loop. |
+| Bar | On the first transport bar at or after a finite section finishes. From a regular looping phrase, it enters on the next transport bar. |
+
+An off-grid finite section can leave a rest before a Bar entry. The final
+section plays its specified passes and falls silent with transport still
+running. **A** in the editor outside the menu still plays the selected
+phrase immediately when idle or replaces the current phrase at the next bar.
+This clears queued sections. **R3** or **Select+B** drops pending sections
+and lets the current phrase continue. The chain is a live queue cleared
+when transport stops.
 
 ## Settings and MIDI rig
 
@@ -287,7 +334,7 @@ or **F2** on desktop. Left/Right switches tabs. Up/Down selects an item.
 
 | Tab | A / Z | X | Other controls |
 |---|---|---|---|
-| Takes | Play highlighted take | Switch Phrase / Take capture | Y / F1 recalls setup while stopped. L3 / F5 copies captured harmony into Phrase Editor. |
+| Takes | Play highlighted take | Switch Phrase / Take capture | Y / F1 recalls setup while stopped. L3 / F5 copies harmony into Phrase Editor. R3 / F6 recovers the last complete phrase pass. |
 | Projects | Review, then press again to load | Save the current workspace under a name | Stop transport first. B / M cancels. |
 | Presets | Load the highlighted performer setup | Save the current setup under a name | Stop transport first. B / M cancels. |
 
@@ -304,6 +351,22 @@ timing from the original pass over the current MIDI routing. The active
 Internal, MIDI Clock, or Link tempo sets replay speed. Take settings are
 stored with it and can be recalled separately. Copy Harmony adds an
 editable looping phrase alongside the take.
+
+### Recover the last phrase pass
+
+Khaṇa also buffers the most recent complete pass played from a phrase or a
+chain section. Open **Workspace → Takes**, then press **R3** (**F6** on
+desktop) when recovery says Ready. The pass becomes a normal saved take.
+It includes the actual generated notes and velocities, notes already
+held at the beginning, note releases at the end, and the harmony and
+performer setup at the start. During playback, it follows the active tempo
+and current MIDI routing like a regular take.
+
+The buffer covers one complete pass with sounding notes, including one
+pass of a multi-section chain. For free live playing or a take spanning
+several sections, arm Capture Take before playing. A recovered take saves
+with the session. Until you recover it, the pass is held in memory and
+replaced by the next complete pass.
 
 Projects save key, meter, internal tempo, phrases, takes, and the current
 performer setup. Edit and save the project again to update its named
@@ -324,7 +387,8 @@ and transpose, voicing, polyphony, groove, Texture Role, both grids, phrases, ta
 and the project and preset lists.
 Quit cleanly to flush the last changes. The next launch restores the
 setup with transport stopped and empty playback and recording queues.
-Mute, Solo, Sustain, the macro group, and undo history are performance-session state.
+Mute, Solo, Sustain, the macro group, the clipboard, and undo history are
+performance-session state.
 
 On Brick, the default file is
 `/mnt/SDCARD/.userdata/tg5040/khana/session.json`. On desktop it is
@@ -335,14 +399,16 @@ routing values in Bass, Chords, Texture, Melody order.
 
 ## Validation
 
-The Rust tests cover performer note transitions, phrase editing, routing,
-and transport. The Link-enabled Brick build and desktop checks exercise
-the compiled code. Physical Brick controls and external MIDI and Link
-timing need a device test. Try setting Melody to channel 7 and +12
-without the guide, then set a macro group of Bass and Texture. Capture an
-off-grid phrase loop with Texture in Triad and Melody in Harmony. Change
-the preset and replay the take through MIDI Clock or Link. Check its note
-releases and timing, then reopen the project after restarting the app.
+The Rust tests cover performer note transitions, chord edits, phrase seams,
+section pass counts and clock-grid timing, and recovering a pass as a take.
+The Link-enabled Brick build and desktop checks exercise the compiled code.
+
+On a Brick Pro, try a 2.5-beat phrase twice followed by a Bar entry for
+another phrase. Listen for the rest before the next bar and verify that
+the next phrase starts in time. Try a Phrase End entry for a continuous
+transition. While looping, resize or replace a chord and check that the
+change lands at the next seam. Recover the last pass and replay it with
+MIDI Clock or Link. Check note releases, routing, and the original timing.
 
 ## LLM disclosure
 

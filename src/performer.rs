@@ -1011,6 +1011,10 @@ impl PerformerEngine {
         }
     }
 
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Enables/disables generation without changing transport state.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;

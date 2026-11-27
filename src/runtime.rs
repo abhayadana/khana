@@ -4,6 +4,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::editor::EditorModal;
 use crate::input::{InputAction, InputPage};
 use crate::midi::MidiEngine;
 use crate::music::chord::Chord;
@@ -51,11 +52,20 @@ pub(crate) struct Frame {
     midi_transpose: [i8; 4],
     midi_input: Option<String>,
     phrase: Option<Phrase>,
-    phrase_index: usize,
     selected_event: usize,
     pixels_per_beat: f32,
-    playing_phrase: Option<usize>,
-    queued_phrase: Option<usize>,
+    previous_phrase: Option<u32>,
+    following_phrase: Option<u32>,
+    playing_phrase: Option<u32>,
+    queued_phrase: Option<u32>,
+    playhead: Option<f64>,
+    next_sections: Vec<(u32, u8, crate::phrase::Transition)>,
+    section_passes: Option<u8>,
+    editor_fit: bool,
+    editor_modal: Option<EditorModal>,
+    editor_clipboard: bool,
+    editor_message: &'static str,
+    edit_pending: bool,
     edit_grid: EditGrid,
     timing: String,
     beat_flash: Option<bool>,
@@ -141,6 +151,7 @@ impl Frame {
                     },
                     take_mode: app.take_mode,
                     project: app.project_name.clone(),
+                    retrospective_ready: app.retrospective_take.is_some(),
                 }
             }),
             take_status: take_status.or_else(|| {
@@ -184,11 +195,45 @@ impl Frame {
             } else {
                 None
             },
-            phrase_index: app.editor_phrase_index,
             selected_event: app.editor_event_index,
             pixels_per_beat: app.editor_zoom,
-            playing_phrase: app.phrase_player.playing_phrase(),
-            queued_phrase: app.phrase_player.queued_phrase(),
+            previous_phrase: app
+                .editor_phrase_index
+                .checked_sub(1)
+                .and_then(|index| app.phrases.get(index))
+                .map(|phrase| phrase.id),
+            following_phrase: app
+                .phrases
+                .get(app.editor_phrase_index + 1)
+                .map(|phrase| phrase.id),
+            playing_phrase: app.phrase_player.pass().map(|pass| pass.phrase_id),
+            queued_phrase: app
+                .phrase_player
+                .queued_phrase()
+                .and_then(|index| app.phrases.get(index))
+                .map(|phrase| phrase.id),
+            playhead: app
+                .phrase_player
+                .pass()
+                .filter(|pass| pass.phrase_index == app.editor_phrase_index)
+                .map(|pass| (now_beat - pass.start).clamp(0.0, pass.end - pass.start)),
+            next_sections: if app.screen == Screen::PhraseEditor {
+                app.phrase_player
+                    .chain_sections()
+                    .filter_map(|section| {
+                        let id = app.phrases.get(section.phrase_index)?.id;
+                        Some((id, section.passes, section.transition))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            section_passes: app.phrase_player.section_passes_left(),
+            editor_fit: app.editor_fit,
+            editor_modal: app.editor_modal.clone(),
+            editor_clipboard: app.editor_clipboard.is_some(),
+            editor_message: app.editor_message,
+            edit_pending: app.phrase_player.edit_pending(app.editor_phrase_index),
             edit_grid: app.editor_grid,
             timing: {
                 let pulse = if sync_status.running {
@@ -288,12 +333,20 @@ impl Frame {
                     settings: self.settings,
                     sync_status: self.sync_status,
                     phrase: self.phrase.as_ref(),
-                    phrase_index: self.phrase_index,
-                    phrase_count: self.phrase_count,
+                    previous_phrase: self.previous_phrase,
+                    following_phrase: self.following_phrase,
                     selected_event: self.selected_event,
                     pixels_per_beat: self.pixels_per_beat,
                     playing_phrase: self.playing_phrase,
                     queued_phrase: self.queued_phrase,
+                    playhead: self.playhead,
+                    next_sections: &self.next_sections,
+                    section_passes: self.section_passes,
+                    fit: self.editor_fit,
+                    modal: self.editor_modal.as_ref(),
+                    has_clipboard: self.editor_clipboard,
+                    message: self.editor_message,
+                    edit_pending: self.edit_pending,
                     edit_grid: self.edit_grid,
                     can_undo: self.can_undo_phrase,
                     select_held,
@@ -535,6 +588,7 @@ fn tick(
         app.recorder.reset_timeline();
         app.take_armed_at = None;
         app.recording_take = None;
+        app.retrospective_recording = None;
         app.playing_take = None;
         if *was_running {
             app.phrase_player.stop();
@@ -544,6 +598,7 @@ fn tick(
         }
     }
 
+    app.finish_retrospective_pass(now_beat);
     if running_now != *was_running {
         if running_now {
             app.setting_focus = None;
@@ -552,6 +607,7 @@ fn tick(
             app.performer_engine.transport_started(now_beat);
         } else {
             app.finish_take(now_beat);
+            app.retrospective_recording = None;
             app.take_armed_at = None;
             app.playing_take = None;
             app.pending_chord = None;
@@ -600,11 +656,22 @@ fn tick(
             live_commit = true;
             app.pending_chord = None;
             app.phrase_player.stop();
+            app.retrospective_recording = None;
             app.set_harmony(chord, at, true, true);
             harmony_committed = true;
         }
         advance_recorder(app, now_beat);
+        if transport.mode() == SyncMode::MidiIn {
+            // A staged chain starts on the incoming clock. Use the active meter
+            // even when the project was prepared before the external Start.
+            app.phrase_player.arm_chain(now_beat, bar_beats);
+        }
         let playback = app.phrase_player.update(&app.phrases, now_beat);
+        if let Some(at) = playback.chord_beat
+            && !app.performer_engine.is_enabled()
+        {
+            app.performer_engine.transport_started(at);
+        }
         if let Some((chord, at)) = playback.chord.zip(playback.chord_beat)
             && chord != app.current_chord
         {
@@ -626,13 +693,43 @@ fn tick(
         };
         app.performer_engine
             .set_next_chord_target(next.map(|(chord, _)| chord), next.map(|(_, beat)| beat));
-        if playback.ended && app.phrase_player.queued_phrase().is_none() {
+        if playback.position.is_none() && playback.ended {
             app.performer_engine.set_enabled(false);
             app.stop_notes(midi)?;
         }
+        begin_retrospective_pass(app, now_beat);
         app.update_performers(now_beat, midi)?;
     }
     Ok(live_commit)
+}
+
+fn begin_retrospective_pass(app: &mut App, now: f64) {
+    let Some(pass) = app.phrase_player.pass() else {
+        app.retrospective_recording = None;
+        return;
+    };
+    if app
+        .retrospective_recording
+        .as_ref()
+        .is_some_and(|take| take.start == pass.start)
+    {
+        return;
+    }
+    app.retrospective_recording = None;
+    // If the external clock jumped well into a pass, its start was not played.
+    let launch_window = (pass.end - pass.start).min(1.0 / 24.0);
+    if now - pass.start > launch_window + 1.0e-6 {
+        return;
+    }
+    let mut take = crate::workspace::TakeRecording::new(
+        app,
+        pass.start,
+        Some(pass.phrase_id),
+        format!("P{:02} PASS", pass.phrase_id),
+    );
+    take.stop = Some(pass.end);
+    take.seed_notes(&app.active_notes);
+    app.retrospective_recording = Some(take);
 }
 
 fn tick_take_playback(app: &mut App, midi: &mut MidiEngine, now: f64) -> Result<bool, String> {
@@ -640,6 +737,7 @@ fn tick_take_playback(app: &mut App, midi: &mut MidiEngine, now: f64) -> Result<
         return Ok(false);
     };
     if !playback.started {
+        app.retrospective_recording = None;
         app.stop_notes(midi)?;
         app.performer_engine.set_enabled(false);
         app.phrase_player.stop();
@@ -879,6 +977,130 @@ mod tests {
         assert_eq!(app.phrases[0].events, original);
         assert!(!app.can_undo_phrase());
         assert!(app.phrases[0].looping);
+    }
+
+    #[test]
+    fn editor_picker_and_clipboard_preserve_off_grid_timing() {
+        use crate::editor::{EditItem, EditorModal};
+        use crate::phrase::ChordEvent;
+
+        let mut app = App::new();
+        let mut midi = MidiEngine::dry_run();
+        let mut transport = SyncTransport::new(app.settings.tempo_bpm);
+        let mut act = |app: &mut App, action| {
+            dispatch_action(action, app, &mut transport, &mut midi).unwrap()
+        };
+        let original = ChordEvent {
+            chord: app.current_chord,
+            start_beat: 0.0,
+            duration_beats: 1.3,
+        };
+        for id in [1, 2] {
+            app.phrases.push(Phrase {
+                id,
+                looping: true,
+                events: vec![original],
+            });
+        }
+        app.screen = Screen::PhraseEditor;
+        act(&mut app, InputAction::Secondary);
+        assert_eq!(app.input_page(), InputPage::EditorModal);
+        act(&mut app, InputAction::Secondary);
+        assert!(!app.can_undo_phrase());
+
+        act(&mut app, InputAction::Secondary);
+        act(&mut app, InputAction::Tertiary);
+        act(&mut app, InputAction::NavigateUp);
+        act(&mut app, InputAction::Primary);
+        assert_eq!(
+            app.phrases[0].events[0].chord.root,
+            original.chord.root.transpose(1)
+        );
+        assert_eq!(app.phrases[0].events[0].duration_beats, 1.3);
+
+        let edit = |app: &mut App, item: EditItem| {
+            app.editor_modal = Some(EditorModal::Edit(
+                EditItem::ALL
+                    .iter()
+                    .position(|candidate| *candidate == item)
+                    .unwrap(),
+            ));
+        };
+        edit(&mut app, EditItem::InsertBefore);
+        act(&mut app, InputAction::Primary);
+        act(&mut app, InputAction::Primary);
+        assert_eq!(app.phrases[0].events[0].duration_beats, 1.0);
+        assert_eq!(app.phrases[0].events[1].start_beat, 1.0);
+        act(&mut app, InputAction::NavigateRight);
+        let cut = app.phrases[0].events[1];
+        edit(&mut app, EditItem::Cut);
+        act(&mut app, InputAction::Primary);
+        assert_eq!(app.phrases[0].events.len(), 1);
+        assert_eq!(app.editor_clipboard, Some(cut));
+        act(&mut app, InputAction::PhraseNext);
+        edit(&mut app, EditItem::Paste);
+        act(&mut app, InputAction::Primary);
+        assert_eq!(
+            app.phrases[1].events[1],
+            ChordEvent {
+                start_beat: 1.3,
+                ..cut
+            }
+        );
+        act(&mut app, InputAction::EditUndo);
+        assert_eq!(app.phrases[1].events, vec![original]);
+        act(&mut app, InputAction::EditDelete);
+        assert_eq!(app.phrases[1].events, vec![original]);
+    }
+
+    #[test]
+    fn recovery_promotes_only_a_complete_phrase_pass_to_takes() {
+        use crate::performer::VoiceEvent;
+        use crate::phrase::ChordEvent;
+
+        let mut app = App::new();
+        app.phrases.push(Phrase {
+            id: 3,
+            looping: true,
+            events: vec![ChordEvent {
+                chord: app.current_chord,
+                start_beat: 0.0,
+                duration_beats: 2.5,
+            }],
+        });
+        app.phrase_player.request(0, 4.0, 4.0);
+        app.phrase_player.update(&app.phrases, 4.0);
+        let note = VoiceEvent::NoteOn {
+            voice_index: 0,
+            note: 47,
+            velocity: 92,
+        };
+        app.active_notes.apply(note);
+        begin_retrospective_pass(&mut app, 4.0);
+        app.finish_retrospective_pass(6.0);
+        assert!(app.retrospective_take.is_none());
+        app.finish_retrospective_pass(6.5);
+        assert!(app.takes.is_empty());
+        let take = app.retrospective_take.as_ref().unwrap();
+        assert!(take.valid());
+        assert_eq!(take.duration, 2.5);
+        assert_eq!(take.source_phrase, Some(3));
+        assert_eq!(take.events[0].beat, 0.0);
+        assert_eq!(take.events[0].event, note);
+        assert_eq!(take.events.last().unwrap().beat, 2.5);
+        assert!(matches!(
+            take.events.last().unwrap().event,
+            VoiceEvent::NoteOff { .. }
+        ));
+
+        let mut midi = MidiEngine::dry_run();
+        let mut transport = SyncTransport::new(app.settings.tempo_bpm);
+        app.workspace_ui = Some(crate::workspace::WorkspaceUi::default());
+        dispatch_action(InputAction::RightClick, &mut app, &mut transport, &mut midi).unwrap();
+        assert_eq!(app.takes.len(), 1);
+        assert!(app.retrospective_take.is_none());
+        dispatch_action(InputAction::RightClick, &mut app, &mut transport, &mut midi).unwrap();
+        assert_eq!(app.takes.len(), 1);
     }
 
     #[test]
