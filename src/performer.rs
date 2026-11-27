@@ -10,6 +10,7 @@
 use crate::music::chord::Chord;
 use crate::music::settings::TonalContext;
 use crate::music::voicing::{MAX_VOICING_NOTES, Voicing};
+use crate::phrase::PhrasePosition;
 use crate::voice::{Voice, VoiceRole, VoiceScope};
 
 const VOICE_COUNT: usize = 4;
@@ -554,10 +555,16 @@ pub struct PerformerSnapshot {
 struct EnsembleContext {
     active_notes: [Option<u8>; VOICE_COUNT],
     last_attack_beat: [Option<f64>; VOICE_COUNT],
+    pending_attack_beat: [Option<f64>; VOICE_COUNT],
     motion_direction: [i8; VOICE_COUNT],
 }
 
 impl EnsembleContext {
+    fn attack_near(self, index: usize, beat: f64, window: f64) -> bool {
+        self.recent_attack(index, beat, window)
+            || self.pending_attack_beat[index].is_some_and(|start| (start - beat).abs() <= window)
+    }
+
     fn recent_attack(self, voice_index: usize, now_beat: f64, window: f64) -> bool {
         self.last_attack_beat[voice_index]
             .is_some_and(|beat| now_beat - beat <= window && now_beat >= beat)
@@ -592,6 +599,75 @@ impl ChordHold {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Groove {
+    #[default]
+    Straight,
+    LightSwing,
+    LaidBack,
+}
+
+impl Groove {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Straight => "STRAIGHT",
+            Self::LightSwing => "LIGHT SWING",
+            Self::LaidBack => "LAID BACK",
+        }
+    }
+
+    pub fn next(self, step: i32) -> Self {
+        [Self::Straight, Self::LightSwing, Self::LaidBack]
+            [(self as i32 + step).rem_euclid(3) as usize]
+    }
+
+    fn delay(self, role: VoiceRole, beat: f64, arrival: bool) -> f64 {
+        if arrival {
+            return 0.0;
+        }
+        match self {
+            Self::Straight => 0.0,
+            Self::LightSwing if (beat * 4.0).floor().rem_euclid(4.0) == 2.0 => 0.085,
+            Self::LightSwing => 0.0,
+            Self::LaidBack => match role {
+                VoiceRole::Bass => 0.0,
+                VoiceRole::Chords => 0.025,
+                VoiceRole::Texture => 0.055,
+                VoiceRole::Melody => 0.040,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum TextureStyle {
+    #[default]
+    Auto,
+    UpperFigure,
+    CommonToneDrone,
+    SparseEcho,
+}
+
+impl TextureStyle {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "AUTO",
+            Self::UpperFigure => "UPPER FIGURE",
+            Self::CommonToneDrone => "COMMON-TONE DRONE",
+            Self::SparseEcho => "SPARSE ECHO",
+        }
+    }
+
+    pub fn next(self, step: i32) -> Self {
+        [
+            Self::Auto,
+            Self::UpperFigure,
+            Self::CommonToneDrone,
+            Self::SparseEcho,
+        ][(self as i32 + step).rem_euclid(4) as usize]
+    }
+}
+
 /// Four independent role-aware performers sharing one active harmony.
 pub struct PerformerEngine {
     chord: Chord,
@@ -599,6 +675,9 @@ pub struct PerformerEngine {
     chord_voicing: Voicing,
     chord_origin_beat: f64,
     next_chord_target: Option<FutureHarmony>,
+    phrase_position: Option<PhrasePosition>,
+    pub(crate) groove: Groove,
+    pub(crate) texture_style: TextureStyle,
     enabled: bool,
     muted: [bool; VOICE_COUNT],
     solo: Option<usize>,
@@ -733,6 +812,9 @@ impl PerformerEngine {
             chord_voicing,
             chord_origin_beat: 0.0,
             next_chord_target: None,
+            phrase_position: None,
+            groove: Groove::Straight,
+            texture_style: TextureStyle::Auto,
             enabled: false,
             muted: [false; VOICE_COUNT],
             solo: None,
@@ -809,6 +891,10 @@ impl PerformerEngine {
         self.chord_voicing = chord_voicing;
     }
 
+    pub fn set_phrase_position(&mut self, position: Option<PhrasePosition>) {
+        self.phrase_position = position;
+    }
+
     /// Supplies a future harmony only when it is genuinely known.
     ///
     /// Live improvisation normally leaves this `None`; semantic Phrase
@@ -840,6 +926,7 @@ impl PerformerEngine {
     /// Disables generation and clears internal note ownership.
     pub fn transport_stopped(&mut self) {
         self.enabled = false;
+        self.phrase_position = None;
         self.live_revoice = false;
         for state in &mut self.states {
             state.sounding = None;
@@ -907,6 +994,12 @@ impl PerformerEngine {
         }
 
         let live_revoice = std::mem::take(&mut self.live_revoice);
+        let opening = self
+            .phrase_position
+            .is_some_and(|position| position.opening(beats_per_bar));
+        let closing = self
+            .phrase_position
+            .is_some_and(|position| position.closing(beats_per_bar));
 
         // First settle every already-scheduled event so EnsembleContext never
         // observes a note that should have been released this frame.
@@ -917,8 +1010,9 @@ impl PerformerEngine {
                 continue;
             }
             let state = &self.states[index];
-            if state.sustain
-                && index >= 2
+            if index >= 2
+                && (state.sustain
+                    || index == 2 && self.texture_style == TextureStyle::CommonToneDrone)
                 && let Some(active) = state.sounding
                 && active.sustain_eligible
                 && !active.notes.iter().all(|note| self.is_chord_tone(note))
@@ -932,9 +1026,8 @@ impl PerformerEngine {
             self.start_due_attack(index, now_beat, &mut batch);
         }
 
-        // Melody is evaluated before Texture so complementary Texture patterns
-        // can respond to a Melody attack on the same transport frame.
-        for index in [0_usize, 1, 3, 2] {
+        // Bass arrives first. Melody shapes the room left for comping and Texture.
+        for index in [0_usize, 3, 1, 2] {
             let voice = voices[index];
             let role = voice.role;
 
@@ -946,6 +1039,8 @@ impl PerformerEngine {
             let desired_family = family_for(role, behavior.activity);
             let family_boundary = family_boundary_index(role, now_beat, beats_per_bar);
 
+            let drone =
+                role == VoiceRole::Texture && self.texture_style == TextureStyle::CommonToneDrone;
             let active_family = self.states[index].pattern.family;
             let mut timing = step_timing(
                 role,
@@ -971,7 +1066,8 @@ impl PerformerEngine {
 
             if family_changed {
                 let state = &self.states[index];
-                if !(state.sustain && state.sounding.is_some_and(|active| active.sustain_eligible)
+                if !((state.sustain || drone)
+                    && state.sounding.is_some_and(|active| active.sustain_eligible)
                     || role == VoiceRole::Chords && live_revoice)
                 {
                     self.stop_sounding_now(index, &mut batch);
@@ -1025,8 +1121,41 @@ impl PerformerEngine {
                     }
                 }
             }
-            let variant = state.pattern.variant;
-            if matches!(
+            let variant = if role == VoiceRole::Texture && self.texture_style != TextureStyle::Auto
+            {
+                match self.texture_style {
+                    TextureStyle::Auto => state.pattern.variant,
+                    TextureStyle::UpperFigure => PatternVariant::TextureIsolatedUpper,
+                    TextureStyle::CommonToneDrone => PatternVariant::TextureLongDrone,
+                    TextureStyle::SparseEcho => PatternVariant::TextureDelayedEcho,
+                }
+            } else {
+                state.pattern.variant
+            };
+            let loop_turnaround = role == VoiceRole::Bass
+                && !state.held
+                && !state.force_attack
+                && behavior.activity >= 0.42
+                && self.phrase_position.is_some();
+            let ending_step = self
+                .phrase_position
+                .filter(|position| {
+                    loop_turnaround
+                        && closing
+                        && position.remaining <= (beats_per_bar / 2.0).min(1.5)
+                })
+                .map(|position| (position.remaining / timing.step_length).ceil() as usize);
+            let variant = match ending_step {
+                Some(_) => PatternVariant::BassTurnaround,
+                None if loop_turnaround && variant == PatternVariant::BassTurnaround => {
+                    PatternVariant::BassChordToneOstinato
+                }
+                None => variant,
+            };
+            if let Some(steps_left) = ending_step {
+                timing.position =
+                    2 * timing.steps_per_cycle - steps_left.min(timing.steps_per_cycle / 2);
+            } else if matches!(
                 variant,
                 PatternVariant::BassOctaveAnswer | PatternVariant::BassTurnaround
             ) && timing.cycle_index.rem_euclid(2) == 1
@@ -1062,7 +1191,7 @@ impl PerformerEngine {
                 continue;
             }
             let state = &self.states[index];
-            if state.sustain
+            if (state.sustain || drone)
                 && !state.force_attack
                 && state.sounding.is_some_and(|active| active.sustain_eligible)
             {
@@ -1083,9 +1212,31 @@ impl PerformerEngine {
             let should_attack = if chord_gate.is_some() {
                 renew_hold
             } else {
-                self.should_attack(index, role, timing, behavior, ensemble, now_beat)
+                self.should_attack(index, variant, timing, behavior, ensemble, now_beat)
             };
-            if behavior.activity <= 0.01 || (!forced && !should_attack) {
+            let melody_intent = self.states[3].melody_plan.intent(timing.position);
+            let held_pattern = self.states[index].held;
+            let yield_space = !held_pattern
+                && match role {
+                    VoiceRole::Melody => {
+                        !matches!(melody_intent, MelodyIntent::Skeleton(_))
+                            && self.states[3].pending_resolution.is_none()
+                            && (closing || opening && ensemble.recent_attack(0, now_beat, 0.20))
+                    }
+                    VoiceRole::Chords => {
+                        timing.position != 0
+                            && !matches!(
+                                self.states[1].pattern.family,
+                                PatternFamily::ChordsLongSustain | PatternFamily::ChordsBarSustain
+                            )
+                            && ensemble.attack_near(3, now_beat, 0.16)
+                    }
+                    VoiceRole::Texture => {
+                        !drone && closing && ensemble.attack_near(0, now_beat, 0.35)
+                    }
+                    VoiceRole::Bass => false,
+                };
+            if behavior.activity <= 0.01 || (!forced && (!should_attack || yield_space)) {
                 continue;
             }
 
@@ -1096,6 +1247,7 @@ impl PerformerEngine {
                     timing.position,
                     voice,
                     ensemble,
+                    closing && !held_pattern,
                 )),
                 VoiceRole::Bass if forced => NoteSet::single(bass_arrival(
                     self.chord,
@@ -1103,6 +1255,17 @@ impl PerformerEngine {
                     self.states[index].previous_note,
                     self.voice_led_bass,
                 )),
+                VoiceRole::Texture if drone => NoteSet::single(self.drone_note()),
+                VoiceRole::Texture
+                    if self.texture_style == TextureStyle::SparseEcho
+                        && let Some(note) = self.states[3].previous_note
+                        && self.is_chord_tone(note) =>
+                {
+                    NoteSet::single(nearest_pitch_class_near(
+                        note % 12,
+                        self.chord_voicing.top_note().saturating_add(5),
+                    ))
+                }
                 VoiceRole::Bass | VoiceRole::Texture => {
                     NoteSet::single(choose_role_note(RoleNoteRequest {
                         voice,
@@ -1136,7 +1299,9 @@ impl PerformerEngine {
                     _ => velocity.saturating_sub(9).max(1),
                 };
             }
-            let gate = if role == VoiceRole::Melody {
+            let gate = if drone {
+                f64::INFINITY
+            } else if role == VoiceRole::Melody {
                 melody_gate_beats(
                     self.states[index].melody_plan.step(timing.position),
                     timing.step_length,
@@ -1152,7 +1317,8 @@ impl PerformerEngine {
                         self.states[index].melody_plan.intent(timing.position),
                         MelodyIntent::Skeleton(_)
                     ));
-            let start = now_beat + timing_offset_beats(role);
+            let start =
+                now_beat + timing_offset_beats(role) + self.groove.delay(role, now_beat, forced);
 
             self.states[index].pending = Some(PendingAttack {
                 notes,
@@ -1166,6 +1332,28 @@ impl PerformerEngine {
         }
 
         batch
+    }
+
+    fn drone_note(&self) -> u8 {
+        if let Some(note) = self.states[2].previous_note
+            && self.is_chord_tone(note)
+        {
+            return note;
+        }
+        let top = self.chord_voicing.top_note();
+        let pitch = self
+            .next_chord_target
+            .and_then(|next| {
+                let tones = next.chord.essential_pitch_classes();
+                self.chord_voicing
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .rev()
+                    .find(|pitch| tones.contains(&(pitch % 12)))
+            })
+            .unwrap_or(top);
+        nearest_pitch_class_near(pitch % 12, top.saturating_add(7))
     }
 
     fn is_chord_tone(&self, note: u8) -> bool {
@@ -1222,6 +1410,9 @@ impl PerformerEngine {
                 })
             }),
             last_attack_beat: std::array::from_fn(|index| self.states[index].last_attack_beat),
+            pending_attack_beat: std::array::from_fn(|index| {
+                self.states[index].pending.map(|note| note.start_beat)
+            }),
             motion_direction: std::array::from_fn(|index| self.states[index].motion_direction),
         }
     }
@@ -1344,30 +1535,52 @@ impl PerformerEngine {
     fn should_attack(
         &self,
         index: usize,
-        role: VoiceRole,
+        variant: PatternVariant,
         timing: StepTiming,
         behavior: Behavior,
         ensemble: EnsembleContext,
         now_beat: f64,
     ) -> bool {
-        let variant = self.states[index].pattern.variant;
-        if role == VoiceRole::Melody {
+        if index == 3 {
             return self.states[index].melody_plan.intent(timing.position) != MelodyIntent::Rest;
         }
 
+        if index == 2 {
+            match self.texture_style {
+                TextureStyle::CommonToneDrone => return true,
+                TextureStyle::SparseEcho => {
+                    return ensemble.last_attack_beat[3].is_some_and(|attack| {
+                        (0.35..=1.15).contains(&(now_beat - attack))
+                            && ensemble.last_attack_beat[2].is_none_or(|echo| echo < attack)
+                    });
+                }
+                TextureStyle::UpperFigure => {
+                    let phase = self.phrase_position.map_or(timing.position, |phrase| {
+                        ((phrase.elapsed + 1.0e-9) / timing.step_length).floor() as usize
+                    });
+                    let cell = (timing.steps_per_cycle / 2).max(4);
+                    let opening = cell / 2 - 1;
+                    let slot = phase % cell;
+                    let figure =
+                        slot == opening || behavior.activity >= 0.55 && slot == opening + 2;
+                    return figure && !ensemble.attack_near(3, now_beat, 0.25);
+                }
+                TextureStyle::Auto => {}
+            }
+        }
         let base_hit = pattern_hit(variant, timing.position, timing.steps_per_cycle);
         if !base_hit {
             return false;
         }
 
-        if role != VoiceRole::Texture {
+        if index != 2 {
             return true;
         }
 
         // Texture rhythm is intentionally regular in v0.11. Complementary
         // patterns create space by relationship rule rather than random holes.
         if texture_relationship(variant, behavior) == TextureRelationship::Complement
-            && ensemble.recent_attack(3, now_beat, 0.125)
+            && ensemble.attack_near(3, now_beat, 0.25)
             && !matches!(
                 variant,
                 PatternVariant::TextureLongDrone | PatternVariant::TextureBarDrone
@@ -1414,12 +1627,16 @@ impl PerformerEngine {
         position: usize,
         voice: Voice,
         ensemble: EnsembleContext,
+        answering: bool,
     ) -> u8 {
         if let Some(resolution) = self.states[index].pending_resolution.take() {
             return resolution;
         }
 
         let mut intent = self.states[index].melody_plan.intent(position);
+        if answering && let MelodyIntent::Skeleton(contour) = intent {
+            intent = MelodyIntent::Skeleton(contour.saturating_sub(2).max(0));
+        }
         if let MelodyIntent::ChromaticApproach(contour) = intent
             && voice.parameters.color >= 0.80
         {
@@ -1948,7 +2165,15 @@ fn choose_role_note(request: RoleNoteRequest) -> u8 {
     let spread = request.voice.parameters.spread.clamp(0.0, 1.0);
     let target = match role {
         VoiceRole::Bass => 36.0 + spread * 8.0,
-        VoiceRole::Texture => f32::from(request.chord_voicing.top_note()) + 3.0 + spread * 10.0,
+        VoiceRole::Texture => {
+            f32::from(request.chord_voicing.top_note())
+                + if request.variant == PatternVariant::TextureIsolatedUpper {
+                    12.0
+                } else {
+                    3.0
+                }
+                + spread * 10.0
+        }
         VoiceRole::Melody => f32::from(request.chord_voicing.top_note()) + 5.0 + spread * 12.0,
         VoiceRole::Chords => f32::from(request.chord_voicing.note(1)),
     };
@@ -2090,9 +2315,8 @@ fn pattern_note_offset(variant: PatternVariant, position: usize) -> usize {
         | PatternVariant::BassScaleApproach
         | PatternVariant::BassWalkingFragment => position / 2,
         PatternVariant::BassChromaticApproach => 0,
-        PatternVariant::TextureLongDrone
-        | PatternVariant::TextureBarDrone
-        | PatternVariant::TextureIsolatedUpper => 0,
+        PatternVariant::TextureLongDrone | PatternVariant::TextureBarDrone => 0,
+        PatternVariant::TextureIsolatedUpper => (position / 2) % 3,
         PatternVariant::TextureDelayedEcho => position / 2 + 1,
         PatternVariant::TextureHalfPulse | PatternVariant::TextureQuarterPulse => position / 2,
         PatternVariant::TextureThreeStepArp | PatternVariant::TextureRotatingThree => position % 3,
@@ -2788,6 +3012,77 @@ mod tests {
     }
 
     #[test]
+    fn grooves_offset_only_performer_attacks() {
+        use super::Groove;
+        for role in [
+            VoiceRole::Bass,
+            VoiceRole::Chords,
+            VoiceRole::Texture,
+            VoiceRole::Melody,
+        ] {
+            assert_eq!(Groove::Straight.delay(role, 3.5, false), 0.0);
+            assert_eq!(Groove::LightSwing.delay(role, 3.5, false), 0.085);
+            assert_eq!(Groove::LightSwing.delay(role, 3.0, false), 0.0);
+            assert_eq!(Groove::LightSwing.delay(role, 3.5, true), 0.0);
+            assert_eq!(Groove::LaidBack.delay(role, 3.5, true), 0.0);
+        }
+        assert_eq!(Groove::LaidBack.delay(VoiceRole::Bass, 3.5, false), 0.0);
+        assert!(Groove::LaidBack.delay(VoiceRole::Melody, 3.5, false) > 0.0);
+    }
+
+    #[test]
+    fn common_tone_drone_holds_compatible_notes_across_harmony() {
+        use super::TextureStyle;
+        let settings = MusicalSettings::default();
+        let mut voices = default_voices();
+        for index in [0, 1, 3] {
+            voices[index].parameters.density = 0.0;
+        }
+        let mut engine = PerformerEngine::new(
+            c_major(),
+            settings.tonal,
+            Voicing::from_slice(&[60, 64, 67]),
+        );
+        let e_minor = Chord::new(
+            PitchClass::from_value(4),
+            ChordQuality::Minor,
+            ChordExtension::Triad,
+        );
+        engine.texture_style = TextureStyle::CommonToneDrone;
+        engine.transport_started(0.0);
+        engine.set_next_chord_target(Some(e_minor), Some(1.0));
+        engine.update(0.0, 4.0, &voices);
+        engine.update(0.03, 4.0, &voices);
+        let drone = engine.snapshots()[2].active_notes[0].unwrap();
+        assert!(e_minor.essential_pitch_classes().contains(&(drone % 12)));
+
+        engine.harmony_changed(
+            e_minor,
+            settings.tonal,
+            Voicing::from_slice(&[64, 67, 71]),
+            1.0,
+        );
+        let update = engine.update(1.0, 4.0, &voices);
+        assert_eq!(update.iter().count(), 0);
+        assert_eq!(engine.snapshots()[2].active_notes[0], Some(drone));
+
+        let f_major = Chord::new(
+            PitchClass::from_value(5),
+            ChordQuality::Major,
+            ChordExtension::Triad,
+        );
+        engine.harmony_changed(
+            f_major,
+            settings.tonal,
+            Voicing::from_slice(&[65, 69, 72]),
+            2.0,
+        );
+        assert!(engine.update(2.0, 4.0, &voices).iter().any(|event| {
+            matches!(event, VoiceEvent::NoteOff { voice_index: 2, note } if note == drone)
+        }));
+    }
+
+    #[test]
     fn density_selects_behavior_family_not_exact_pattern() {
         assert_eq!(family_for(VoiceRole::Bass, 0.10), PatternFamily::BassAnchor);
         assert_eq!(family_for(VoiceRole::Bass, 0.55), PatternFamily::BassMoving);
@@ -3277,6 +3572,7 @@ mod tests {
         let context = super::EnsembleContext {
             active_notes: [None, None, None, Some(60)],
             last_attack_beat: [None; 4],
+            pending_attack_beat: [None; 4],
             motion_direction: [0, 0, 0, 1],
         };
 

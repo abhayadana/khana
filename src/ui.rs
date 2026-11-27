@@ -15,7 +15,15 @@ use sdl2::rect::Rect;
 pub struct PerformanceView<'a> {
     pub timing: &'a str,
     pub beat_flash: Option<bool>,
-    pub options: &'a str,
+    pub chord_gate: &'static str,
+    pub bass_arrival: &'static str,
+    pub groove: &'static str,
+    pub texture_role: &'static str,
+    pub panic_confirm: bool,
+    pub macro_targets: [bool; 4],
+    pub has_macro_group: bool,
+    pub live_grid: &'static str,
+    pub select_held: bool,
     pub voicing: VoicingStyle,
     pub pending_voicing: Option<VoicingStyle>,
     pub settings: MusicalSettings,
@@ -33,7 +41,6 @@ pub struct PerformanceView<'a> {
     pub scope: VoiceScope,
     pub recorder_status: RecorderStatus,
     pub next_recording_armed: bool,
-    pub quantize_beats: f64,
     pub phrase_count: usize,
     pub midi_destination: &'a str,
     pub midi_clock: &'static str,
@@ -57,6 +64,7 @@ pub struct PhraseEditorView<'a> {
     pub queued_phrase: Option<usize>,
     pub edit_grid: EditGrid,
     pub can_undo: bool,
+    pub select_held: bool,
 }
 
 /// Stateless 1024×768 renderer.
@@ -78,7 +86,11 @@ impl Ui {
         let PerformanceView {
             timing,
             beat_flash,
-            options,
+            groove,
+            macro_targets,
+            has_macro_group,
+            live_grid,
+            select_held,
             voicing,
             pending_voicing,
             settings,
@@ -96,61 +108,37 @@ impl Ui {
             scope,
             recorder_status,
             next_recording_armed,
-            quantize_beats,
             phrase_count,
-            midi_destination,
             midi_clock,
             midi_channels,
             midi_transpose,
-            midi_input,
+            ..
         } = view;
 
         canvas.set_draw_color(background());
         canvas.clear();
 
-        if let Some(field) = setting_focus.filter(|field| field.is_rig()) {
-            return draw_rig(canvas, &view, field, self.brick);
+        if let Some(field) = setting_focus {
+            return draw_setup(canvas, &view, field, self.brick);
         }
-        draw_header(canvas, settings, setting_focus, sync_status, "PERFORMANCE")?;
+        draw_header(canvas, settings, None, sync_status, "PERFORMANCE")?;
         draw_beat_strip(canvas, timing, beat_flash)?;
-        let settings_hint = match setting_focus {
-            Some(SettingField::Tonic) => Some("LEFT: MIDI RIG".to_owned()),
-            Some(SettingField::ChordHold | SettingField::BassArrival | SettingField::Voicing) => {
-                Some(options.to_owned())
-            }
-
-            Some(SettingField::Tempo) if sync_status.mode == SyncMode::MidiIn => {
-                Some("TEMPO FROM MIDI INPUT".to_owned())
-            }
-
-            Some(SettingField::Tempo) if sync_status.running => {
-                Some("LIVE TEMPO: UP/DOWN 1 BPM".to_owned())
-            }
-            _ => None,
-        };
-        if let Some(hint) = settings_hint {
-            draw_text(canvas, 360, 52, &hint, 1, accent())?;
-        } else if setting_focus.is_none()
-            && let Some(input) = midi_input
-        {
-            let label: String = input.chars().take(42).collect();
-            draw_text(
-                canvas,
-                360,
-                52,
-                &format!("{}  {label}", sync_status.midi_status),
-                1,
-                accent(),
-            )?;
-        }
         draw_text(
             canvas,
-            815,
+            370,
             52,
-            midi_clock,
+            &format!(
+                "LIVE GRID {live_grid}   {}",
+                if self.brick { "SEL+R2" } else { "F9" }
+            ),
             1,
-            field_color(setting_focus, SettingField::MidiClockOut),
+            accent(),
         )?;
+        draw_text(canvas, 615, 52, groove, 1, dim_text())?;
+        if sync_status.mode == SyncMode::MidiIn {
+            draw_text(canvas, 710, 52, sync_status.midi_status, 1, accent())?;
+        }
+        draw_text(canvas, 815, 52, midi_clock, 1, dim_text())?;
 
         draw_panel(canvas, Rect::new(32, 82, 250, 220), panel())?;
         draw_text(canvas, 54, 100, "CURRENT", 2, dim_text())?;
@@ -166,7 +154,11 @@ impl Ui {
             canvas,
             54,
             192,
-            &format!("VOICING {}", voicing.label()),
+            &format!(
+                "{} {}",
+                if self.brick { "R3" } else { "F6" },
+                voicing.label()
+            ),
             2,
             accent(),
         )?;
@@ -207,33 +199,48 @@ impl Ui {
 
         draw_panel(canvas, Rect::new(780, 82, 212, 220), panel())?;
         draw_text(canvas, 800, 100, "DIRECTION", 2, dim_text())?;
-        draw_text(canvas, 800, 132, direction.label(), 3, accent())?;
+        draw_text(canvas, 800, 123, direction.label(), 2, accent())?;
+        let mut x = 800;
+        for intent in [
+            HarmonicDirection::Resolve,
+            HarmonicDirection::Neutral,
+            HarmonicDirection::Tension,
+        ] {
+            let color = if direction == intent {
+                accent()
+            } else {
+                dim_text()
+            };
+            draw_text(canvas, x, 150, intent.label(), 1, color)?;
+            x += 56;
+        }
         draw_text(
             canvas,
             800,
-            158,
-            if self.brick {
-                "L2 RESOLVE  BOTH/Y NEUTRAL"
-            } else {
-                "Q RESOLVE  E NEUTRAL"
-            },
+            165,
+            if self.brick { "L2 / R2" } else { "Q / E / W" },
             1,
             dim_text(),
         )?;
-        draw_text(
-            canvas,
-            800,
-            171,
-            if self.brick {
-                "R2 TENSION"
-            } else {
-                "W TENSION"
-            },
-            1,
-            dim_text(),
-        )?;
-        draw_text(canvas, 800, 194, "SCOPE", 2, dim_text())?;
-        draw_text(canvas, 800, 230, &scope.label(), 4, text_color())?;
+        draw_text(canvas, 800, 186, "BUTTON FOCUS", 1, dim_text())?;
+        let focus_label = match scope {
+            VoiceScope::All => "ALL",
+            VoiceScope::One(index) => voices[index].role.label(),
+        };
+        draw_text(canvas, 800, 200, focus_label, 2, text_color())?;
+        let macro_label = if has_macro_group {
+            voices
+                .iter()
+                .zip(macro_targets)
+                .filter(|(_, targeted)| *targeted)
+                .map(|(voice, _)| voice.role.label())
+                .collect::<Vec<_>>()
+                .join("+")
+        } else {
+            focus_label.to_owned()
+        };
+        draw_text(canvas, 800, 228, "MACROS", 1, dim_text())?;
+        draw_text(canvas, 800, 243, &macro_label, 1, accent())?;
         draw_text(canvas, 800, 274, "WHY", 1, dim_text())?;
         draw_text(
             canvas,
@@ -251,42 +258,45 @@ impl Ui {
             performer_snapshots,
             scope,
             (midi_channels, midi_transpose),
+            (has_macro_group, macro_targets),
         )?;
 
-        draw_panel(canvas, Rect::new(32, 660, 960, 82), panel())?;
+        draw_panel(canvas, Rect::new(32, 660, 960, 67), panel())?;
         draw_recording_strip(
             canvas,
             recorder_status,
             next_recording_armed,
-            quantize_beats,
             phrase_count,
-            midi_destination,
+            self.brick,
         )?;
-        if setting_focus.is_none() {
-            draw_text(
-                canvas,
-                52,
-                729,
-                if self.brick {
-                    "L3 SUSTAIN  R3 VOICING  SEL+L/R2 MUTE/SOLO  SEL+L/R1 HOLD/GRID  SEL+R3 VARY"
+        let footer = if self.brick && select_held {
+            let mute = if scope == VoiceScope::All {
+                if performer_snapshots.iter().all(|state| state.muted) {
+                    "UNMUTE ALL"
                 } else {
-                    "F5 SUSTAIN  F6 VOICING  F7 VARY  F8 HOLD  F9 GRID  F10 MUTE  F11 SOLO"
-                },
-                1,
-                dim_text(),
-            )?;
-        }
-        if self.brick {
-            let hints = if setting_focus.is_some() && sync_status.running {
-                "U/D BPM  A/B/MENU CLOSE  START STOP"
-            } else if setting_focus.is_some() {
-                "L/R FIELD  U/D VALUE  A/B/MENU CLOSE  MENU HOLD EXIT"
+                    "MUTE ALL"
+                }
+            } else if matches!(scope, VoiceScope::One(index) if performer_snapshots[index].muted) {
+                "UNMUTE"
             } else {
-                "A COMMIT B REROLL X SURPRISE Y NEUTRAL SEL+A REC SEL+B ARM SEL+X SETUP MENU PAGE/HOLD EXIT"
+                "MUTE"
             };
-            draw_text(canvas, 32, 746, hints, 1, dim_text())?;
-        }
-
+            let solo = if scope == VoiceScope::All
+                || matches!(scope, VoiceScope::One(index) if performer_snapshots[index].soloed)
+            {
+                "CLEAR SOLO"
+            } else {
+                "SOLO"
+            };
+            format!(
+                "L1 {mute}  R1 {solo}  L2 PATTERN HOLD  R2 LIVE GRID  R3 VARY  B ARM NEXT  X SETUP"
+            )
+        } else if self.brick {
+            "A COMMIT   Y MACRO GROUP   L3 SUSTAIN   HOLD SELECT FOR SHORTCUTS".into()
+        } else {
+            "Z COMMIT   F4 MACRO GROUP   F5 SUSTAIN   M SETUP".into()
+        };
+        draw_text(canvas, 32, 739, &footer, 2, dim_text())?;
         Ok(())
     }
 
@@ -309,6 +319,7 @@ impl Ui {
             queued_phrase,
             edit_grid,
             can_undo,
+            select_held,
         } = view;
 
         canvas.set_draw_color(background());
@@ -324,7 +335,7 @@ impl Ui {
                 270,
                 370,
                 if self.brick {
-                    "MENU: PERFORMANCE  SEL+A: RECORD"
+                    "MENU TO PERFORMANCE TO RECORD"
                 } else {
                     "RECORD ON PERFORMANCE SCREEN"
                 },
@@ -360,7 +371,7 @@ impl Ui {
             canvas,
             690,
             90,
-            &format!("GRID {}", edit_grid.label()),
+            &format!("DUR GRID {}", edit_grid.label()),
             2,
             accent(),
         )?;
@@ -426,7 +437,7 @@ impl Ui {
                 535,
                 670,
                 if self.brick {
-                    "SEL+Y DELETE  L/R2 SIZE  U/D GRID"
+                    "L/R2 SIZE  U/D GRID"
                 } else {
                     "BACKSPACE DELETE  F/R SIZE  UP/DN GRID"
                 },
@@ -438,7 +449,7 @@ impl Ui {
                 535,
                 700,
                 if self.brick {
-                    "L/R1 PHRASE  SEL+L/R1 ZOOM"
+                    "L/R1 PHRASE"
                 } else {
                     "A/L PHRASE   -/= ZOOM   SPACE TRANSPORT"
                 },
@@ -451,10 +462,12 @@ impl Ui {
             canvas,
             32,
             746,
-            if self.brick {
-                "L3/SEL+X LOOP  R3/SEL+B CLEAR QUEUE"
+            if self.brick && select_held {
+                "Y DELETE   L/R1 ZOOM   X SETUP"
+            } else if self.brick {
+                "L3 LOOP   R3 CLEAR QUEUE   HOLD SELECT FOR SHORTCUTS"
             } else {
-                "F5 LOOP  F6 CLEAR QUEUE"
+                "F5 LOOP   F6 CLEAR QUEUE"
             },
             1,
             dim_text(),
@@ -463,7 +476,13 @@ impl Ui {
             canvas,
             530,
             746,
-            if self.brick { "SEL+A UNDO" } else { "F12 UNDO" },
+            if self.brick && select_held {
+                "A UNDO"
+            } else if self.brick {
+                ""
+            } else {
+                "F12 UNDO"
+            },
             1,
             if can_undo { accent() } else { dim_text() },
         )?;
@@ -471,130 +490,189 @@ impl Ui {
     }
 }
 
-fn draw_rig(
+fn draw_setup(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
     view: &PerformanceView<'_>,
     field: SettingField,
     brick: bool,
 ) -> Result<(), String> {
     let sync = view.sync_status;
-    draw_header(canvas, view.settings, Some(field), sync, "MIDI RIG")?;
-    draw_panel(canvas, Rect::new(32, 82, 960, 278), panel())?;
-    draw_text(canvas, 58, 102, "PERFORMER", 2, dim_text())?;
-    draw_text(canvas, 370, 102, "MIDI CHANNEL", 2, dim_text())?;
-    draw_text(canvas, 670, 102, "TRANSPOSE (SEMITONES)", 2, dim_text())?;
-
-    for (index, voice) in view.voices.iter().enumerate() {
-        let y = 145 + index as i32 * 48;
-        draw_text(canvas, 58, y, voice.role.label(), 2, text_color())?;
+    let rig = field.is_rig();
+    let live = sync.running || sync.starting;
+    draw_header(
+        canvas,
+        view.settings,
+        Some(field),
+        sync,
+        if live { "LIVE TEMPO" } else { "SETTINGS" },
+    )?;
+    if !live {
         draw_text(
             canvas,
-            370,
-            y,
-            &view.midi_channels[index].to_string(),
+            46,
+            80,
+            "MUSIC",
             2,
-            rig_field_color(field, SettingField::MidiChannel(index)),
+            if rig { dim_text() } else { accent() },
         )?;
         draw_text(
             canvas,
-            670,
-            y,
-            &format!("{:+}", view.midi_transpose[index]),
+            158,
+            80,
+            "MIDI RIG",
             2,
-            rig_field_color(field, SettingField::MidiTranspose(index)),
+            if rig { accent() } else { dim_text() },
         )?;
+        draw_text(canvas, 320, 80, "X SWITCH TAB", 2, dim_text())?;
     }
-
-    let clock_source = match sync.mode {
-        SyncMode::Internal => "INTERNAL",
-        SyncMode::MidiIn => "MIDI IN",
-        SyncMode::Link => "ABLETON LINK",
-    };
-    let link = if sync.link_available {
-        format!(
-            "{} PEERS   START/STOP {}",
-            sync.link_peers,
-            if sync.link_start_stop_sync {
-                "ON"
-            } else {
-                "OFF"
+    if rig {
+        draw_rig_values(canvas, view, field, brick)?;
+    } else {
+        draw_panel(
+            canvas,
+            Rect::new(32, 114, 960, if live { 112 } else { 585 }),
+            panel(),
+        )?;
+        let values = [
+            view.settings.tonal.tonic.label().to_owned(),
+            view.settings.tonal.mode.label().to_owned(),
+            format!("{:.0} BPM", view.settings.tempo_bpm),
+            view.settings.meter.label(),
+            view.chord_gate.to_owned(),
+            view.bass_arrival.to_owned(),
+            view.groove.to_owned(),
+            view.texture_role.to_owned(),
+        ];
+        for (row, ((setting, label), value)) in
+            SettingField::MUSIC.into_iter().zip(values).enumerate()
+        {
+            if live && setting != SettingField::Tempo {
+                continue;
             }
-        )
-    } else {
-        "LINK NOT BUILT".into()
-    };
-    let input = if sync.mode == SyncMode::MidiIn {
-        match view.midi_input {
-            Some(input) => format!("{}   {input}", sync.midi_status),
-            None => sync.midi_status.to_owned(),
+            let y = if live { 159 } else { 148 + row as i32 * 67 };
+            draw_text(canvas, 58, y, label, 2, text_color())?;
+            draw_setup_value(canvas, 378, y, 422, &value, setting == field)?;
         }
-    } else {
-        "INACTIVE".into()
-    };
-    let focus = Some(field);
-    draw_panel(canvas, Rect::new(32, 383, 960, 327), panel())?;
-    for (index, (label, value, setting)) in [
-        (
-            "CLOCK SOURCE",
-            clock_source.to_owned(),
-            Some(SettingField::Sync),
-        ),
-        ("MIDI CLOCK IN", input, None),
-        (
-            "MIDI CLOCK OUT",
-            view.midi_clock.to_owned(),
-            Some(SettingField::MidiClockOut),
-        ),
-        ("ABLETON LINK", link, Some(SettingField::StartStopSync)),
-        (
-            "MIDI OUTPUT",
-            view.midi_destination.to_owned(),
-            Some(SettingField::MidiOutput),
-        ),
-        (
-            "MIDI PANIC",
-            if brick {
-                "A TO SEND".into()
-            } else {
-                "Z TO SEND".into()
-            },
-            Some(SettingField::MidiPanic),
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let y = 402 + index as i32 * 47;
-        let color = if setting == focus {
-            accent()
-        } else {
-            text_color()
-        };
-        draw_text(canvas, 58, y, label, 2, color)?;
-        let value: String = value.chars().take(48).collect();
-        draw_text(canvas, 370, y, &value, 2, color)?;
     }
-
     draw_text(
         canvas,
         32,
         734,
-        if brick {
-            "L/R FIELD  U/D VALUE  A/B/MENU CLOSE"
+        if view.panic_confirm {
+            if brick {
+                "A SEND MIDI PANIC   B CANCEL"
+            } else {
+                "Z SEND MIDI PANIC   M CANCEL"
+            }
+        } else if brick {
+            "D-PAD SELECT VALUE   L1 / R1 CHANGE   B BACK"
         } else {
-            "LEFT/RIGHT FIELD  UP/DOWN VALUE  Z/M CLOSE"
+            "ARROWS SELECT VALUE   - / = CHANGE   M BACK"
         },
-        1,
+        2,
         dim_text(),
     )
 }
 
-fn rig_field_color(focus: SettingField, field: SettingField) -> Color {
-    if focus == field {
-        accent()
-    } else {
-        text_color()
+fn draw_rig_values(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    view: &PerformanceView<'_>,
+    field: SettingField,
+    brick: bool,
+) -> Result<(), String> {
+    let sync = view.sync_status;
+    draw_panel(canvas, Rect::new(32, 112, 960, 235), panel())?;
+    draw_text(canvas, 58, 132, "PERFORMER", 2, dim_text())?;
+    draw_text(canvas, 325, 132, "CHANNEL", 2, dim_text())?;
+    draw_text(canvas, 592, 132, "TRANSPOSE", 2, dim_text())?;
+    for (index, voice) in view.voices.iter().enumerate() {
+        let y = 174 + index as i32 * 42;
+        draw_text(canvas, 58, y, voice.role.label(), 2, text_color())?;
+        draw_setup_value(
+            canvas,
+            325,
+            y,
+            124,
+            &view.midi_channels[index].to_string(),
+            field == SettingField::MidiChannel(index),
+        )?;
+        draw_setup_value(
+            canvas,
+            592,
+            y,
+            124,
+            &format!("{:+}", view.midi_transpose[index]),
+            field == SettingField::MidiTranspose(index),
+        )?;
     }
+    let source = match sync.mode {
+        SyncMode::Internal => "INTERNAL",
+        SyncMode::MidiIn => "MIDI IN",
+        SyncMode::Link => "ABLETON LINK",
+    };
+    let link_transport = if !sync.link_available {
+        "LINK NOT BUILT"
+    } else if sync.link_start_stop_sync {
+        "ON"
+    } else {
+        "OFF"
+    };
+    let panic = if brick { "A REVIEW" } else { "Z REVIEW" };
+    let values = [
+        source,
+        view.midi_clock,
+        link_transport,
+        view.midi_destination,
+        panic,
+    ];
+    draw_panel(canvas, Rect::new(32, 360, 960, 348), panel())?;
+    for (index, ((setting, label), value)) in SettingField::RIG.into_iter().zip(values).enumerate()
+    {
+        let y = 383 + index as i32 * 44;
+        draw_text(canvas, 58, y, label, 2, text_color())?;
+        let value: String = value.chars().take(46).collect();
+        draw_setup_value(canvas, 378, y, 584, &value, setting == field)?;
+    }
+    let input = if sync.mode == SyncMode::MidiIn {
+        format!("{} {}", sync.midi_status, view.midi_input.unwrap_or(""))
+    } else {
+        "INACTIVE".into()
+    };
+    let input: String = input.chars().take(46).collect();
+    draw_text(canvas, 58, 615, "MIDI INPUT", 2, dim_text())?;
+    draw_text(canvas, 378, 615, &input, 2, dim_text())?;
+    draw_text(canvas, 58, 660, "LINK PEERS", 2, dim_text())?;
+    draw_text(
+        canvas,
+        378,
+        660,
+        &sync.link_peers.to_string(),
+        2,
+        dim_text(),
+    )
+}
+
+fn draw_setup_value(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    x: i32,
+    y: i32,
+    width: u32,
+    value: &str,
+    focused: bool,
+) -> Result<(), String> {
+    draw_panel(
+        canvas,
+        Rect::new(x - 8, y - 8, width, 31),
+        if focused { accent() } else { dim_panel() },
+    )?;
+    draw_text(
+        canvas,
+        x,
+        y,
+        value,
+        2,
+        if focused { background() } else { text_color() },
+    )
 }
 
 fn draw_beat_strip(
@@ -756,6 +834,7 @@ fn draw_voice_rows(
     snapshots: [PerformerSnapshot; 4],
     scope: VoiceScope,
     (channels, transpose): ([u8; 4], [i8; 4]),
+    (has_macro_group, macro_targets): (bool, [bool; 4]),
 ) -> Result<(), String> {
     draw_text(canvas, 36, 330, "PERFORMERS", 2, dim_text())?;
     draw_text(canvas, 260, 330, "DENS", 2, dim_text())?;
@@ -775,6 +854,13 @@ fn draw_voice_rows(
             Rect::new(32, y - 8, 960, 56),
             if scoped { scoped_panel() } else { panel() },
         )?;
+        if scope == VoiceScope::One(index) {
+            canvas.set_draw_color(accent());
+            canvas.draw_rect(Rect::new(32, y - 8, 960, 56))?;
+        }
+        if has_macro_group && macro_targets[index] {
+            draw_panel(canvas, Rect::new(39, y + 7, 7, 7), accent())?;
+        }
         let active = active_note_summary(context, state.active_notes);
         draw_text(
             canvas,
@@ -843,59 +929,36 @@ fn draw_recording_strip(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
     status: RecorderStatus,
     next_armed: bool,
-    quantize_beats: f64,
     phrase_count: usize,
-    midi_destination: &str,
+    brick: bool,
 ) -> Result<(), String> {
-    let status_text = match status {
-        RecorderStatus::Idle => "IDLE".to_owned(),
-        RecorderStatus::Armed { start_beat } => {
-            format!("ARMED START {:.1}", start_beat)
-        }
-        RecorderStatus::Recording { phrase_id } => {
-            format!("RECORDING P{:02}", phrase_id)
-        }
-        RecorderStatus::Stopping {
-            phrase_id,
-            stop_beat,
-        } => format!("P{:02} STOP {:.1}", phrase_id, stop_beat),
+    let capture = match status {
+        RecorderStatus::Idle => "READY".to_owned(),
+        RecorderStatus::Armed { .. } => "ARMED".to_owned(),
+        RecorderStatus::Recording { phrase_id } => format!("RECORDING P{phrase_id:02}"),
+        RecorderStatus::Stopping { phrase_id, .. } => format!("STOPPING P{phrase_id:02}"),
     };
-
-    draw_text(canvas, 52, 678, "CAPTURE", 2, dim_text())?;
-    draw_text(canvas, 180, 678, &status_text, 3, accent())?;
+    draw_text(canvas, 52, 686, "CAPTURE", 2, dim_text())?;
+    draw_text(canvas, 180, 686, &capture, 2, accent())?;
+    if next_armed {
+        draw_text(canvas, 410, 686, "NEXT ARMED", 2, accent())?;
+    }
     draw_text(
         canvas,
-        610,
-        678,
-        &format!("Q {:.1} BEATS", quantize_beats),
+        635,
+        686,
+        &format!("{phrase_count} SAVED"),
         2,
         dim_text(),
     )?;
     draw_text(
         canvas,
-        820,
-        678,
-        &format!("SAVED {}", phrase_count),
+        815,
+        686,
+        if brick { "SEL+A REC" } else { "P REC" },
         2,
         dim_text(),
-    )?;
-
-    let capture_label = if next_armed {
-        "NEXT PHRASE ARMED"
-    } else {
-        "CAPTURE READY"
-    };
-    let midi_label = midi_destination.chars().take(32).collect::<String>();
-    draw_text(
-        canvas,
-        180,
-        712,
-        &format!("{capture_label}   MIDI {midi_label}"),
-        1,
-        dim_text(),
-    )?;
-
-    Ok(())
+    )
 }
 
 fn draw_timeline(

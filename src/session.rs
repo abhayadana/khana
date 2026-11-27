@@ -9,7 +9,7 @@ use crate::midi::MidiEngine;
 use crate::music::chord::Chord;
 use crate::music::settings::{MusicalSettings, TimeSignature};
 use crate::music::voicing::VoicingStyle;
-use crate::performer::ChordHold;
+use crate::performer::{ChordHold, Groove, TextureStyle};
 use crate::phrase::{EditGrid, LiveGrid, Phrase};
 use crate::sync::{SyncMode, SyncTransport};
 use crate::voice::VoiceParameters;
@@ -26,6 +26,10 @@ struct Session {
     clock_out: bool,
     voices: [VoiceParameters; 4],
     chord_hold: ChordHold,
+    #[serde(default)]
+    groove: Groove,
+    #[serde(default)]
+    texture_style: TextureStyle,
     voice_led_bass: bool,
     voicing: VoicingStyle,
     live_grid: LiveGrid,
@@ -48,6 +52,8 @@ impl Session {
             clock_out: midi.clock_enabled(),
             voices: app.voices.map(|voice| voice.parameters),
             chord_hold: app.performer_engine.hold_length,
+            groove: app.performer_engine.groove,
+            texture_style: app.performer_engine.texture_style,
             voice_led_bass: app.performer_engine.voice_led_bass,
             voicing: app.voice_engine.style,
             live_grid: app.live_grid,
@@ -94,6 +100,8 @@ impl Session {
             voice.parameters = params;
         }
         app.performer_engine.hold_length = self.chord_hold;
+        app.performer_engine.groove = self.groove;
+        app.performer_engine.texture_style = self.texture_style;
         app.performer_engine.voice_led_bass = self.voice_led_bass;
         app.voice_engine.style = self.voicing;
         app.live_grid = self.live_grid;
@@ -236,6 +244,8 @@ mod tests {
         app.editor_grid = EditGrid::Eighth;
         app.voice_engine.style = VoicingStyle::Open;
         app.performer_engine.hold_length = ChordHold::Sixteen;
+        app.performer_engine.groove = Groove::LaidBack;
+        app.performer_engine.texture_style = TextureStyle::SparseEcho;
         app.voices[0].parameters.color = 0.7;
         midi.adjust_channel(0, 5).unwrap();
         midi.adjust_transpose(3, 12).unwrap();
@@ -262,6 +272,11 @@ mod tests {
         assert_eq!(restored.editor_grid, EditGrid::Eighth);
         assert_eq!(restored.voice_engine.style, VoicingStyle::Open);
         assert_eq!(restored.performer_engine.hold_length, ChordHold::Sixteen);
+        assert_eq!(restored.performer_engine.groove, Groove::LaidBack);
+        assert_eq!(
+            restored.performer_engine.texture_style,
+            TextureStyle::SparseEcho
+        );
         assert_eq!(restored.voices[0].parameters.color, 0.7);
         assert_eq!(restored.phrases, app.phrases);
         assert_eq!(restored.pending_chord, None);

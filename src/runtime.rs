@@ -40,7 +40,6 @@ pub(crate) struct Frame {
     scope: VoiceScope,
     recorder_status: RecorderStatus,
     next_recording_armed: bool,
-    quantize_beats: f64,
     phrase_count: usize,
     midi_destination: String,
     midi_clock: &'static str,
@@ -56,7 +55,14 @@ pub(crate) struct Frame {
     edit_grid: EditGrid,
     timing: String,
     beat_flash: Option<bool>,
-    options: String,
+    chord_gate: &'static str,
+    bass_arrival: &'static str,
+    groove: &'static str,
+    texture_role: &'static str,
+    panic_confirm: bool,
+    macro_targets: [bool; 4],
+    has_macro_group: bool,
+    live_grid: &'static str,
     voicing: VoicingStyle,
     pending_voicing: Option<VoicingStyle>,
     can_undo_phrase: bool,
@@ -96,7 +102,6 @@ impl Frame {
             scope: app.scope,
             recorder_status: app.recorder.status(),
             next_recording_armed: app.recorder.next_is_armed(),
-            quantize_beats: app.recorder.quantize_beats(),
             phrase_count: app.phrases.len(),
             midi_destination: midi.destination_name().to_owned(),
             midi_clock: if sync_status.mode == SyncMode::MidiIn {
@@ -131,25 +136,21 @@ impl Frame {
                         (at - now_beat).max(0.0)
                     )
                 });
-                format!("BEAT {pulse}  GRID {}{pending}", app.live_grid.label())
+                format!("BEAT {pulse}{pending}")
             },
             beat_flash: (sync_status.running && bar_phase.rem_euclid(beat) < beat * 0.22)
                 .then_some(beat_index == 0),
             voicing: app.voice_engine.style,
             pending_voicing: app.pending_voicing.map(|(style, _)| style),
             can_undo_phrase: app.can_undo_phrase(),
-            options: match app.setting_focus {
-                Some(SettingField::ChordHold) => {
-                    format!("CHORD HOLD {}", app.performer_engine.hold_label())
-                }
-                Some(SettingField::BassArrival) => {
-                    format!("BASS ARRIVAL {}", app.performer_engine.bass_label())
-                }
-                Some(SettingField::Voicing) => {
-                    format!("VOICING {}", app.voice_engine.style.label())
-                }
-                _ => String::new(),
-            },
+            chord_gate: app.performer_engine.hold_label(),
+            bass_arrival: app.performer_engine.bass_label(),
+            groove: app.performer_engine.groove.label(),
+            texture_role: app.performer_engine.texture_style.label(),
+            panic_confirm: app.panic_confirm,
+            macro_targets: app.macro_targets(),
+            has_macro_group: app.macro_group.iter().any(|&member| member),
+            live_grid: app.live_grid.label(),
         }
     }
 
@@ -161,8 +162,13 @@ impl Frame {
         &self,
         ui: &Ui,
         canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+        select_held: bool,
     ) -> Result<(), String> {
-        match self.screen {
+        match if self.setting_focus.is_some() {
+            Screen::Performance
+        } else {
+            self.screen
+        } {
             Screen::Performance => ui.draw_performance(
                 canvas,
                 PerformanceView {
@@ -170,7 +176,15 @@ impl Frame {
                     beat_flash: self.beat_flash,
                     settings: self.settings,
                     setting_focus: self.setting_focus,
-                    options: &self.options,
+                    chord_gate: self.chord_gate,
+                    bass_arrival: self.bass_arrival,
+                    groove: self.groove,
+                    texture_role: self.texture_role,
+                    panic_confirm: self.panic_confirm,
+                    macro_targets: self.macro_targets,
+                    has_macro_group: self.has_macro_group,
+                    live_grid: self.live_grid,
+                    select_held,
                     voicing: self.voicing,
                     pending_voicing: self.pending_voicing,
                     sync_status: self.sync_status,
@@ -186,7 +200,6 @@ impl Frame {
                     scope: self.scope,
                     recorder_status: self.recorder_status,
                     next_recording_armed: self.next_recording_armed,
-                    quantize_beats: self.quantize_beats,
                     phrase_count: self.phrase_count,
                     midi_destination: &self.midi_destination,
                     midi_clock: self.midi_clock,
@@ -211,6 +224,7 @@ impl Frame {
                     queued_phrase: self.queued_phrase,
                     edit_grid: self.edit_grid,
                     can_undo: self.can_undo_phrase,
+                    select_held,
                 },
             ),
         }
@@ -457,6 +471,7 @@ fn tick(
     if running_now != *was_running {
         if running_now {
             app.setting_focus = None;
+            app.panic_confirm = false;
             app.chord_started_beat = now_beat;
             app.performer_engine.transport_started(now_beat);
         } else {
@@ -502,6 +517,7 @@ fn tick(
             app.performer_engine.request_live_revoice();
             live_commit = true;
         }
+        app.performer_engine.set_phrase_position(playback.position);
         let phrase_next = playback.next_chord.zip(playback.next_chord_beat);
         let next = match (app.pending_chord, phrase_next) {
             (Some(a), Some(b)) => Some(if a.1 <= b.1 { a } else { b }),
@@ -688,7 +704,7 @@ mod tests {
         worker.action(InputAction::ToggleSettings).unwrap();
         assert_eq!(worker.input_page(), InputPage::Settings);
         worker.action(InputAction::MenuTap).unwrap();
-        assert_eq!(worker.input_page(), InputPage::Performance);
+        assert_eq!(worker.input_page(), InputPage::Editor);
         assert!(worker.action(InputAction::Quit).unwrap());
         worker.shutdown().unwrap();
     }
@@ -699,7 +715,7 @@ mod tests {
         worker.action(InputAction::ToggleTransport).unwrap();
         worker.action(InputAction::ToggleSettings).unwrap();
         worker.action(InputAction::NavigateRight).unwrap();
-        worker.action(InputAction::NavigateUp).unwrap();
+        worker.action(InputAction::ScopeNext).unwrap();
         let live = worker.snapshot().unwrap();
         assert_eq!(live.setting_focus, Some(SettingField::Tempo));
         assert_eq!(live.sync_status.tempo_bpm, 121.0);
@@ -719,17 +735,24 @@ mod tests {
         let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
         assert_eq!(worker.snapshot().unwrap().midi_clock, "CLOCK OUT OFF");
         worker.action(InputAction::ToggleSettings).unwrap();
-        for _ in 0..3 {
-            worker.action(InputAction::NavigateLeft).unwrap();
+        worker.action(InputAction::Tertiary).unwrap();
+        for _ in 0..5 {
+            worker.action(InputAction::NavigateDown).unwrap();
         }
-        worker.action(InputAction::NavigateUp).unwrap();
+        worker.action(InputAction::ScopeNext).unwrap();
         assert_eq!(worker.snapshot().unwrap().midi_clock, "CLOCK OUT READY");
-        worker.action(InputAction::NavigateRight).unwrap();
+        for _ in 0..3 {
+            worker.action(InputAction::NavigateDown).unwrap();
+        }
         assert_eq!(
             worker.snapshot().unwrap().setting_focus,
             Some(SettingField::MidiPanic)
         );
         worker.action(InputAction::Primary).unwrap();
+        assert!(worker.snapshot().unwrap().panic_confirm);
+        worker.action(InputAction::Primary).unwrap();
+        assert!(!worker.snapshot().unwrap().panic_confirm);
+        worker.action(InputAction::Secondary).unwrap();
         assert_eq!(worker.input_page(), InputPage::Performance);
         worker.action(InputAction::ToggleTransport).unwrap();
         thread::sleep(Duration::from_millis(50));
@@ -742,30 +765,84 @@ mod tests {
     }
 
     #[test]
+    fn macro_group_stays_pinned_and_buttons_use_the_highlight() {
+        use crate::voice::MacroKind;
+
+        let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
+        let initial = worker.snapshot().unwrap().voices;
+        for action in [
+            InputAction::ScopeNext,
+            InputAction::ToggleMacroMember,
+            InputAction::ScopeNext,
+            InputAction::ScopeNext,
+            InputAction::ToggleMacroMember,
+            InputAction::ScopeNext,
+            InputAction::AdjustMacro {
+                kind: MacroKind::Dynamics,
+                delta: 0.1,
+            },
+            InputAction::ToggleMute,
+        ] {
+            worker.action(action).unwrap();
+        }
+        let frame = worker.snapshot().unwrap();
+        assert_eq!(frame.macro_targets, [true, false, true, false]);
+        for (index, previous) in initial.into_iter().enumerate() {
+            let delta = if frame.macro_targets[index] { 0.1 } else { 0.0 };
+            assert!(
+                (frame.voices[index].parameters.dynamics - previous.parameters.dynamics - delta)
+                    .abs()
+                    < 0.0001
+            );
+            assert_eq!(frame.performer_snapshots[index].muted, index == 3);
+        }
+        worker.action(InputAction::ScopeNext).unwrap();
+        worker.action(InputAction::ToggleMacroMember).unwrap();
+        assert_eq!(worker.snapshot().unwrap().macro_targets, [true; 4]);
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn trigger_direction_stops_at_edges_and_can_return_to_neutral() {
+        let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
+        for delta in [-1, -1, 1, 1, 1, -1] {
+            worker.action(InputAction::DirectionStep(delta)).unwrap();
+        }
+        assert_eq!(
+            worker.snapshot().unwrap().direction,
+            HarmonicDirection::Neutral
+        );
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
     fn stopped_settings_assign_channels_and_midi_input_blocks_clock_out() {
         let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
         worker.action(InputAction::ToggleSettings).unwrap();
-        for _ in 0..8 {
-            worker.action(InputAction::NavigateLeft).unwrap();
+        worker.action(InputAction::Tertiary).unwrap();
+        for _ in 0..3 {
+            worker.action(InputAction::NavigateDown).unwrap();
         }
-        let settings = worker.snapshot().unwrap();
-        assert_eq!(settings.setting_focus, Some(SettingField::MidiChannel(3)));
-        worker.action(InputAction::NavigateUp).unwrap();
-        assert_eq!(worker.snapshot().unwrap().midi_channels, [1, 2, 3, 5]);
+        assert_eq!(
+            worker.snapshot().unwrap().setting_focus,
+            Some(SettingField::MidiChannel(3))
+        );
+        for _ in 0..3 {
+            worker.action(InputAction::ScopeNext).unwrap();
+        }
+        assert_eq!(worker.snapshot().unwrap().midi_channels, [1, 2, 3, 7]);
         worker.action(InputAction::NavigateRight).unwrap();
-        worker.action(InputAction::NavigateUp).unwrap();
+        for _ in 0..12 {
+            worker.action(InputAction::ScopeNext).unwrap();
+        }
         let transpose = worker.snapshot().unwrap();
         assert_eq!(
             transpose.setting_focus,
-            Some(SettingField::MidiTranspose(0))
+            Some(SettingField::MidiTranspose(3))
         );
-        assert_eq!(transpose.midi_transpose, [1, 0, 0, 0]);
-        worker.action(InputAction::MenuTap).unwrap();
-        worker.action(InputAction::ToggleSettings).unwrap();
-        for _ in 0..7 {
-            worker.action(InputAction::NavigateRight).unwrap();
-        }
-        worker.action(InputAction::NavigateUp).unwrap();
+        assert_eq!(transpose.midi_transpose, [0, 0, 0, 12]);
+        worker.action(InputAction::NavigateDown).unwrap();
+        worker.action(InputAction::ScopeNext).unwrap();
         let settings = worker.snapshot().unwrap();
         assert_eq!(settings.sync_status.mode, SyncMode::MidiIn);
         assert_eq!(settings.midi_clock, "CLOCK OUT BLOCKED");

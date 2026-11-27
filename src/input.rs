@@ -21,6 +21,8 @@ pub enum InputAction {
     BiasResolve,
     BiasNeutral,
     BiasTension,
+    DirectionStep(i32),
+    ToggleMacroMember,
     ScopePrevious,
     ScopeNext,
     AdjustMacro { kind: MacroKind, delta: f32 },
@@ -76,6 +78,7 @@ pub fn map_key(keycode: Keycode) -> Option<InputAction> {
             kind: MacroKind::Density,
             delta: 0.05,
         }),
+        Keycode::F4 => Some(ToggleMacroMember),
         Keycode::Y => Some(AdjustMacro {
             kind: MacroKind::Dynamics,
             delta: -0.05,
@@ -182,6 +185,11 @@ pub fn open_input_devices(
 fn map_event(event: &Event, page: InputPage) -> Option<InputAction> {
     match event {
         Event::KeyDown {
+            keycode: Some(Keycode::X),
+            repeat: false,
+            ..
+        } if page == InputPage::Settings => Some(InputAction::Tertiary),
+        Event::KeyDown {
             keycode: Some(keycode),
             repeat: false,
             ..
@@ -205,7 +213,7 @@ fn map_controller_button(button: Button, page: InputPage) -> Option<InputAction>
         Button::A => Some(Primary),
         Button::B => Some(Secondary),
         Button::X => Some(Tertiary),
-        Button::Y if page == InputPage::Performance => Some(BiasNeutral),
+        Button::Y if page == InputPage::Performance => Some(ToggleMacroMember),
         Button::Y if page == InputPage::Editor => Some(ToggleScreen),
         Button::Back => Some(ToggleSettings),
         Button::LeftStick => Some(LeftClick),
@@ -255,7 +263,6 @@ pub enum InputPage {
     Settings,
 }
 
-const TRIGGER_PAIR_WINDOW: Duration = Duration::from_millis(75);
 const MENU_HOLD: Duration = Duration::from_millis(700);
 const MACRO_TICK: Duration = Duration::from_millis(50);
 const AXIS_DEAD_ZONE: f32 = 0.12;
@@ -271,7 +278,6 @@ pub struct HandheldInput {
     menu_consumed: bool,
     axes: [i16; 6],
     triggers: [bool; 2],
-    pending_bias: Option<(usize, Instant)>,
     next_macro: Instant,
     hat: HatState,
 }
@@ -289,7 +295,6 @@ impl HandheldInput {
             menu_consumed: false,
             axes: [0, 0, i16::MIN, 0, 0, i16::MIN],
             triggers: [false; 2],
-            pending_bias: None,
             next_macro: now + MACRO_TICK,
             hat: HatState::Centered,
         }
@@ -307,26 +312,23 @@ impl HandheldInput {
                 keycode: Some(key),
                 repeat: false,
                 ..
-            } => {
-                let action = map_key(*key);
-                if action == Some(InputAction::BiasNeutral) {
-                    self.pending_bias = None;
-                }
-                action
-            }
+            } if *key == Keycode::X && page == InputPage::Settings => Some(InputAction::Tertiary),
+            Event::KeyDown {
+                keycode: Some(key),
+                repeat: false,
+                ..
+            } => map_key(*key),
             Event::JoyButtonDown {
                 which, button_idx, ..
             } if Some(*which) == self.instance => match *button_idx {
                 6 => {
                     self.select = true;
-                    self.pending_bias = None;
                     if self.menu_down.is_some() {
                         self.menu_consumed = true;
                     }
                     None
                 }
                 8 => {
-                    self.pending_bias = None;
                     if self.menu_down.is_none() {
                         self.menu_down = Some(now);
                         self.menu_consumed = self.select;
@@ -345,11 +347,7 @@ impl HandheldInput {
                     if button > 8 {
                         println!("INPUT: unassigned Brick button index {button}");
                     }
-                    let action = brick_button(page, button, self.select);
-                    if action == Some(InputAction::BiasNeutral) {
-                        self.pending_bias = None;
-                    }
-                    action
+                    brick_button(page, button, self.select)
                 }
             },
             Event::JoyButtonUp {
@@ -388,7 +386,7 @@ impl HandheldInput {
                     5 => 1,
                     _ => return None,
                 };
-                self.trigger(page, trigger, *value, now)
+                self.trigger(page, trigger, *value)
             }
             Event::JoyHatMotion { which, state, .. } if Some(*which) == self.instance => {
                 if *state == self.hat {
@@ -414,47 +412,26 @@ impl HandheldInput {
         }
     }
 
-    fn trigger(
-        &mut self,
-        page: InputPage,
-        trigger: usize,
-        value: i16,
-        now: Instant,
-    ) -> Option<InputAction> {
+    fn trigger(&mut self, page: InputPage, trigger: usize, value: i16) -> Option<InputAction> {
         use InputAction::*;
-        if page != InputPage::Performance {
-            self.pending_bias = None;
-        }
-        // Digital edges with hysteresis for SDL axes.
+        // Digital press edges with hysteresis.
         if value <= -16_384 {
             self.triggers[trigger] = false;
-            if self
-                .pending_bias
-                .is_some_and(|(button, _)| button == trigger)
-            {
-                self.pending_bias = None;
-                return trigger_action(page, trigger);
-            }
-            return None;
         }
         if value < 16_384 || self.triggers[trigger] {
             return None;
         }
         self.triggers[trigger] = true;
-        if page != InputPage::Performance {
-            return trigger_action(page, trigger);
+        match (page, self.select, trigger) {
+            (InputPage::Performance, true, 0) => Some(PatternHold),
+            (InputPage::Performance, true, _) => Some(CycleLiveGrid),
+            (InputPage::Editor, true, _) => None,
+            _ => trigger_action(page, trigger),
         }
-        if self.select {
-            return Some(if trigger == 0 { ToggleMute } else { ToggleSolo });
-        }
-        let previous = self.pending_bias.take();
-        if previous
-            .is_some_and(|(button, at)| button != trigger && self.triggers[button] && now <= at)
-        {
-            return Some(BiasNeutral);
-        }
-        self.pending_bias = Some((trigger, now + TRIGGER_PAIR_WINDOW));
-        previous.and_then(|(button, _)| trigger_action(page, button))
+    }
+
+    pub fn select_held(&self) -> bool {
+        self.select
     }
 
     /// Held Menu exits once, independent of frame rate. Relative stick changes
@@ -469,14 +446,6 @@ impl HandheldInput {
             self.menu_consumed = true;
             actions[0] = Some(InputAction::Quit);
             return actions;
-        }
-        if page != InputPage::Performance {
-            self.pending_bias = None;
-        } else if let Some((trigger, at)) = self.pending_bias
-            && now >= at
-        {
-            self.pending_bias = None;
-            actions[0] = trigger_action(page, trigger);
         }
         if now < self.next_macro {
             return actions;
@@ -526,8 +495,8 @@ fn stick_deflection(value: i16) -> f32 {
 fn trigger_action(page: InputPage, trigger: usize) -> Option<InputAction> {
     use InputAction::*;
     match (page, trigger) {
-        (InputPage::Performance, 0) => Some(BiasResolve),
-        (InputPage::Performance, 1) => Some(BiasTension),
+        (InputPage::Performance, 0) => Some(DirectionStep(-1)),
+        (InputPage::Performance, 1) => Some(DirectionStep(1)),
         (InputPage::Editor, 0) => Some(EditShorten),
         (InputPage::Editor, 1) => Some(EditExtend),
         _ => None,
@@ -551,17 +520,17 @@ fn brick_button(page: InputPage, button: u8, select: bool) -> Option<InputAction
         (InputPage::Performance, false, 1) => Some(Primary), // A
         (InputPage::Performance, false, 0) => Some(Secondary), // B
         (InputPage::Performance, false, 3) => Some(Tertiary), // X
-        (InputPage::Performance, false, 2) => Some(BiasNeutral), // Y
+        (InputPage::Performance, false, 2) => Some(ToggleMacroMember), // Y
         (InputPage::Performance, false, 4) => Some(ScopePrevious),
         (InputPage::Performance, false, 5) => Some(ScopeNext),
         (InputPage::Performance, true, 1) => Some(ToggleRecord),
         (InputPage::Performance, true, 0) => Some(ArmNextRecording),
         (InputPage::Performance, true, 3) => Some(ToggleSettings),
-        (InputPage::Performance, true, 4) => Some(PatternHold),
-        (InputPage::Performance, true, 5) => Some(CycleLiveGrid),
+        (InputPage::Performance, true, 4) => Some(ToggleMute),
+        (InputPage::Performance, true, 5) => Some(ToggleSolo),
         (InputPage::Performance, true, 2) => Some(Vary),
         (InputPage::Editor, true, 1) => Some(EditUndo),
-        (InputPage::Editor, true, 3) => Some(LeftClick),
+        (InputPage::Editor, true, 3) => Some(ToggleSettings),
         (InputPage::Editor, true, 0) => Some(RightClick),
         (InputPage::Editor, false, 1) => Some(Primary),
         (InputPage::Editor, false, 0) => Some(Secondary),
@@ -574,6 +543,9 @@ fn brick_button(page: InputPage, button: u8, select: bool) -> Option<InputAction
         (InputPage::Editor, true, 5) => Some(ZoomIn),
         (InputPage::Settings, false, 0) => Some(ToggleSettings),
         (InputPage::Settings, false, 1) => Some(Primary),
+        (InputPage::Settings, false, 3) => Some(Tertiary),
+        (InputPage::Settings, false, 4) => Some(ScopePrevious),
+        (InputPage::Settings, false, 5) => Some(ScopeNext),
         _ => None,
     }
 }
@@ -657,64 +629,25 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_triggers_choose_neutral_once_in_either_order() {
-        for first in [0, 1] {
-            let start = Instant::now();
-            let mut input = HandheldInput::new(Some(1), start);
-            let page = InputPage::Performance;
-            assert_eq!(input.trigger(page, first, i16::MAX, start), None);
-            let overlap = start + Duration::from_millis(35);
-            assert_eq!(
-                input.trigger(page, 1 - first, i16::MAX, overlap),
-                Some(InputAction::BiasNeutral)
-            );
-            assert_eq!(input.trigger(page, first, i16::MIN, overlap), None);
-            assert_eq!(input.trigger(page, 1 - first, i16::MIN, overlap), None);
-            assert!(
-                input
-                    .tick(page, start + TRIGGER_PAIR_WINDOW)
-                    .iter()
-                    .all(Option::is_none)
-            );
-        }
-    }
-
-    #[test]
-    fn trigger_taps_and_modified_press_edges_are_discrete() {
+    fn performance_trigger_edges_step_direction_or_control_pattern_and_grid() {
+        use InputAction::*;
         let start = Instant::now();
         let mut input = HandheldInput::new(Some(1), start);
         let page = InputPage::Performance;
-        assert_eq!(input.trigger(page, 0, i16::MAX, start), None);
-        assert_eq!(
-            input.trigger(page, 0, i16::MIN, start + Duration::from_millis(25)),
-            Some(InputAction::BiasResolve)
-        );
-        assert_eq!(input.trigger(page, 1, i16::MAX, start), None);
-        assert_eq!(
-            input.tick(page, start + TRIGGER_PAIR_WINDOW)[0],
-            Some(InputAction::BiasTension)
-        );
-
-        input.trigger(page, 1, i16::MIN, start + TRIGGER_PAIR_WINDOW);
+        assert_eq!(input.trigger(page, 0, i16::MAX), Some(DirectionStep(-1)));
+        assert_eq!(input.trigger(page, 0, i16::MAX), None);
+        assert_eq!(input.trigger(page, 0, i16::MIN), None);
+        assert_eq!(input.trigger(page, 1, i16::MAX), Some(DirectionStep(1)));
+        input.trigger(page, 1, i16::MIN);
         input.select = true;
-        assert_eq!(
-            input.trigger(page, 0, i16::MAX, start),
-            Some(InputAction::ToggleMute)
-        );
-        assert_eq!(
-            input.trigger(page, 1, i16::MAX, start),
-            Some(InputAction::ToggleSolo)
-        );
-        assert!(
-            input
-                .tick(page, start + TRIGGER_PAIR_WINDOW)
-                .iter()
-                .all(Option::is_none)
-        );
+        assert_eq!(input.trigger(page, 0, i16::MAX), Some(PatternHold));
+        assert_eq!(input.trigger(page, 1, i16::MAX), Some(CycleLiveGrid));
+        assert_eq!(brick_button(page, 4, true), Some(ToggleMute));
+        assert_eq!(brick_button(page, 5, true), Some(ToggleSolo));
     }
 
     #[test]
-    fn brick_stick_clicks_and_controller_neutral_are_page_aware() {
+    fn brick_stick_clicks_and_macro_group_are_page_aware() {
         let now = Instant::now();
         let mut input = HandheldInput {
             left_click: 11,
@@ -734,12 +667,10 @@ mod tests {
             input.event(&down(12), InputPage::Editor, now),
             Some(InputAction::RightClick)
         );
-        input.trigger(InputPage::Performance, 0, i16::MAX, now);
         assert_eq!(
             input.event(&down(2), InputPage::Performance, now),
-            Some(InputAction::BiasNeutral)
+            Some(InputAction::ToggleMacroMember)
         );
-        assert!(input.pending_bias.is_none());
         input.event(&down(6), InputPage::Performance, now);
         assert_eq!(
             input.event(&down(12), InputPage::Performance, now),
@@ -751,7 +682,7 @@ mod tests {
         );
         assert_eq!(
             map_controller_button(Button::Y, InputPage::Performance),
-            Some(InputAction::BiasNeutral)
+            Some(InputAction::ToggleMacroMember)
         );
         assert_eq!(
             map_controller_button(Button::Y, InputPage::Editor),

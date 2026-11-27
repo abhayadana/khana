@@ -48,14 +48,6 @@ pub enum VoiceScope {
 }
 
 impl VoiceScope {
-    /// Compact scope label.
-    pub fn label(self) -> String {
-        match self {
-            Self::All => "ALL".to_owned(),
-            Self::One(index) => format!("{}", index + 1),
-        }
-    }
-
     /// Selects the next voice scope.
     pub const fn next(self) -> Self {
         match self {
@@ -120,10 +112,6 @@ impl VoiceEngine {
     /// Revoices the current harmony without creating a new harmonic event.
     pub fn revoice(&mut self, chord: Chord, voices: &[Voice; 4]) -> VoiceRender {
         self.render(chord, voices)
-    }
-
-    pub fn cycle_style(&mut self, direction: i32) {
-        self.style = self.style.next(direction);
     }
 
     fn render(&mut self, chord: Chord, voices: &[Voice; 4]) -> VoiceRender {

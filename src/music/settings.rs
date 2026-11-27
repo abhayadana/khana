@@ -257,65 +257,65 @@ pub enum SettingField {
     MidiTranspose(usize),
     ChordHold,
     BassArrival,
-    Voicing,
+    Groove,
+    TextureStyle,
     MidiClockOut,
     MidiPanic,
     MidiOutput,
 }
 
 impl SettingField {
-    pub const ALL: [Self; 20] = [
-        Self::Tonic,
-        Self::Mode,
-        Self::Tempo,
-        Self::Meter,
-        Self::ChordHold,
-        Self::BassArrival,
-        Self::Voicing,
-        Self::Sync,
-        Self::StartStopSync,
-        Self::MidiChannel(0),
-        Self::MidiChannel(1),
-        Self::MidiChannel(2),
-        Self::MidiChannel(3),
-        Self::MidiTranspose(0),
-        Self::MidiTranspose(1),
-        Self::MidiTranspose(2),
-        Self::MidiTranspose(3),
-        Self::MidiClockOut,
-        Self::MidiPanic,
-        Self::MidiOutput,
+    pub const MUSIC: [(Self, &'static str); 8] = [
+        (Self::Tonic, "TONIC"),
+        (Self::Mode, "MODE"),
+        (Self::Tempo, "TEMPO"),
+        (Self::Meter, "METER"),
+        (Self::ChordHold, "CHORD GATE"),
+        (Self::BassArrival, "BASS ARRIVAL"),
+        (Self::Groove, "GROOVE"),
+        (Self::TextureStyle, "TEXTURE ROLE"),
+    ];
+    pub const RIG: [(Self, &'static str); 5] = [
+        (Self::Sync, "CLOCK SOURCE"),
+        (Self::MidiClockOut, "MIDI CLOCK OUT"),
+        (Self::StartStopSync, "LINK START/STOP"),
+        (Self::MidiOutput, "MIDI OUTPUT"),
+        (Self::MidiPanic, "MIDI PANIC"),
     ];
 
-    pub const fn is_rig(self) -> bool {
-        matches!(
-            self,
-            Self::Sync
-                | Self::StartStopSync
-                | Self::MidiChannel(_)
-                | Self::MidiTranspose(_)
-                | Self::MidiClockOut
-                | Self::MidiPanic
-                | Self::MidiOutput
-        )
+    pub fn is_rig(self) -> bool {
+        matches!(self, Self::MidiChannel(_) | Self::MidiTranspose(_))
+            || Self::RIG.iter().any(|(field, _)| *field == self)
     }
 
-    /// Moves focus one field to the right.
-    pub fn next(self) -> Self {
-        let index = Self::ALL
-            .iter()
-            .position(|candidate| *candidate == self)
-            .unwrap_or(0);
-        Self::ALL[(index + 1) % Self::ALL.len()]
-    }
+    pub fn move_cursor(self, rows: i32, columns: i32) -> Self {
+        if !self.is_rig() {
+            let row = Self::MUSIC
+                .iter()
+                .position(|(field, _)| *field == self)
+                .unwrap_or(0);
+            return Self::MUSIC
+                [(row as i32 + rows).clamp(0, Self::MUSIC.len() as i32 - 1) as usize]
+                .0;
+        }
 
-    /// Moves focus one field to the left.
-    pub fn previous(self) -> Self {
-        let index = Self::ALL
-            .iter()
-            .position(|candidate| *candidate == self)
-            .unwrap_or(0);
-        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+        let (row, column) = match self {
+            Self::MidiChannel(row) => (row, 0),
+            Self::MidiTranspose(row) => (row, 1),
+            field => (
+                4 + Self::RIG
+                    .iter()
+                    .position(|(item, _)| *item == field)
+                    .unwrap_or(0),
+                0,
+            ),
+        };
+        let row = (row as i32 + rows).clamp(0, 3 + Self::RIG.len() as i32) as usize;
+        match (row, (column + columns).clamp(0, 1)) {
+            (0..=3, 0) => Self::MidiChannel(row),
+            (0..=3, _) => Self::MidiTranspose(row),
+            _ => Self::RIG[row - 4].0,
+        }
     }
 }
 

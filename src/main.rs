@@ -51,6 +51,7 @@ struct App {
     screen: Screen,
     settings: MusicalSettings,
     setting_focus: Option<SettingField>,
+    panic_confirm: bool,
     current_chord: Chord,
     chord_started_beat: f64,
     current_render: VoiceRender,
@@ -65,6 +66,7 @@ struct App {
     performer_engine: PerformerEngine,
     voices: [Voice; 4],
     scope: VoiceScope,
+    macro_group: [bool; 4],
     recorder: PhraseRecorder,
     phrase_player: PhrasePlayer,
     phrases: Vec<Phrase>,
@@ -107,6 +109,7 @@ impl App {
             screen: Screen::Performance,
             settings,
             setting_focus: None,
+            panic_confirm: false,
             current_chord,
             chord_started_beat: 0.0,
             current_render,
@@ -121,6 +124,7 @@ impl App {
             performer_engine,
             voices,
             scope: VoiceScope::All,
+            macro_group: [false; 4],
             recorder: PhraseRecorder::new(),
             phrase_player: PhrasePlayer::new(),
             phrases: Vec::new(),
@@ -132,6 +136,23 @@ impl App {
             live_grid: LiveGrid::Immediate,
             pending_chord: None,
             pending_voicing: None,
+        }
+    }
+
+    fn macro_targets(&self) -> [bool; 4] {
+        if self.macro_group.iter().any(|&member| member) {
+            self.macro_group
+        } else {
+            std::array::from_fn(|index| {
+                self.scope == VoiceScope::All || self.scope == VoiceScope::One(index)
+            })
+        }
+    }
+
+    fn set_direction(&mut self, direction: HarmonicDirection) {
+        if self.direction != direction {
+            self.direction = direction;
+            self.refresh_recommendations();
         }
     }
 
@@ -449,7 +470,7 @@ fn main() -> Result<(), String> {
         // The worker owns all mutable music state. The renderer holds only a
         // snapshot, so a slow SDL present cannot delay its clock or MIDI poll.
         let frame = worker.snapshot()?;
-        frame.draw(&ui, &mut canvas)?;
+        frame.draw(&ui, &mut canvas, brick && handheld.select_held())?;
         canvas.present();
         max_render = max_render.max(render_now.elapsed());
         if render_now.duration_since(last_report) >= Duration::from_secs(5) {
@@ -488,6 +509,17 @@ fn dispatch_action(
     }
     if action == InputAction::ToggleTransport {
         toggle_transport(app, transport);
+    } else if let Some(field) = app.setting_focus {
+        handle_setting_action(action, field, app, transport, midi)?;
+    } else if action == InputAction::ToggleSettings {
+        let playing = transport.is_running() || transport.start_pending();
+        app.setting_focus = if !playing {
+            Some(SettingField::Tonic)
+        } else if transport.mode() == SyncMode::Internal {
+            Some(SettingField::Tempo)
+        } else {
+            None
+        };
     } else {
         match app.screen {
             Screen::Performance => handle_performance_action(action, app, transport, midi)?,
@@ -499,6 +531,7 @@ fn dispatch_action(
 
 fn toggle_transport(app: &mut App, transport: &mut SyncTransport) {
     app.setting_focus = None;
+    app.panic_confirm = false;
     if transport.start_pending() {
         app.phrase_player.stop();
         app.recorder.cancel_pending_start();
@@ -516,12 +549,8 @@ fn handle_performance_action(
     action: InputAction,
     app: &mut App,
     transport: &mut SyncTransport,
-    midi: &mut MidiEngine,
+    _midi: &mut MidiEngine,
 ) -> Result<(), String> {
-    if let Some(field) = app.setting_focus {
-        return handle_setting_action(action, field, app, transport, midi);
-    }
-
     let now_beat = transport.beat(app.settings.meter.beats_per_bar());
 
     match action {
@@ -586,18 +615,23 @@ fn handle_performance_action(
             app.surprise = true;
             app.refresh_recommendations();
         }
-        InputAction::BiasResolve => {
-            app.direction = HarmonicDirection::Resolve;
-            app.refresh_recommendations();
+        InputAction::BiasResolve => app.set_direction(HarmonicDirection::Resolve),
+        InputAction::BiasNeutral => app.set_direction(HarmonicDirection::Neutral),
+        InputAction::BiasTension => app.set_direction(HarmonicDirection::Tension),
+        InputAction::DirectionStep(step) => {
+            use HarmonicDirection::*;
+            let direction = match (app.direction, step.signum()) {
+                (Neutral, -1) => Resolve,
+                (Neutral, 1) => Tension,
+                (Resolve, 1) | (Tension, -1) => Neutral,
+                (direction, _) => direction,
+            };
+            app.set_direction(direction);
         }
-        InputAction::BiasNeutral => {
-            app.direction = HarmonicDirection::Neutral;
-            app.refresh_recommendations();
-        }
-        InputAction::BiasTension => {
-            app.direction = HarmonicDirection::Tension;
-            app.refresh_recommendations();
-        }
+        InputAction::ToggleMacroMember => match app.scope {
+            VoiceScope::All => app.macro_group = [false; 4],
+            VoiceScope::One(index) => app.macro_group[index] = !app.macro_group[index],
+        },
         InputAction::ScopePrevious => {
             app.scope = app.scope.previous();
         }
@@ -605,11 +639,15 @@ fn handle_performance_action(
             app.scope = app.scope.next();
         }
         InputAction::AdjustMacro { kind, delta } => {
-            let bass_density_changed = kind == MacroKind::Density
-                && matches!(app.scope, VoiceScope::All | VoiceScope::One(0));
-            adjust_macro(&mut app.voices, app.scope, kind, delta);
-
-            if kind == MacroKind::Spread || bass_density_changed {
+            let targets = app.macro_targets();
+            for (index, selected) in targets.into_iter().enumerate() {
+                if selected {
+                    adjust_macro(&mut app.voices, VoiceScope::One(index), kind, delta);
+                }
+            }
+            if (kind == MacroKind::Spread && targets[1])
+                || (kind == MacroKind::Density && targets[0])
+            {
                 app.revoice_current();
             }
         }
@@ -634,13 +672,6 @@ fn handle_performance_action(
             app.screen = Screen::PhraseEditor;
             app.clamp_editor_selection();
         }
-        InputAction::ToggleSettings if !transport.is_running() && !transport.start_pending() => {
-            app.setting_focus = Some(SettingField::Tonic);
-        }
-        InputAction::ToggleSettings if transport.mode() == SyncMode::Internal => {
-            app.setting_focus = Some(SettingField::Tempo);
-        }
-        InputAction::ToggleSettings => {}
         _ => {}
     }
 
@@ -655,24 +686,40 @@ fn handle_setting_action(
     midi: &mut MidiEngine,
 ) -> Result<(), String> {
     let running = transport.is_running() || transport.start_pending();
-    match action {
-        InputAction::Primary if !running && field == SettingField::MidiPanic => {
+    if action == InputAction::Primary && !running && field == SettingField::MidiPanic {
+        if std::mem::take(&mut app.panic_confirm) {
             midi.panic()?;
-            app.setting_focus = None;
+        } else {
+            app.panic_confirm = true;
         }
-        InputAction::ToggleSettings | InputAction::Primary => {
-            app.setting_focus = None;
+        return Ok(());
+    }
+    if std::mem::take(&mut app.panic_confirm)
+        && matches!(action, InputAction::ToggleSettings | InputAction::Secondary)
+    {
+        return Ok(());
+    }
+    match action {
+        InputAction::ToggleSettings | InputAction::Secondary => app.setting_focus = None,
+        InputAction::Tertiary if !running => {
+            app.setting_focus = Some(if field.is_rig() {
+                SettingField::Tonic
+            } else {
+                SettingField::MidiChannel(0)
+            });
         }
-        InputAction::NavigateLeft if !running => {
-            app.setting_focus = Some(field.previous());
-        }
-        InputAction::NavigateRight if !running => {
-            app.setting_focus = Some(field.next());
-        }
-        InputAction::NavigateUp if !running || live_tempo(field, transport) => {
+        InputAction::NavigateLeft if !running => app.setting_focus = Some(field.move_cursor(0, -1)),
+        InputAction::NavigateRight if !running => app.setting_focus = Some(field.move_cursor(0, 1)),
+        InputAction::NavigateUp if !running => app.setting_focus = Some(field.move_cursor(-1, 0)),
+        InputAction::NavigateDown if !running => app.setting_focus = Some(field.move_cursor(1, 0)),
+        InputAction::ScopeNext | InputAction::ZoomIn
+            if !running || live_tempo(field, transport) =>
+        {
             adjust_setting(1, field, app, transport, midi)?;
         }
-        InputAction::NavigateDown if !running || live_tempo(field, transport) => {
+        InputAction::ScopePrevious | InputAction::ZoomOut
+            if !running || live_tempo(field, transport) =>
+        {
             adjust_setting(-1, field, app, transport, midi)?;
         }
         _ => {}
@@ -759,9 +806,11 @@ fn adjust_setting(
         SettingField::MidiTranspose(voice) => midi.adjust_transpose(voice, direction)?,
         SettingField::ChordHold => app.performer_engine.cycle_hold_length(direction),
         SettingField::BassArrival => app.performer_engine.toggle_bass_arrival(),
-        SettingField::Voicing => {
-            app.voice_engine.cycle_style(direction);
-            app.revoice_current();
+        SettingField::Groove => {
+            app.performer_engine.groove = app.performer_engine.groove.next(direction)
+        }
+        SettingField::TextureStyle => {
+            app.performer_engine.texture_style = app.performer_engine.texture_style.next(direction)
         }
         SettingField::MidiPanic => {}
         SettingField::MidiOutput => {
@@ -864,11 +913,6 @@ fn handle_editor_action(
         InputAction::ZoomIn => {
             app.editor_zoom = (app.editor_zoom + 12.0).min(180.0);
         }
-        InputAction::ToggleSettings if !transport.is_running() && !transport.start_pending() => {
-            app.screen = Screen::Performance;
-            app.setting_focus = Some(SettingField::Tonic);
-        }
-        InputAction::ToggleSettings => {}
         _ => {}
     }
 
@@ -919,7 +963,7 @@ fn print_controls() {
     println!("  X       reroll same vocabulary");
     println!("  S       surprise / broaden vocabulary");
     println!("  Q/E/W   Resolve / Neutral / Tension bias");
-    println!("  C/V     previous / next voice scope");
+    println!("  C/V     previous / next performer; F4 macro group");
     println!("  T/G     density -/+");
     println!("  Y/H     dynamics -/+");
     println!("  U/J     spread -/+");
@@ -928,9 +972,9 @@ fn print_controls() {
     println!("  N       arm next phrase");
     println!("  M       settings (stopped), or tempo (playing on internal clock)");
     println!("SETTINGS:");
-    println!("  Left/Right field   Up/Down value   Z/M exit");
-    println!("  MIDI Rig: from Tonic, Left once. Channel, transpose, MIDI In/Out, Link");
-    println!("  MIDI PANIC: Z sends on assigned channels");
+    println!("  Arrows select value; -/= change; X switches tab; M exits");
+    println!("  MIDI Rig: Channel, transpose, MIDI In/Out, Link");
+    println!("  MIDI PANIC: Z reviews, Z again sends on assigned channels");
     println!("PERFORMERS:");
     println!("  Bass CHD | Chords BAR | Texture 2BAR | Melody PHR");
     println!("PHRASE EDITOR:");
@@ -948,13 +992,13 @@ fn print_controls() {
     println!("BRICK PRO:");
     println!("  MENU tap: page, hold: exit; never SELECT+MENU");
     println!("  Performance: A commit B reroll X surprise L/R1 scope");
-    println!("  L2 Resolve, L2+R2 or Y Neutral, R2 Tension");
+    println!("  L2/R2 step direction; Y toggles macro group membership");
     println!("  SELECT+A record, SELECT+B arm next, SELECT+X settings / live internal tempo");
     println!("  Sticks: left X/Y density/dynamics, right X/Y spread/color");
-    println!("  Performance: L3 Sustain, R3 voicing, SELECT+L/R2 Mute/Solo");
-    println!("  SELECT+L/R1 Pattern Hold/live grid, SELECT+R3 or SELECT+Y Vary");
+    println!("  Performance: L3 Sustain, R3 voicing, SELECT+L/R1 Mute/Solo");
+    println!("  SELECT+L/R2 Pattern Hold/live grid, SELECT+R3 or SELECT+Y Vary");
     println!("  Editor: A play B change X duplicate Y back; SELECT+Y delete");
-    println!("  Editor: L3 or SELECT+X Loop, R3 or SELECT+B clear queue, SELECT+A Undo");
+    println!("  Editor: L3 Loop, R3 clear queue, SELECT+A Undo, SELECT+X Setup");
     println!("  L/R1 phrase, L/R2 duration, SELECT+L/R1 zoom, D-pad grid/event");
 }
 

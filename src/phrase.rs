@@ -274,10 +274,6 @@ impl PhraseRecorder {
             .saturating_add(1);
     }
 
-    pub const fn quantize_beats(&self) -> f64 {
-        self.quantize_beats
-    }
-
     pub const fn next_is_armed(&self) -> bool {
         self.arm_next
     }
@@ -396,6 +392,23 @@ struct ScheduledPhrase {
     start_beat: f64,
 }
 
+/// Position within the current pass, in quarter-note beats.
+#[derive(Clone, Copy, Debug)]
+pub struct PhrasePosition {
+    pub elapsed: f64,
+    pub remaining: f64,
+}
+
+impl PhrasePosition {
+    pub fn opening(self, bar: f64) -> bool {
+        self.elapsed < (bar / 2.0).min((self.elapsed + self.remaining) / 4.0)
+    }
+
+    pub fn closing(self, bar: f64) -> bool {
+        self.remaining <= bar.min((self.elapsed + self.remaining) / 2.0)
+    }
+}
+
 /// Result of one phrase-player update.
 #[derive(Debug, Default)]
 pub struct PhrasePlaybackUpdate {
@@ -404,6 +417,7 @@ pub struct PhrasePlaybackUpdate {
     pub next_chord: Option<Chord>,
     pub next_chord_beat: Option<f64>,
     pub ended: bool,
+    pub position: Option<PhrasePosition>,
 }
 
 /// Semantic phrase player supporting one-shot playback, loops, and bar-quantized replacement.
@@ -538,6 +552,10 @@ impl PhrasePlayer {
             self.playing = Some(playing);
         }
 
+        let position = (!ended).then_some(PhrasePosition {
+            elapsed: now_beat - playing.started_beat,
+            remaining: playing.started_beat + duration - now_beat,
+        });
         let (chord, chord_beat) = current.unzip();
         PhrasePlaybackUpdate {
             chord,
@@ -545,6 +563,7 @@ impl PhrasePlayer {
             next_chord,
             next_chord_beat,
             ended,
+            position,
         }
     }
 }
@@ -682,10 +701,14 @@ mod tests {
         let last = player.update(&phrases, 5.0);
         assert_eq!(last.chord, Some(d_minor()));
         assert_eq!(last.next_chord_beat, Some(6.3));
+        assert!(last.position.unwrap().remaining > 1.29);
+        assert!(!last.position.unwrap().closing(4.0));
         let seam = player.update(&phrases, 6.3);
         assert_eq!(seam.chord, Some(c_major()));
         assert_eq!(seam.chord_beat, Some(6.3));
         assert!(!seam.ended);
+        assert_eq!(seam.position.unwrap().elapsed, 0.0);
+        assert!(seam.position.unwrap().opening(4.0));
         player.request(1, 6.5, 4.0);
         assert_eq!(player.update(&phrases, 7.31).next_chord_beat, Some(8.0));
         assert_eq!(player.update(&phrases, 8.0).chord, Some(d_minor()));
