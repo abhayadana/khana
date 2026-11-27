@@ -243,16 +243,18 @@ pub enum SettingField {
     Meter,
     Sync,
     StartStopSync,
+    MidiOutput,
 }
 
 impl SettingField {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Tonic,
         Self::Mode,
         Self::Tempo,
         Self::Meter,
         Self::Sync,
         Self::StartStopSync,
+        Self::MidiOutput,
     ];
 
     /// Moves focus one field to the right.

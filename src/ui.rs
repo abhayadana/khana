@@ -88,6 +88,17 @@ impl Ui {
         canvas.clear();
 
         draw_header(canvas, settings, setting_focus, sync_status, "PERFORMANCE")?;
+        if setting_focus == Some(SettingField::MidiOutput) {
+            let label: String = midi_destination.chars().take(42).collect();
+            draw_text(
+                canvas,
+                360,
+                52,
+                &format!("MIDI OUTPUT: {label}"),
+                1,
+                accent(),
+            )?;
+        }
 
         draw_panel(canvas, Rect::new(32, 82, 250, 220), panel())?;
         draw_text(canvas, 54, 100, "CURRENT", 2, dim_text())?;
@@ -384,7 +395,7 @@ fn draw_header(
         },
     )?;
 
-    if focus.is_some() {
+    if focus.is_some() && focus != Some(SettingField::MidiOutput) {
         let link_text = if sync_status.link_available {
             format!(
                 "SETTINGS  STARTSYNC {}",

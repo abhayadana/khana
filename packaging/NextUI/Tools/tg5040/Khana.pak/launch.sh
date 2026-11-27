@@ -8,8 +8,9 @@ cd "$PAK_DIR"
 export KHANA_BRICK=1
 export KHANA_MIDI_BACKEND="${KHANA_MIDI_BACKEND:-raw}"
 export BRICK_UI_FPS="${BRICK_UI_FPS:-30}"
-# Preserve NextUI's SDL environment. Do not force an unverified video backend.
-echo "Khana v0.11.3 NextUI launch"
+# Use the firmware's native SDL2; preserve the existing search path and video backend.
+export LD_LIBRARY_PATH="/usr/trimui/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+echo "Khana v0.11.4 NextUI launch"
 date
 printf 'PAK=%s PLATFORM=%s SDL_VIDEODRIVER=%s UI_FPS=%s\n' "$PAK_DIR" "${PLATFORM:-unknown}" "${SDL_VIDEODRIVER:-auto}" "$BRICK_UI_FPS"
 if [ ! -x ./khana ]; then

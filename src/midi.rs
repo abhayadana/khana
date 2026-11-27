@@ -221,7 +221,20 @@ impl MidiEngine {
         }
     }
 
-    /// Poll raw output on the control loop, not only on rendered frames. Ownership is
+    /// Cycle the raw destination only while transport is stopped.
+    pub fn cycle_raw_destination(&mut self, direction: i32) -> Result<(), String> {
+        if !matches!(self.connection, MidiSink::Raw(_)) {
+            println!("MIDI destination selection is available on the raw backend");
+            return Ok(());
+        }
+        self.stop_all()?;
+        if let MidiSink::Raw(output) = &mut self.connection {
+            output.cycle(direction);
+        }
+        Ok(())
+    }
+
+    /// Poll raw output on the music worker, not on rendered frames. Ownership is
     /// invalid after a connection fault; old attacks are never replayed.
     pub fn service(&mut self) {
         if let MidiSink::Raw(output) = &mut self.connection {

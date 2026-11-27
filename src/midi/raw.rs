@@ -17,7 +17,7 @@ const QUEUE_CAPACITY: usize = 128;
 const O_NONBLOCK: i32 = 0x800;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Identity {
+pub(super) struct Identity {
     card_id: String,
     device: u32,
     usb_id: String,
@@ -29,12 +29,82 @@ pub(super) struct RawPort {
     path: PathBuf,
     identity: Identity,
     output: bool,
+    input: bool,
+    directions_known: bool,
+    product: String,
+    output_owner: Option<u32>,
 }
 
 impl RawPort {
     fn label(&self) -> String {
-        format!("{} ({})", self.identity.card_id, self.path.display())
+        if self.product.is_empty() || self.product == self.identity.card_id {
+            format!("{} ({})", self.identity.card_id, self.path.display())
+        } else {
+            format!(
+                "{} [{}] ({})",
+                self.product,
+                self.identity.card_id,
+                self.path.display()
+            )
+        }
     }
+
+    fn kind(&self) -> &'static str {
+        if !self.identity.usb_id.is_empty() {
+            "USB"
+        } else if self
+            .identity
+            .location
+            .to_string_lossy()
+            .contains("/virtual/")
+            || self
+                .identity
+                .card_id
+                .to_ascii_lowercase()
+                .starts_with("virmidi")
+        {
+            "VIRTUAL"
+        } else {
+            "OTHER / UNKNOWN"
+        }
+    }
+
+    fn direction_label(&self) -> &'static str {
+        if !self.directions_known {
+            "UNKNOWN"
+        } else if self.output && self.input {
+            "IN / OUT"
+        } else if self.output {
+            "OUT"
+        } else {
+            "INPUT ONLY"
+        }
+    }
+}
+
+/// ALSA procfs reports each substream separately. Owner PID in an input
+/// section must not be reported as the output owner.
+fn port_details(text: &str) -> (bool, bool, Option<u32>) {
+    let mut output = false;
+    let mut input = false;
+    let mut in_output = false;
+    let mut owner = None;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with("Output ") {
+            output = true;
+            in_output = true;
+        } else if line.starts_with("Input ") {
+            input = true;
+            in_output = false;
+        } else if in_output
+            && owner.is_none()
+            && let Some((key, value)) = line.split_once(':')
+            && key.trim() == "Owner PID"
+        {
+            owner = value.trim().parse().ok();
+        }
+    }
+    (output, input, owner)
 }
 
 fn read_trimmed(path: impl AsRef<Path>) -> String {
@@ -71,9 +141,18 @@ pub(super) fn discover() -> io::Result<Vec<RawPort>> {
         }
         let directions = read_trimmed(format!("{card_dir}/midi{device}"));
         // Unknown direction is not evidence of input-only. Try the open.
-        let output = directions.contains("Output") || !directions.contains("Input");
+        let (has_output, input, output_owner) = port_details(&directions);
+        let directions_known = has_output || input;
+        let output = has_output || !directions_known;
+        let product = directions
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
         let usb_id = read_trimmed(format!("{card_dir}/usbid"));
         let location = fs::canonicalize(format!("/sys/class/sound/card{card}/device"))
+            .or_else(|_| fs::canonicalize(format!("/sys/class/sound/card{card}")))
             .unwrap_or_else(|_| path.clone());
         ports.push(RawPort {
             path,
@@ -84,6 +163,10 @@ pub(super) fn discover() -> io::Result<Vec<RawPort>> {
                 location,
             },
             output,
+            input,
+            directions_known,
+            product,
+            output_owner,
         });
     }
     ports.sort_by(|left, right| left.path.cmp(&right.path));
@@ -96,14 +179,13 @@ pub(super) fn list() {
             println!("Raw MIDI device nodes: {}", ports.len());
             for port in ports {
                 println!(
-                    "  {} [{}] USB {}",
+                    "  {} [{}] {} {}{}",
                     port.label(),
-                    if port.output {
-                        "OUT / UNKNOWN"
-                    } else {
-                        "INPUT ONLY"
-                    },
-                    port.identity.usb_id
+                    port.direction_label(),
+                    port.kind(),
+                    port.identity.usb_id,
+                    port.output_owner
+                        .map_or_else(String::new, |pid| format!(" owner PID {pid}"))
                 );
             }
         }
@@ -111,11 +193,13 @@ pub(super) fn list() {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) enum Selection {
     Auto,
     Name(String),
     Path(PathBuf),
+    Identity(Identity),
+    Off,
 }
 
 fn select<'a>(
@@ -123,15 +207,20 @@ fn select<'a>(
     selection: &Selection,
     pinned: Option<&Identity>,
 ) -> Result<&'a RawPort, &'static str> {
+    let prefer_usb = pinned.is_none()
+        && matches!(selection, Selection::Auto)
+        && ports.iter().any(|port| port.output && port.kind() == "USB");
     let mut matches = ports.iter().filter(|port| {
         port.output
             && if let Some(identity) = pinned {
                 &port.identity == identity
             } else {
                 match selection {
-                    Selection::Auto => true,
+                    Selection::Auto => !prefer_usb || port.kind() == "USB",
                     Selection::Name(name) => port.label().to_lowercase().contains(name),
                     Selection::Path(path) => &port.path == path,
+                    Selection::Identity(identity) => &port.identity == identity,
+                    Selection::Off => false,
                 }
             }
     });
@@ -248,6 +337,56 @@ impl RawOutput {
         Ok(())
     }
 
+    /// Called only after the MIDI engine has flushed owned note releases.
+    pub(super) fn cycle(&mut self, direction: i32) {
+        let ports = match discover() {
+            Ok(ports) => ports,
+            Err(error) => {
+                eprintln!("MIDI selection scan failed: {error}");
+                Vec::new()
+            }
+        };
+        let mut choices = vec![Selection::Auto];
+        choices.extend(
+            ports
+                .iter()
+                .filter(|port| port.output)
+                .map(|port| Selection::Identity(port.identity.clone())),
+        );
+        choices.push(Selection::Off);
+        let current = choices
+            .iter()
+            .position(|choice| choice == &self.selection)
+            .or_else(|| {
+                self.pinned.as_ref().and_then(|identity| {
+                    choices
+                        .iter()
+                        .position(|choice| choice == &Selection::Identity(identity.clone()))
+                })
+            })
+            .unwrap_or(0);
+        let next = if direction > 0 {
+            (current + 1) % choices.len()
+        } else {
+            (current + choices.len() - 1) % choices.len()
+        };
+        if self.needs_cleanup {
+            eprintln!("MIDI: previous device may require external panic after disconnect");
+        }
+        self.file = None;
+        self.bound_path = None;
+        self.queue.clear();
+        self.pinned = None;
+        self.needs_cleanup = false;
+        self.selection = choices.swap_remove(next);
+        self.next_scan = Instant::now();
+        if matches!(self.selection, Selection::Off) {
+            self.set_label("RAW OFF".to_owned());
+        } else {
+            self.service(Instant::now());
+        }
+    }
+
     fn bind(&mut self, now: Instant) {
         self.next_scan = now + RESCAN;
         let ports = match discover() {
@@ -260,7 +399,14 @@ impl RawOutput {
         let port = match select(&ports, &self.selection, self.pinned.as_ref()) {
             Ok(port) => port,
             Err(reason) => {
-                self.set_label(format!("RAW WAIT: {reason}"));
+                let target = match &self.selection {
+                    Selection::Auto => "AUTO".to_owned(),
+                    Selection::Name(name) => name.clone(),
+                    Selection::Path(path) => path.display().to_string(),
+                    Selection::Identity(identity) => identity.card_id.clone(),
+                    Selection::Off => "OFF".to_owned(),
+                };
+                self.set_label(format!("RAW WAIT {target}: {reason}"));
                 return;
             }
         };
@@ -273,7 +419,12 @@ impl RawOutput {
                 self.pinned = Some(port.identity.clone());
                 self.file = Some(file);
                 self.bound_path = Some(port.path.clone());
-                self.set_label(format!("RAW: {}", port.label()));
+                let mode = if matches!(self.selection, Selection::Auto) {
+                    "AUTO"
+                } else {
+                    "SELECT"
+                };
+                self.set_label(format!("RAW {mode}: {}", port.label()));
                 // Only after a fault, on the previously pinned device. Clear
                 // potentially orphaned notes on Khaṇa's four channels before
                 // sending any new attacks. Never replay old musical events.
@@ -288,7 +439,12 @@ impl RawOutput {
                     self.needs_cleanup = false;
                 }
             }
-            Err(error) => self.set_label(format!("RAW WAIT: {error}")),
+            Err(error) => {
+                let owner = port
+                    .output_owner
+                    .map_or_else(String::new, |pid| format!(" (owner PID {pid})"));
+                self.set_label(format!("RAW WAIT {}: {error}{owner}", port.label()));
+            }
         }
     }
 
@@ -303,6 +459,9 @@ impl RawOutput {
     }
 
     pub(super) fn service(&mut self, now: Instant) {
+        if matches!(self.selection, Selection::Off) {
+            return;
+        }
         if now >= self.next_scan {
             self.next_scan = now + RESCAN;
             if self.connected() {
@@ -439,6 +598,10 @@ mod tests {
                 location: PathBuf::from(location),
             },
             output: true,
+            input: true,
+            directions_known: true,
+            product: String::new(),
+            output_owner: None,
         }
     }
 
@@ -462,6 +625,33 @@ mod tests {
         let selected = select(&ports, &Selection::Auto, Some(&original.identity)).unwrap();
         assert_eq!(selected.path, PathBuf::from("/dev/snd/midiC3D0"));
         assert!(select(&ports[..1], &Selection::Auto, Some(&original.identity)).is_err());
+    }
+
+    #[test]
+    fn proc_directions_and_output_owner_are_reported() {
+        let text = "QT-2host\n\nOutput 0\n  Owner PID    : 4091\nInput 0\n  Owner PID    : 22\n";
+        assert_eq!(port_details(text), (true, true, Some(4091)));
+        assert_eq!(
+            port_details("Input 0\n Owner PID : 22"),
+            (false, true, None)
+        );
+        assert_eq!(port_details(""), (false, false, None));
+    }
+
+    #[test]
+    fn virtual_ports_are_not_usb_and_auto_prefers_physical_usb() {
+        let mut virtual_port = port(0, "VirMIDI", "/devices/virtual/sound/card0");
+        virtual_port.identity.usb_id.clear();
+        assert_eq!(virtual_port.kind(), "VIRTUAL");
+        let ports = [virtual_port, port(1, "QT2host", "/usb/1")];
+        assert_eq!(
+            select(&ports, &Selection::Auto, None)
+                .unwrap()
+                .identity
+                .card_id,
+            "QT2host"
+        );
+        assert!(select(&ports, &Selection::Off, None).is_err());
     }
 
     #[test]

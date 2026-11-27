@@ -1,0 +1,1317 @@
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,4 +1,4 @@
+-//! Khaṇa v0.11.3 raw MIDI platform.
++//! Khaṇa v0.11.4 independent musical runtime.
+ //!
+ //! v0.11 adds complete semantic chord voicings, rhythmic/gated Melody phrases,
+ //! persistent cyclic Texture, and lightweight performer-to-performer awareness.
+@@ -7,8 +7,9 @@
+ mod midi;
+ mod music;
+ mod performer;
+-mod phrase;
+-mod sync;
++mod phrase;
++mod runtime;
++mod sync;
+ mod ui;
+ mod voice;
+ 
+@@ -26,7 +27,7 @@
+ use phrase::{EditGrid, Phrase, PhrasePlayer, PhraseRecorder};
+ use sdl2::event::Event;
+ use sync::{SyncMode, SyncTransport};
+-use ui::{PerformanceView, PhraseEditorView, Ui};
++use ui::Ui;
+ use voice::{MacroKind, Voice, VoiceEngine, VoiceRender, VoiceScope, adjust_macro, default_voices};
+ 
+ const WINDOW_WIDTH: u32 = 1024;
+@@ -332,195 +333,84 @@
+         );
+     }
+ 
+-    let ui = Ui::new(WINDOW_WIDTH, brick);
+-    let mut app = App::new();
+-    let mut transport = SyncTransport::new(app.settings.tempo_bpm);
+-    let mut midi = MidiEngine::configured(brick)?;
+-    let mut was_running = false;
+-
+-    print_controls();
+-    let mut next_render = Instant::now();
+-    let mut last_poll = next_render;
+-    let mut last_report = next_render;
+-    let mut max_gap = Duration::ZERO;
+-    let mut max_render = Duration::ZERO;
+-
+-    'running: loop {
+-        let poll = Instant::now();
+-        midi.service();
+-        max_gap = max_gap.max(poll.duration_since(last_poll));
+-        last_poll = poll;
+-        if poll.duration_since(last_report) >= Duration::from_secs(5) {
+-            let (expired, late_beats) = app.performer_engine.take_timing_diagnostics();
+-            println!(
+-                "DIAG poll {:.2} ms | render {:.2} ms | expired attacks {} | max attack lateness {:.4} beats | active MIDI {:?}",
+-                max_gap.as_secs_f64() * 1000.0,
+-                max_render.as_secs_f64() * 1000.0,
+-                expired,
+-                late_beats,
+-                midi.active_counts()
+-            );
+-            midi.report();
+-            max_gap = Duration::ZERO;
+-            max_render = Duration::ZERO;
+-            last_report = poll;
+-        }
+-        let now_beat = transport.beat(app.settings.meter.beats_per_bar());
+-        let running_now = transport.is_running();
+-
+-        if running_now != was_running {
+-            if running_now {
+-                app.chord_started_beat = now_beat;
+-                app.performer_engine.transport_started(now_beat);
+-            } else {
+-                app.phrase_player.stop();
+-                app.performer_engine.transport_stopped();
+-                midi.stop_all()?;
+-            }
+-            was_running = running_now;
+-        }
+-
+-        if running_now {
+-            if let Some(phrase) = app.recorder.update(now_beat, app.current_chord) {
+-                println!(
+-                    "CAPTURED P{:02}: {} events, {:.1} beats",
+-                    phrase.id,
+-                    phrase.events.len(),
+-                    phrase.duration_beats()
+-                );
+-                app.phrases.push(phrase);
+-                app.editor_phrase_index = app.phrases.len().saturating_sub(1);
+-                app.editor_event_index = 0;
+-            }
+-
+-            let playback = app.phrase_player.update(&app.phrases, now_beat);
+-
+-            if let Some(chord) = playback.chord {
+-                app.set_harmony(chord, now_beat, true, false);
+-            }
+-            app.performer_engine
+-                .set_next_chord_target(playback.next_chord, playback.next_chord_beat);
+-
+-            if playback.ended && app.phrase_player.queued_phrase().is_none() {
+-                app.performer_engine.set_enabled(false);
+-                midi.stop_all()?;
+-            }
+-
+-            app.update_performers(now_beat, &mut midi)?;
+-        }
+-        // Deliver freshly queued bytes before SDL input/rendering can stall.
+-        midi.service();
+-
+-        for event in event_pump.poll_iter() {
+-            if matches!(event, Event::Quit { .. }) {
+-                break 'running;
+-            }
+-            if input_log
+-                && matches!(
+-                    event,
+-                    Event::JoyButtonDown { .. }
+-                        | Event::JoyButtonUp { .. }
+-                        | Event::JoyAxisMotion { .. }
+-                        | Event::JoyHatMotion { .. }
+-                        | Event::ControllerButtonDown { .. }
+-                        | Event::KeyDown { .. }
+-                )
+-            {
+-                println!("INPUT {event:?}");
+-            }
+-            let action = if brick {
+-                handheld.event(&event, app.input_page(), Instant::now())
+-            } else {
+-                desktop_event(&event, &controllers)
+-            };
+-            if let Some(action) = action
+-                && dispatch_action(action, &mut app, &mut transport, &mut midi)?
+-            {
+-                break 'running;
+-            }
+-        }
+-        if brick {
+-            for action in handheld
+-                .tick(app.input_page(), Instant::now())
+-                .into_iter()
+-                .flatten()
+-            {
+-                if dispatch_action(action, &mut app, &mut transport, &mut midi)? {
+-                    break 'running;
+-                }
+-            }
+-        }
+-
+-        // Render only when due; do not sleep for the entire UI frame budget.
+-        let render_now = Instant::now();
+-        if render_now < next_render {
+-            thread::sleep(Duration::from_millis(1));
+-            continue;
+-        }
+-        next_render = render_now + frame_period;
+-
+-        let now_beat = transport.beat(app.settings.meter.beats_per_bar());
+-
+-        match app.screen {
+-            Screen::Performance => {
+-                let sync_status = transport.status();
+-                app.settings.tempo_bpm = sync_status.tempo_bpm;
+-
+-                ui.draw_performance(
+-                    &mut canvas,
+-                    PerformanceView {
+-                        settings: app.settings,
+-                        setting_focus: app.setting_focus,
+-                        sync_status,
+-                        current_chord: app.current_chord,
+-                        chord_elapsed_beats: now_beat - app.chord_started_beat,
+-                        current_render: app.current_render,
+-                        recommendations: &app.recommendations,
+-                        selected_class: app.selected_class,
+-                        selected_row: app.selected_row,
+-                        direction: app.direction,
+-                        voices: &app.voices,
+-                        performer_snapshots: app.performer_engine.snapshots(),
+-                        scope: app.scope,
+-                        recorder_status: app.recorder.status(),
+-                        next_recording_armed: app.recorder.next_is_armed(),
+-                        quantize_beats: app.recorder.quantize_beats(),
+-                        phrase_count: app.phrases.len(),
+-                        midi_destination: midi.destination_name(),
+-                    },
+-                )?;
+-            }
+-            Screen::PhraseEditor => {
+-                let sync_status = transport.status();
+-                app.settings.tempo_bpm = sync_status.tempo_bpm;
+-
+-                ui.draw_phrase_editor(
+-                    &mut canvas,
+-                    PhraseEditorView {
+-                        settings: app.settings,
+-                        sync_status,
+-                        phrase: app.selected_phrase(),
+-                        phrase_index: app.editor_phrase_index,
+-                        phrase_count: app.phrases.len(),
+-                        selected_event: app.editor_event_index,
+-                        pixels_per_beat: app.editor_zoom,
+-                        playing_phrase: app.phrase_player.playing_phrase(),
+-                        queued_phrase: app.phrase_player.queued_phrase(),
+-                        edit_grid: app.editor_grid,
+-                    },
+-                )?;
+-            }
+-        }
+-
+-        canvas.present();
+-        max_render = max_render.max(render_now.elapsed());
+-        thread::sleep(Duration::from_millis(1));
+-    }
+-
+-    midi.stop_all()?;
+-    println!("Khaṇa exited cleanly.");
+-    Ok(())
+-}
++    let ui = Ui::new(WINDOW_WIDTH, brick);
++    let mut worker = runtime::Worker::spawn(brick)?;
++    print_controls();
++    let mut next_render = Instant::now();
++    let mut last_report = next_render;
++    let mut max_render = Duration::ZERO;
++
++    'running: loop {
++        for event in event_pump.poll_iter() {
++            if matches!(event, Event::Quit { .. }) {
++                break 'running;
++            }
++            if input_log
++                && matches!(
++                    event,
++                    Event::JoyButtonDown { .. }
++                        | Event::JoyButtonUp { .. }
++                        | Event::JoyAxisMotion { .. }
++                        | Event::JoyHatMotion { .. }
++                        | Event::ControllerButtonDown { .. }
++                        | Event::KeyDown { .. }
++                )
++            {
++                println!("INPUT {event:?}");
++            }
++            let action = if brick {
++                handheld.event(&event, worker.input_page(), Instant::now())
++            } else {
++                desktop_event(&event, &controllers)
++            };
++            if let Some(action) = action
++                && worker.action(action)?
++            {
++                break 'running;
++            }
++        }
++        if brick {
++            for action in handheld
++                .tick(worker.input_page(), Instant::now())
++                .into_iter()
++                .flatten()
++            {
++                if worker.action(action)? {
++                    break 'running;
++                }
++            }
++        }
++
++        // Render only when due; do not sleep for the entire UI frame budget.
++        let render_now = Instant::now();
++        if render_now < next_render {
++            thread::sleep(Duration::from_millis(1));
++            continue;
++        }
++        next_render = render_now + frame_period;
++
++        // The worker owns all mutable music state. The renderer holds only a
++        // snapshot, so a slow SDL present cannot delay its clock or MIDI poll.
++        let frame = worker.snapshot()?;
++        frame.draw(&ui, &mut canvas)?;
++        canvas.present();
++        max_render = max_render.max(render_now.elapsed());
++        if render_now.duration_since(last_report) >= Duration::from_secs(5) {
++            let (ticks, active) = frame.diagnostics();
++            println!(
++                "UI DIAG render {:.2} ms | music ticks {ticks} | active MIDI {active:?}",
++                max_render.as_secs_f64() * 1000.0
++            );
++            max_render = Duration::ZERO;
++            last_report = render_now;
++        }
++        thread::sleep(Duration::from_millis(1));
++    }
++
++    worker.shutdown()?;
++    println!("Khaṇa exited cleanly.");
++    Ok(())
++}
+ 
+ /// Returns true for a clean application exit, regardless of input source.
+ fn dispatch_action(
+@@ -735,10 +625,15 @@
+ 
+             app.settings.tempo_bpm = transport.tempo();
+         }
+-        SettingField::StartStopSync => {
+-            let status = transport.status();
+-            transport.set_link_start_stop_sync(!status.link_start_stop_sync);
+-        }
++        SettingField::StartStopSync => {
++            let status = transport.status();
++            transport.set_link_start_stop_sync(!status.link_start_stop_sync);
++        }
++        SettingField::MidiOutput => {
++            if !transport.is_running() {
++                midi.cycle_raw_destination(direction)?;
++            }
++        }
+     }
+ 
+     Ok(())
+diff --git a/src/music/settings.rs b/src/music/settings.rs
+--- a/src/music/settings.rs
++++ b/src/music/settings.rs
+@@ -242,18 +242,20 @@
+     Tempo,
+     Meter,
+     Sync,
+-    StartStopSync,
+-}
+-
+-impl SettingField {
+-    pub const ALL: [Self; 6] = [
++    StartStopSync,
++    MidiOutput,
++}
++
++impl SettingField {
++    pub const ALL: [Self; 7] = [
+         Self::Tonic,
+         Self::Mode,
+         Self::Tempo,
+         Self::Meter,
+         Self::Sync,
+-        Self::StartStopSync,
+-    ];
++        Self::StartStopSync,
++        Self::MidiOutput,
++    ];
+ 
+     /// Moves focus one field to the right.
+     pub fn next(self) -> Self {
+diff --git a/src/ui.rs b/src/ui.rs
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -87,7 +87,11 @@
+         canvas.set_draw_color(background());
+         canvas.clear();
+ 
+-        draw_header(canvas, settings, setting_focus, sync_status, "PERFORMANCE")?;
++        draw_header(canvas, settings, setting_focus, sync_status, "PERFORMANCE")?;
++        if setting_focus == Some(SettingField::MidiOutput) {
++            let label: String = midi_destination.chars().take(42).collect();
++            draw_text(canvas, 360, 52, &format!("MIDI OUTPUT: {label}"), 1, accent())?;
++        }
+ 
+         draw_panel(canvas, Rect::new(32, 82, 250, 220), panel())?;
+         draw_text(canvas, 54, 100, "CURRENT", 2, dim_text())?;
+@@ -384,8 +388,8 @@
+         },
+     )?;
+ 
+-    if focus.is_some() {
+-        let link_text = if sync_status.link_available {
++    if focus.is_some() && focus != Some(SettingField::MidiOutput) {
++        let link_text = if sync_status.link_available {
+             format!(
+                 "SETTINGS  STARTSYNC {}",
+                 if sync_status.link_start_stop_sync {
+diff --git a/src/midi.rs b/src/midi.rs
+--- a/src/midi.rs
++++ b/src/midi.rs
+@@ -221,7 +221,20 @@
+         }
+     }
+ 
+-    /// Poll raw output on the control loop, not only on rendered frames. Ownership is
++    /// Cycle the raw destination only while transport is stopped.
++    pub fn cycle_raw_destination(&mut self, direction: i32) -> Result<(), String> {
++        if !matches!(self.connection, MidiSink::Raw(_)) {
++            println!("MIDI destination selection is available on the raw backend");
++            return Ok(());
++        }
++        self.stop_all()?;
++        if let MidiSink::Raw(output) = &mut self.connection {
++            output.cycle(direction);
++        }
++        Ok(())
++    }
++
++    /// Poll raw output on the music worker, not on rendered frames. Ownership is
+     /// invalid after a connection fault; old attacks are never replayed.
+     pub fn service(&mut self) {
+         if let MidiSink::Raw(output) = &mut self.connection {
+diff --git a/src/midi/raw.rs b/src/midi/raw.rs
+--- a/src/midi/raw.rs
++++ b/src/midi/raw.rs
+@@ -17,7 +17,7 @@
+ const O_NONBLOCK: i32 = 0x800;
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+-struct Identity {
++pub(super) struct Identity {
+     card_id: String,
+     device: u32,
+     usb_id: String,
+@@ -28,14 +28,71 @@
+ pub(super) struct RawPort {
+     path: PathBuf,
+     identity: Identity,
+-    output: bool,
+-}
+-
+-impl RawPort {
+-    fn label(&self) -> String {
+-        format!("{} ({})", self.identity.card_id, self.path.display())
+-    }
+-}
++    output: bool,
++    input: bool,
++    directions_known: bool,
++    product: String,
++    output_owner: Option<u32>,
++}
++
++impl RawPort {
++    fn label(&self) -> String {
++        if self.product.is_empty() || self.product == self.identity.card_id {
++            format!("{} ({})", self.identity.card_id, self.path.display())
++        } else {
++            format!("{} [{}] ({})", self.product, self.identity.card_id, self.path.display())
++        }
++    }
++
++    fn kind(&self) -> &'static str {
++        if !self.identity.usb_id.is_empty() {
++            "USB"
++        } else if self.identity.location.to_string_lossy().contains("/virtual/")
++            || self.identity.card_id.to_ascii_lowercase().starts_with("virmidi")
++        {
++            "VIRTUAL"
++        } else {
++            "OTHER / UNKNOWN"
++        }
++    }
++
++    fn direction_label(&self) -> &'static str {
++        if !self.directions_known {
++            "UNKNOWN"
++        } else if self.output && self.input {
++            "IN / OUT"
++        } else if self.output {
++            "OUT"
++        } else {
++            "INPUT ONLY"
++        }
++    }
++}
++
++/// ALSA procfs reports each substream separately. Owner PID in an input
++/// section must not be reported as the output owner.
++fn port_details(text: &str) -> (bool, bool, Option<u32>) {
++    let mut output = false;
++    let mut input = false;
++    let mut in_output = false;
++    let mut owner = None;
++    for line in text.lines().map(str::trim) {
++        if line.starts_with("Output ") {
++            output = true;
++            in_output = true;
++        } else if line.starts_with("Input ") {
++            input = true;
++            in_output = false;
++        } else if in_output
++            && owner.is_none()
++            && let Some((key, value)) = line.split_once(':')
++            && key.trim() == "Owner PID"
++        {
++            owner = value.trim().parse().ok();
++        }
++    }
++    (output, input, owner)
++}
+ 
+ fn read_trimmed(path: impl AsRef<Path>) -> String {
+     fs::read_to_string(path)
+@@ -71,10 +128,14 @@
+         }
+         let directions = read_trimmed(format!("{card_dir}/midi{device}"));
+         // Unknown direction is not evidence of input-only. Try the open.
+-        let output = directions.contains("Output") || !directions.contains("Input");
+-        let usb_id = read_trimmed(format!("{card_dir}/usbid"));
+-        let location = fs::canonicalize(format!("/sys/class/sound/card{card}/device"))
+-            .unwrap_or_else(|_| path.clone());
++        let (has_output, input, output_owner) = port_details(&directions);
++        let directions_known = has_output || input;
++        let output = has_output || !directions_known;
++        let product = directions.lines().next().unwrap_or_default().trim().to_owned();
++        let usb_id = read_trimmed(format!("{card_dir}/usbid"));
++        let location = fs::canonicalize(format!("/sys/class/sound/card{card}/device"))
++            .or_else(|_| fs::canonicalize(format!("/sys/class/sound/card{card}")))
++            .unwrap_or_else(|_| path.clone());
+         ports.push(RawPort {
+             path,
+             identity: Identity {
+@@ -83,8 +144,12 @@
+                 usb_id,
+                 location,
+             },
+-            output,
+-        });
++            output,
++            input,
++            directions_known,
++            product,
++            output_owner,
++        });
+     }
+     ports.sort_by(|left, right| left.path.cmp(&right.path));
+     Ok(ports)
+@@ -96,14 +161,12 @@
+             println!("Raw MIDI device nodes: {}", ports.len());
+             for port in ports {
+                 println!(
+-                    "  {} [{}] USB {}",
+-                    port.label(),
+-                    if port.output {
+-                        "OUT / UNKNOWN"
+-                    } else {
+-                        "INPUT ONLY"
+-                    },
+-                    port.identity.usb_id
++                    "  {} [{}] {} {}{}",
++                    port.label(),
++                    port.direction_label(),
++                    port.kind(),
++                    port.identity.usb_id,
++                    port.output_owner.map_or_else(String::new, |pid| format!(" owner PID {pid}"))
+                 );
+             }
+         }
+@@ -111,27 +174,34 @@
+     }
+ }
+ 
+-#[derive(Debug)]
+-pub(super) enum Selection {
+-    Auto,
+-    Name(String),
+-    Path(PathBuf),
+-}
++#[derive(Debug, Clone, Eq, PartialEq)]
++pub(super) enum Selection {
++    Auto,
++    Name(String),
++    Path(PathBuf),
++    Identity(Identity),
++    Off,
++}
+ 
+ fn select<'a>(
+     ports: &'a [RawPort],
+     selection: &Selection,
+     pinned: Option<&Identity>,
+ ) -> Result<&'a RawPort, &'static str> {
+-    let mut matches = ports.iter().filter(|port| {
++    let prefer_usb = pinned.is_none()
++        && matches!(selection, Selection::Auto)
++        && ports.iter().any(|port| port.output && port.kind() == "USB");
++    let mut matches = ports.iter().filter(|port| {
+         port.output
+             && if let Some(identity) = pinned {
+                 &port.identity == identity
+             } else {
+                 match selection {
+-                    Selection::Auto => true,
+-                    Selection::Name(name) => port.label().to_lowercase().contains(name),
+-                    Selection::Path(path) => &port.path == path,
++                    Selection::Auto => !prefer_usb || port.kind() == "USB",
++                    Selection::Name(name) => port.label().to_lowercase().contains(name),
++                    Selection::Path(path) => &port.path == path,
++                    Selection::Identity(identity) => &port.identity == identity,
++                    Selection::Off => false,
+                 }
+             }
+     });
+@@ -248,7 +318,49 @@
+         Ok(())
+     }
+ 
+-    fn bind(&mut self, now: Instant) {
++    /// Called only after the MIDI engine has flushed owned note releases.
++    pub(super) fn cycle(&mut self, direction: i32) {
++        let ports = match discover() {
++            Ok(ports) => ports,
++            Err(error) => {
++                eprintln!("MIDI selection scan failed: {error}");
++                Vec::new()
++            }
++        };
++        let mut choices = vec![Selection::Auto];
++        choices.extend(
++            ports.iter().filter(|port| port.output)
++                .map(|port| Selection::Identity(port.identity.clone())),
++        );
++        choices.push(Selection::Off);
++        let current = choices.iter().position(|choice| choice == &self.selection)
++            .or_else(|| self.pinned.as_ref().and_then(|identity| {
++                choices.iter().position(|choice| choice == &Selection::Identity(identity.clone()))
++            }))
++            .unwrap_or(0);
++        let next = if direction > 0 {
++            (current + 1) % choices.len()
++        } else {
++            (current + choices.len() - 1) % choices.len()
++        };
++        if self.needs_cleanup {
++            eprintln!("MIDI: previous device may require external panic after disconnect");
++        }
++        self.file = None;
++        self.bound_path = None;
++        self.queue.clear();
++        self.pinned = None;
++        self.needs_cleanup = false;
++        self.selection = choices.swap_remove(next);
++        self.next_scan = Instant::now();
++        if matches!(self.selection, Selection::Off) {
++            self.set_label("RAW OFF".to_owned());
++        } else {
++            self.service(Instant::now());
++        }
++    }
++
++    fn bind(&mut self, now: Instant) {
+         self.next_scan = now + RESCAN;
+         let ports = match discover() {
+             Ok(ports) => ports,
+@@ -260,20 +372,32 @@
+         let port = match select(&ports, &self.selection, self.pinned.as_ref()) {
+             Ok(port) => port,
+             Err(reason) => {
+-                self.set_label(format!("RAW WAIT: {reason}"));
++                let target = match &self.selection {
++                    Selection::Auto => "AUTO".to_owned(),
++                    Selection::Name(name) => name.clone(),
++                    Selection::Path(path) => path.display().to_string(),
++                    Selection::Identity(identity) => identity.card_id.clone(),
++                    Selection::Off => "OFF".to_owned(),
++                };
++                self.set_label(format!("RAW WAIT {target}: {reason}"));
+                 return;
+             }
+         };
+         match OpenOptions::new()
+             .write(true)
+             .custom_flags(O_NONBLOCK)
+             .open(&port.path)
+         {
+             Ok(file) => {
+                 self.pinned = Some(port.identity.clone());
+                 self.file = Some(file);
+                 self.bound_path = Some(port.path.clone());
+-                self.set_label(format!("RAW: {}", port.label()));
++                let mode = if matches!(self.selection, Selection::Auto) {
++                    "AUTO"
++                } else {
++                    "SELECT"
++                };
++                self.set_label(format!("RAW {mode}: {}", port.label()));
+                 // Only after a fault, on the previously pinned device. Clear
+                 // potentially orphaned notes on Khaṇa's four channels before
+                 // sending any new attacks. Never replay old musical events.
+@@ -288,7 +412,10 @@
+                     self.needs_cleanup = false;
+                 }
+             }
+-            Err(error) => self.set_label(format!("RAW WAIT: {error}")),
++            Err(error) => {
++                let owner = port.output_owner.map_or_else(String::new, |pid| format!(" (owner PID {pid})"));
++                self.set_label(format!("RAW WAIT {}: {error}{owner}", port.label()));
++            }
+         }
+     }
+ 
+@@ -302,8 +429,11 @@
+         self.set_label(format!("RAW LOST: {error}"));
+     }
+ 
+-    pub(super) fn service(&mut self, now: Instant) {
+-        if now >= self.next_scan {
++    pub(super) fn service(&mut self, now: Instant) {
++        if matches!(self.selection, Selection::Off) {
++            return;
++        }
++        if now >= self.next_scan {
+             self.next_scan = now + RESCAN;
+             if self.connected() {
+                 // Detect unplug even during silence. Never switch to another
+@@ -438,8 +568,12 @@
+                 usb_id: "1234:5678".to_owned(),
+                 location: PathBuf::from(location),
+             },
+-            output: true,
+-        }
++            output: true,
++            input: true,
++            directions_known: true,
++            product: String::new(),
++            output_owner: None,
++        }
+     }
+ 
+     #[test]
+@@ -464,8 +598,26 @@
+         assert!(select(&ports[..1], &Selection::Auto, Some(&original.identity)).is_err());
+     }
+ 
+-    #[test]
+-    fn device_names_exclude_non_midi_nodes() {
++    #[test]
++    fn proc_directions_and_output_owner_are_reported() {
++        let text = "QT-2host\n\nOutput 0\n  Owner PID    : 4091\nInput 0\n  Owner PID    : 22\n";
++        assert_eq!(port_details(text), (true, true, Some(4091)));
++        assert_eq!(port_details("Input 0\n Owner PID : 22"), (false, true, None));
++        assert_eq!(port_details(""), (false, false, None));
++    }
++
++    #[test]
++    fn virtual_ports_are_not_usb_and_auto_prefers_physical_usb() {
++        let mut virtual_port = port(0, "VirMIDI", "/devices/virtual/sound/card0");
++        virtual_port.identity.usb_id.clear();
++        assert_eq!(virtual_port.kind(), "VIRTUAL");
++        let ports = [virtual_port, port(1, "QT2host", "/usb/1")];
++        assert_eq!(select(&ports, &Selection::Auto, None).unwrap().identity.card_id, "QT2host");
++        assert!(select(&ports, &Selection::Off, None).is_err());
++    }
++
++    #[test]
++    fn device_names_exclude_non_midi_nodes() {
+         assert_eq!(device_numbers("midiC12D3"), Some((12, 3)));
+         for name in ["seq", "controlC1", "pcmC1D0p", "midiCD0", "midiC1D0x"] {
+             assert_eq!(device_numbers(name), None);
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "khana"
+-version = "0.11.3"
++version = "0.11.4"
+ edition = "2024"
+ 
+ [features]
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -336,8 +336,8 @@
+ ]
+ 
+ [[package]]
+-name = "khana"
+-version = "0.11.3"
++name = "khana"
++version = "0.11.4"
+ dependencies = [
+  "midir",
+  "rusty_link",
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,8 @@
+-# Khaṇa v0.11.3
+-
++# Khaṇa v0.11.4
++
++See [v0.11.4 musical timing worker](docs/BRICK_V0.11.4.md) for thread ownership,
++MIDI output selection, NextUI runtime setup and acceptance tests.
++
+ See [v0.11.3 raw MIDI platform](docs/BRICK_V0.11.3.md) for the new Brick default,
+ device selection, reconnection behavior, build flags and hardware tests.
+ 
+diff --git a/packaging/NextUI/Tools/tg5040/Khana.pak/launch.sh b/packaging/NextUI/Tools/tg5040/Khana.pak/launch.sh
+--- a/packaging/NextUI/Tools/tg5040/Khana.pak/launch.sh
++++ b/packaging/NextUI/Tools/tg5040/Khana.pak/launch.sh
+@@ -8,8 +8,9 @@
+ export KHANA_BRICK=1
+ export KHANA_MIDI_BACKEND="${KHANA_MIDI_BACKEND:-raw}"
+ export BRICK_UI_FPS="${BRICK_UI_FPS:-30}"
+-# Preserve NextUI's SDL environment. Do not force an unverified video backend.
+-echo "Khana v0.11.3 NextUI launch"
++# Use the firmware's native SDL2; preserve the existing search path and video backend.
++export LD_LIBRARY_PATH="/usr/trimui/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
++echo "Khana v0.11.4 NextUI launch"
+ date
+ printf 'PAK=%s PLATFORM=%s SDL_VIDEODRIVER=%s UI_FPS=%s\n' "$PAK_DIR" "${PLATFORM:-unknown}" "${SDL_VIDEODRIVER:-auto}" "$BRICK_UI_FPS"
+ if [ ! -x ./khana ]; then
+diff --git a/packaging/NextUI/Tools/tg5040/Khana.pak/pak.json b/packaging/NextUI/Tools/tg5040/Khana.pak/pak.json
+--- a/packaging/NextUI/Tools/tg5040/Khana.pak/pak.json
++++ b/packaging/NextUI/Tools/tg5040/Khana.pak/pak.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "Khana",
+-  "version": "0.11.3",
++  "version": "0.11.4",
+   "type": "tool",
+   "platform": "tg5040",
+   "description": "Performance-oriented MIDI harmony and phrase instrument"
+diff --git a/src/runtime.rs b/src/runtime.rs
+new file mode 100644
+--- /dev/null
++++ b/src/runtime.rs
+@@ -0,0 +1,396 @@
++//! Musical runtime: SDL never owns or locks the clock, performer, or MIDI sink.
++
++use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
++use std::thread::{self, JoinHandle};
++use std::time::{Duration, Instant};
++
++use crate::input::{InputAction, InputPage};
++use crate::midi::MidiEngine;
++use crate::music::chord::Chord;
++use crate::music::recommendation::{HarmonicDirection, RecommendationClass, RecommendationSet};
++use crate::music::settings::{MusicalSettings, SettingField};
++use crate::performer::PerformerSnapshot;
++use crate::phrase::{EditGrid, Phrase, RecorderStatus};
++use crate::sync::{SyncStatus, SyncTransport};
++use crate::ui::{PerformanceView, PhraseEditorView, Ui};
++use crate::voice::{Voice, VoiceRender, VoiceScope};
++use crate::{App, Screen, dispatch_action};
++
++const POLL_PERIOD: Duration = Duration::from_millis(1);
++const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
++
++/// Owned render data; drawing and present never hold a musical-state lock.
++pub(crate) struct Frame {
++    screen: Screen,
++    worker_ticks: u64,
++    active_midi: [u32; 4],
++    settings: MusicalSettings,
++    setting_focus: Option<SettingField>,
++    sync_status: SyncStatus,
++    current_chord: Chord,
++    chord_elapsed_beats: f64,
++    current_render: VoiceRender,
++    recommendations: RecommendationSet,
++    selected_class: RecommendationClass,
++    selected_row: usize,
++    direction: HarmonicDirection,
++    voices: [Voice; 4],
++    performer_snapshots: [PerformerSnapshot; 4],
++    scope: VoiceScope,
++    recorder_status: RecorderStatus,
++    next_recording_armed: bool,
++    quantize_beats: f64,
++    phrase_count: usize,
++    midi_destination: String,
++    phrase: Option<Phrase>,
++    phrase_index: usize,
++    selected_event: usize,
++    pixels_per_beat: f32,
++    playing_phrase: Option<usize>,
++    queued_phrase: Option<usize>,
++    edit_grid: EditGrid,
++}
++
++impl Frame {
++    fn capture(
++        app: &mut App,
++        transport: &mut SyncTransport,
++        midi: &MidiEngine,
++        worker_ticks: u64,
++    ) -> Self {
++        let now_beat = transport.beat(app.settings.meter.beats_per_bar());
++        let sync_status = transport.status();
++        app.settings.tempo_bpm = sync_status.tempo_bpm;
++        Self {
++            screen: app.screen,
++            worker_ticks,
++            active_midi: midi.active_counts(),
++            settings: app.settings,
++            setting_focus: app.setting_focus,
++            sync_status,
++            current_chord: app.current_chord,
++            chord_elapsed_beats: now_beat - app.chord_started_beat,
++            current_render: app.current_render,
++            recommendations: app.recommendations.clone(),
++            selected_class: app.selected_class,
++            selected_row: app.selected_row,
++            direction: app.direction,
++            voices: app.voices,
++            performer_snapshots: app.performer_engine.snapshots(),
++            scope: app.scope,
++            recorder_status: app.recorder.status(),
++            next_recording_armed: app.recorder.next_is_armed(),
++            quantize_beats: app.recorder.quantize_beats(),
++            phrase_count: app.phrases.len(),
++            midi_destination: midi.destination_name().to_owned(),
++            phrase: if app.screen == Screen::PhraseEditor {
++                app.selected_phrase().cloned()
++            } else {
++                None
++            },
++            phrase_index: app.editor_phrase_index,
++            selected_event: app.editor_event_index,
++            pixels_per_beat: app.editor_zoom,
++            playing_phrase: app.phrase_player.playing_phrase(),
++            queued_phrase: app.phrase_player.queued_phrase(),
++            edit_grid: app.editor_grid,
++        }
++    }
++
++    pub(crate) fn diagnostics(&self) -> (u64, [u32; 4]) {
++        (self.worker_ticks, self.active_midi)
++    }
++
++    pub(crate) fn draw(
++        &self,
++        ui: &Ui,
++        canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
++    ) -> Result<(), String> {
++        match self.screen {
++            Screen::Performance => ui.draw_performance(
++                canvas,
++                PerformanceView {
++                    settings: self.settings,
++                    setting_focus: self.setting_focus,
++                    sync_status: self.sync_status,
++                    current_chord: self.current_chord,
++                    chord_elapsed_beats: self.chord_elapsed_beats,
++                    current_render: self.current_render,
++                    recommendations: &self.recommendations,
++                    selected_class: self.selected_class,
++                    selected_row: self.selected_row,
++                    direction: self.direction,
++                    voices: &self.voices,
++                    performer_snapshots: self.performer_snapshots,
++                    scope: self.scope,
++                    recorder_status: self.recorder_status,
++                    next_recording_armed: self.next_recording_armed,
++                    quantize_beats: self.quantize_beats,
++                    phrase_count: self.phrase_count,
++                    midi_destination: &self.midi_destination,
++                },
++            ),
++            Screen::PhraseEditor => ui.draw_phrase_editor(
++                canvas,
++                PhraseEditorView {
++                    settings: self.settings,
++                    sync_status: self.sync_status,
++                    phrase: self.phrase.as_ref(),
++                    phrase_index: self.phrase_index,
++                    phrase_count: self.phrase_count,
++                    selected_event: self.selected_event,
++                    pixels_per_beat: self.pixels_per_beat,
++                    playing_phrase: self.playing_phrase,
++                    queued_phrase: self.queued_phrase,
++                    edit_grid: self.edit_grid,
++                },
++            ),
++        }
++    }
++}
++
++enum Command {
++    Action(InputAction, SyncSender<(InputPage, bool)>),
++    Snapshot(SyncSender<Frame>),
++}
++
++/// The UI submits one request at a time. Action acknowledgments preserve
++/// screen-dependent input semantics without allowing unbounded command queues.
++pub(crate) struct Worker {
++    tx: Option<Sender<Command>>,
++    handle: Option<JoinHandle<Result<(), String>>>,
++    page: InputPage,
++}
++
++impl Worker {
++    pub(crate) fn spawn(brick: bool) -> Result<Self, String> {
++        Self::start_with(move || MidiEngine::configured(brick))
++    }
++
++    fn start_with<F>(make_midi: F) -> Result<Self, String>
++    where
++        F: FnOnce() -> Result<MidiEngine, String> + Send + 'static,
++    {
++        let (tx, rx) = mpsc::channel();
++        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
++        let handle = thread::Builder::new()
++            .name("khana-music".to_owned())
++            .spawn(move || {
++                // Construct platform objects here; no requirement for Link or
++                // midir handles themselves to implement Send.
++                let mut app = App::new();
++                let mut transport = SyncTransport::new(app.settings.tempo_bpm);
++                let mut midi = make_midi()?;
++                if ready_tx.send(()).is_err() {
++                    return Ok(());
++                }
++                let result = run(&rx, &mut app, &mut transport, &mut midi);
++                let cleanup = midi.stop_all();
++                result.and(cleanup)
++            })
++            .map_err(|error| format!("Cannot start music worker: {error}"))?;
++        let mut worker = Self {
++            tx: Some(tx),
++            handle: Some(handle),
++            page: InputPage::Performance,
++        };
++        if ready_rx.recv_timeout(RESPONSE_TIMEOUT).is_err() {
++            worker.shutdown()?;
++            return Err("Music worker did not initialize".to_owned());
++        }
++        Ok(worker)
++    }
++
++    pub(crate) fn input_page(&self) -> InputPage {
++        self.page
++    }
++
++    fn request<T>(&self, make: impl FnOnce(SyncSender<T>) -> Command) -> Result<T, String> {
++        let (reply, response) = mpsc::sync_channel(1);
++        self.tx
++            .as_ref()
++            .ok_or_else(|| "Music worker closed".to_owned())?
++            .send(make(reply))
++            .map_err(|_| "Music worker disconnected".to_owned())?;
++        response
++            .recv_timeout(RESPONSE_TIMEOUT)
++            .map_err(|error| format!("Music worker response: {error}"))
++    }
++
++    pub(crate) fn action(&mut self, action: InputAction) -> Result<bool, String> {
++        let (page, quit) = self.request(|reply| Command::Action(action, reply))?;
++        self.page = page;
++        Ok(quit)
++    }
++
++    pub(crate) fn snapshot(&self) -> Result<Frame, String> {
++        self.request(Command::Snapshot)
++    }
++
++    pub(crate) fn shutdown(&mut self) -> Result<(), String> {
++        // Dropping the last sender wakes recv_timeout even when stopped.
++        drop(self.tx.take());
++        if let Some(handle) = self.handle.take() {
++            handle
++                .join()
++                .map_err(|_| "Music worker panicked".to_owned())??;
++        }
++        Ok(())
++    }
++}
++
++impl Drop for Worker {
++    fn drop(&mut self) {
++        if let Err(error) = self.shutdown() {
++            eprintln!("Music worker shutdown: {error}");
++        }
++    }
++}
++
++fn run(
++    rx: &Receiver<Command>,
++    app: &mut App,
++    transport: &mut SyncTransport,
++    midi: &mut MidiEngine,
++) -> Result<(), String> {
++    let mut was_running = false;
++    let mut last_poll = Instant::now();
++    let mut last_report = last_poll;
++    let mut max_gap = Duration::ZERO;
++    let mut max_work = Duration::ZERO;
++    let mut worker_ticks = 0_u64;
++
++    loop {
++        let poll = Instant::now();
++        worker_ticks = worker_ticks.saturating_add(1);
++        max_gap = max_gap.max(poll.duration_since(last_poll));
++        last_poll = poll;
++        midi.service();
++        tick(app, transport, midi, &mut was_running)?;
++        midi.service();
++        max_work = max_work.max(poll.elapsed());
++        if poll.duration_since(last_report) >= Duration::from_secs(5) {
++            let (expired, late_beats) = app.performer_engine.take_timing_diagnostics();
++            println!(
++                "MUSIC DIAG poll {:.2} ms | work {:.2} ms | expired attacks {} | max attack lateness {:.4} beats | active MIDI {:?}",
++                max_gap.as_secs_f64() * 1000.0,
++                max_work.as_secs_f64() * 1000.0,
++                expired,
++                late_beats,
++                midi.active_counts()
++            );
++            midi.report();
++            max_gap = Duration::ZERO;
++            max_work = Duration::ZERO;
++            last_report = poll;
++        }
++        // Service musical time between every command, including rapid stick
++        // adjustments. Sleep only the unused part of this poll period.
++        match rx.recv_timeout(POLL_PERIOD.saturating_sub(poll.elapsed())) {
++            Ok(Command::Action(action, reply)) => {
++                let quit = dispatch_action(action, app, transport, midi)?;
++                // Apply transport transitions before acknowledging the action.
++                if !quit {
++                    tick(app, transport, midi, &mut was_running)?;
++                    midi.service();
++                }
++                if reply.send((app.input_page(), quit)).is_err() || quit {
++                    break;
++                }
++            }
++            Ok(Command::Snapshot(reply)) => {
++                if reply.send(Frame::capture(app, transport, midi, worker_ticks)).is_err() {
++                    break;
++                }
++            }
++            Err(RecvTimeoutError::Timeout) => {}
++            Err(RecvTimeoutError::Disconnected) => break,
++        }
++    }
++    Ok(())
++}
++
++fn tick(
++    app: &mut App,
++    transport: &mut SyncTransport,
++    midi: &mut MidiEngine,
++    was_running: &mut bool,
++) -> Result<(), String> {
++    let now_beat = transport.beat(app.settings.meter.beats_per_bar());
++    let running_now = transport.is_running();
++
++    if running_now != *was_running {
++        if running_now {
++            app.chord_started_beat = now_beat;
++            app.performer_engine.transport_started(now_beat);
++        } else {
++            app.phrase_player.stop();
++            app.performer_engine.transport_stopped();
++            midi.stop_all()?;
++        }
++        *was_running = running_now;
++    }
++
++    if running_now {
++        if let Some(phrase) = app.recorder.update(now_beat, app.current_chord) {
++            println!(
++                "CAPTURED P{:02}: {} events, {:.1} beats",
++                phrase.id,
++                phrase.events.len(),
++                phrase.duration_beats()
++            );
++            app.phrases.push(phrase);
++            app.editor_phrase_index = app.phrases.len().saturating_sub(1);
++            app.editor_event_index = 0;
++        }
++
++        let playback = app.phrase_player.update(&app.phrases, now_beat);
++        if let Some(chord) = playback.chord {
++            app.set_harmony(chord, now_beat, true, false);
++        }
++        app.performer_engine
++            .set_next_chord_target(playback.next_chord, playback.next_chord_beat);
++        if playback.ended && app.phrase_player.queued_phrase().is_none() {
++            app.performer_engine.set_enabled(false);
++            midi.stop_all()?;
++        }
++        app.update_performers(now_beat, midi)?;
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn worker_advances_without_ui_requests_and_acknowledges_stop() {
++        let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
++        assert!(!worker.snapshot().unwrap().sync_status.running);
++        assert!(!worker.action(InputAction::ToggleTransport).unwrap());
++        let first = worker.snapshot().unwrap();
++        thread::sleep(Duration::from_millis(80));
++        let second = worker.snapshot().unwrap();
++        assert!(second.chord_elapsed_beats > first.chord_elapsed_beats);
++        assert!(second.worker_ticks > first.worker_ticks + 1);
++        assert!(!worker.action(InputAction::ToggleTransport).unwrap());
++        let stopped = worker.snapshot().unwrap();
++        assert!(!stopped.sync_status.running);
++        assert_eq!(stopped.active_midi, [0; 4]);
++        worker.shutdown().unwrap();
++    }
++
++    #[test]
++    fn screen_actions_acknowledge_new_input_context() {
++        let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
++        assert_eq!(worker.input_page(), InputPage::Performance);
++        worker.action(InputAction::ToggleScreen).unwrap();
++        assert_eq!(worker.input_page(), InputPage::Editor);
++        worker.action(InputAction::ToggleSettings).unwrap();
++        assert_eq!(worker.input_page(), InputPage::Settings);
++        worker.action(InputAction::MenuTap).unwrap();
++        assert_eq!(worker.input_page(), InputPage::Performance);
++        assert!(worker.action(InputAction::Quit).unwrap());
++        worker.shutdown().unwrap();
++    }
++}
+diff --git a/docs/BRICK_V0.11.4.md b/docs/BRICK_V0.11.4.md
+new file mode 100644
+--- /dev/null
++++ b/docs/BRICK_V0.11.4.md
+@@ -0,0 +1,91 @@
++# Khaṇa v0.11.4 — independent musical worker
++
++Baseline: `5a25a8ca43e0f15688c65ed7f36fb137ae8bc675` (working MIDI, v0.11.3).
++The preceding build was confirmed to deliver MIDI via QT-2host on Brick Pro.
++
++## Runtime ownership
++
++- The main thread owns SDL, physical input interpretation and drawing/present.
++- The music worker owns the App, SyncTransport, phrase recorder/player,
++  PerformerEngine and MidiEngine. Link and MIDI objects are created inside it.
++- The worker services musical time at a nominal 1 ms cadence, waking sooner for
++  requests. Existing beat-based pending-attack and gate logic is preserved.
++- The UI requests an owned snapshot only when rendering is due. SDL draw and
++  present never hold a music-state lock. UI actions are acknowledged in order,
++  including the new input page. No stale page interpretation or unbounded
++  request backlog is intended. No additional lookahead MIDI scheduler is added.
++- Shutdown drops the sender, wakes the worker, releases owned notes and joins.
++  Worker errors propagate to the UI or shutdown log. A blocked system call or
++  driver can still stall shutdown; this is not a hard real-time implementation.
++- Raw output discovery, recommendation computation, logging and bounded MIDI
++  cleanup still run on the worker and may add timing jitter. Trace is best
++  disabled for performance measurement. Desktop sequencer behavior is retained.
++
++## Selecting MIDI output
++
++With transport stopped, Select+X opens Settings (desktop M). Left/right moves
++between fields; left from TONIC wraps to MIDI OUTPUT. Up/down cycles AUTO,
++currently detected raw output devices, and OFF. A/Menu closes Settings.
++The new selection is session-local; use KHANA_MIDI_PORT or
++KHANA_MIDI_RAW_DEVICE in the launcher for a persistent starting selection.
++The raw selector does not change desktop ALSA sequencer or explicit dry-run.
++
++AUTO prefers USB over other candidates when USB is available, but refuses
++ambiguous matches. Once connected, it pins identity until explicitly changed.
++Explicit devices are selected by identity, not the changing card number alone.
++Off suppresses discovery and delivery. Selection only changes while stopped.
++The old output is released before switching; if it was already disconnected or
++faulted, external panic may still be necessary. Recovery cleanup remains
++restricted to the previously pinned device until a deliberate selection change.
++Multiple identical ports with indistinguishable identities remain a limitation.
++
++`--midi-list` reports product/card name, path, IN/OUT/UNKNOWN, USB/virtual/other
++and output owner PID when available. Procfs information is a hint; actual open
++is the writability test. VirMIDI is not classified as USB.
++
++## Build and deployment
++
++The committed `.cargo/config.toml` selects the NextUI cross linker. The launcher
++now prepends `/usr/trimui/lib` to LD_LIBRARY_PATH and forwards arguments.
++The raw-only build continues to omit the direct ALSA userspace dependency.
++
++```sh
++cargo fmt --all
++cargo clippy --all-targets --all-features --locked -- -D warnings
++cargo test --all-features --locked
++cargo clippy --all-targets --no-default-features --locked -- -D warnings
++cargo test --no-default-features --locked
++./scripts/test-deployment-freshness.sh
++./scripts/package-khana.sh
++BRICK_HOST=root@YOUR_BRICK_IP ./scripts/deploy-khana.sh
++```
++
++For SSH diagnostics, use the native SDL library path before running directly:
++
++```sh
++cd /mnt/SDCARD/Tools/tg5040/Khana.pak
++export LD_LIBRARY_PATH="/usr/trimui/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
++./khana --midi-list
++KHANA_MIDI_PORT=QT2host KHANA_MIDI_TRACE=1 ./khana --midi-test
++```
++
++Close the graphical app before headless audition. Reserve MIDI channels 1–4.
++
++## Acceptance tests
++
++1. Compare GUI layout and physical controls with v0.11.3; rapid screen changes
++   followed by navigation should be handled in order.
++2. Start playback via QT-2host and compare musical timing at 30 and 60 FPS.
++   Switch screens, adjust macros, capture and play phrases during playback.
++3. Inspect `MUSIC DIAG` poll/work maxima, expired attacks and lateness separately
++   from `UI DIAG` render duration. Music tick count must continue increasing.
++4. Stop transport: no owned MIDI notes. Start again: fresh attacks. Exit during
++   playback: clean worker shutdown and note release.
++5. With transport stopped, select OFF, AUTO, and the explicit port. Confirm
++   connection state, no MIDI while OFF and correct destination after switching.
++6. Unplug/reconnect the same MIDI device while playing. Confirm no UI freeze or
++   stale attacks; verify the four channels are cleared on recovery.
++7. Repeat with no hardware attached, desktop sequencer and raw-only dry-run.
++
++This release intentionally does not implement MIDI clock out/in, a separate
++lookahead scheduler, persistent Settings, or a multi-port/channel routing matrix.

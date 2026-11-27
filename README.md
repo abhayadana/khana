@@ -1,4 +1,7 @@
-# Khaṇa v0.11.3
+# Khaṇa v0.11.4
+
+See [v0.11.4 musical timing worker](docs/BRICK_V0.11.4.md) for thread ownership,
+MIDI output selection, NextUI runtime setup and acceptance tests.
 
 See [v0.11.3 raw MIDI platform](docs/BRICK_V0.11.3.md) for the new Brick default,
 device selection, reconnection behavior, build flags and hardware tests.

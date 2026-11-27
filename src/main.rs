@@ -1,4 +1,4 @@
-//! Khaṇa v0.11.3 raw MIDI platform.
+//! Khaṇa v0.11.4 independent musical runtime.
 //!
 //! v0.11 adds complete semantic chord voicings, rhythmic/gated Melody phrases,
 //! persistent cyclic Texture, and lightweight performer-to-performer awareness.
@@ -8,6 +8,7 @@ mod midi;
 mod music;
 mod performer;
 mod phrase;
+mod runtime;
 mod sync;
 mod ui;
 mod voice;
@@ -26,7 +27,7 @@ use performer::PerformerEngine;
 use phrase::{EditGrid, Phrase, PhrasePlayer, PhraseRecorder};
 use sdl2::event::Event;
 use sync::{SyncMode, SyncTransport};
-use ui::{PerformanceView, PhraseEditorView, Ui};
+use ui::Ui;
 use voice::{MacroKind, Voice, VoiceEngine, VoiceRender, VoiceScope, adjust_macro, default_voices};
 
 const WINDOW_WIDTH: u32 = 1024;
@@ -333,84 +334,13 @@ fn main() -> Result<(), String> {
     }
 
     let ui = Ui::new(WINDOW_WIDTH, brick);
-    let mut app = App::new();
-    let mut transport = SyncTransport::new(app.settings.tempo_bpm);
-    let mut midi = MidiEngine::configured(brick)?;
-    let mut was_running = false;
-
+    let mut worker = runtime::Worker::spawn(brick)?;
     print_controls();
     let mut next_render = Instant::now();
-    let mut last_poll = next_render;
     let mut last_report = next_render;
-    let mut max_gap = Duration::ZERO;
     let mut max_render = Duration::ZERO;
 
     'running: loop {
-        let poll = Instant::now();
-        midi.service();
-        max_gap = max_gap.max(poll.duration_since(last_poll));
-        last_poll = poll;
-        if poll.duration_since(last_report) >= Duration::from_secs(5) {
-            let (expired, late_beats) = app.performer_engine.take_timing_diagnostics();
-            println!(
-                "DIAG poll {:.2} ms | render {:.2} ms | expired attacks {} | max attack lateness {:.4} beats | active MIDI {:?}",
-                max_gap.as_secs_f64() * 1000.0,
-                max_render.as_secs_f64() * 1000.0,
-                expired,
-                late_beats,
-                midi.active_counts()
-            );
-            midi.report();
-            max_gap = Duration::ZERO;
-            max_render = Duration::ZERO;
-            last_report = poll;
-        }
-        let now_beat = transport.beat(app.settings.meter.beats_per_bar());
-        let running_now = transport.is_running();
-
-        if running_now != was_running {
-            if running_now {
-                app.chord_started_beat = now_beat;
-                app.performer_engine.transport_started(now_beat);
-            } else {
-                app.phrase_player.stop();
-                app.performer_engine.transport_stopped();
-                midi.stop_all()?;
-            }
-            was_running = running_now;
-        }
-
-        if running_now {
-            if let Some(phrase) = app.recorder.update(now_beat, app.current_chord) {
-                println!(
-                    "CAPTURED P{:02}: {} events, {:.1} beats",
-                    phrase.id,
-                    phrase.events.len(),
-                    phrase.duration_beats()
-                );
-                app.phrases.push(phrase);
-                app.editor_phrase_index = app.phrases.len().saturating_sub(1);
-                app.editor_event_index = 0;
-            }
-
-            let playback = app.phrase_player.update(&app.phrases, now_beat);
-
-            if let Some(chord) = playback.chord {
-                app.set_harmony(chord, now_beat, true, false);
-            }
-            app.performer_engine
-                .set_next_chord_target(playback.next_chord, playback.next_chord_beat);
-
-            if playback.ended && app.phrase_player.queued_phrase().is_none() {
-                app.performer_engine.set_enabled(false);
-                midi.stop_all()?;
-            }
-
-            app.update_performers(now_beat, &mut midi)?;
-        }
-        // Deliver freshly queued bytes before SDL input/rendering can stall.
-        midi.service();
-
         for event in event_pump.poll_iter() {
             if matches!(event, Event::Quit { .. }) {
                 break 'running;
@@ -429,23 +359,23 @@ fn main() -> Result<(), String> {
                 println!("INPUT {event:?}");
             }
             let action = if brick {
-                handheld.event(&event, app.input_page(), Instant::now())
+                handheld.event(&event, worker.input_page(), Instant::now())
             } else {
                 desktop_event(&event, &controllers)
             };
             if let Some(action) = action
-                && dispatch_action(action, &mut app, &mut transport, &mut midi)?
+                && worker.action(action)?
             {
                 break 'running;
             }
         }
         if brick {
             for action in handheld
-                .tick(app.input_page(), Instant::now())
+                .tick(worker.input_page(), Instant::now())
                 .into_iter()
                 .flatten()
             {
-                if dispatch_action(action, &mut app, &mut transport, &mut midi)? {
+                if worker.action(action)? {
                     break 'running;
                 }
             }
@@ -459,65 +389,25 @@ fn main() -> Result<(), String> {
         }
         next_render = render_now + frame_period;
 
-        let now_beat = transport.beat(app.settings.meter.beats_per_bar());
-
-        match app.screen {
-            Screen::Performance => {
-                let sync_status = transport.status();
-                app.settings.tempo_bpm = sync_status.tempo_bpm;
-
-                ui.draw_performance(
-                    &mut canvas,
-                    PerformanceView {
-                        settings: app.settings,
-                        setting_focus: app.setting_focus,
-                        sync_status,
-                        current_chord: app.current_chord,
-                        chord_elapsed_beats: now_beat - app.chord_started_beat,
-                        current_render: app.current_render,
-                        recommendations: &app.recommendations,
-                        selected_class: app.selected_class,
-                        selected_row: app.selected_row,
-                        direction: app.direction,
-                        voices: &app.voices,
-                        performer_snapshots: app.performer_engine.snapshots(),
-                        scope: app.scope,
-                        recorder_status: app.recorder.status(),
-                        next_recording_armed: app.recorder.next_is_armed(),
-                        quantize_beats: app.recorder.quantize_beats(),
-                        phrase_count: app.phrases.len(),
-                        midi_destination: midi.destination_name(),
-                    },
-                )?;
-            }
-            Screen::PhraseEditor => {
-                let sync_status = transport.status();
-                app.settings.tempo_bpm = sync_status.tempo_bpm;
-
-                ui.draw_phrase_editor(
-                    &mut canvas,
-                    PhraseEditorView {
-                        settings: app.settings,
-                        sync_status,
-                        phrase: app.selected_phrase(),
-                        phrase_index: app.editor_phrase_index,
-                        phrase_count: app.phrases.len(),
-                        selected_event: app.editor_event_index,
-                        pixels_per_beat: app.editor_zoom,
-                        playing_phrase: app.phrase_player.playing_phrase(),
-                        queued_phrase: app.phrase_player.queued_phrase(),
-                        edit_grid: app.editor_grid,
-                    },
-                )?;
-            }
-        }
-
+        // The worker owns all mutable music state. The renderer holds only a
+        // snapshot, so a slow SDL present cannot delay its clock or MIDI poll.
+        let frame = worker.snapshot()?;
+        frame.draw(&ui, &mut canvas)?;
         canvas.present();
         max_render = max_render.max(render_now.elapsed());
+        if render_now.duration_since(last_report) >= Duration::from_secs(5) {
+            let (ticks, active) = frame.diagnostics();
+            println!(
+                "UI DIAG render {:.2} ms | music ticks {ticks} | active MIDI {active:?}",
+                max_render.as_secs_f64() * 1000.0
+            );
+            max_render = Duration::ZERO;
+            last_report = render_now;
+        }
         thread::sleep(Duration::from_millis(1));
     }
 
-    midi.stop_all()?;
+    worker.shutdown()?;
     println!("Khaṇa exited cleanly.");
     Ok(())
 }
@@ -738,6 +628,11 @@ fn adjust_setting(
         SettingField::StartStopSync => {
             let status = transport.status();
             transport.set_link_start_stop_sync(!status.link_start_stop_sync);
+        }
+        SettingField::MidiOutput => {
+            if !transport.is_running() {
+                midi.cycle_raw_destination(direction)?;
+            }
         }
     }
 
