@@ -244,9 +244,16 @@ fn score_voicing(voicing: Voicing, previous: Option<Voicing>, spread: f32) -> f3
         .max()
         .unwrap_or(0);
 
+    let common_tones = previous.map_or(0, |old| {
+        voicing
+            .iter()
+            .filter(|note| old.as_slice().contains(note))
+            .count()
+    });
     target_cost
         + movement_cost * if previous.is_some() { 2.25 } else { 0.0 }
         + f32::from(largest_gap.saturating_sub(24)) * 2.0
+        - common_tones as f32 * 2.5
 }
 
 #[cfg(test)]

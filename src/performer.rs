@@ -300,6 +300,7 @@ struct PendingAttack {
     velocity: u8,
     start_beat: f64,
     gate_beats: f64,
+    preserve_common: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -365,7 +366,14 @@ impl PatternState {
             });
             self.age_cycles = 0;
             self.last_cycle_index = cycle_index;
-        } else if cycle_index != self.last_cycle_index
+        } else if (cycle_index != self.last_cycle_index
+            && (!matches!(
+                self.family,
+                PatternFamily::MelodyMotif
+                    | PatternFamily::MelodyPhrase
+                    | PatternFamily::MelodyOrnament
+            ) || cycle_index.rem_euclid(4) == 0
+                || self.last_cycle_index == i64::MIN))
             || (self.family == PatternFamily::ChordsLongSustain && boundary_changed)
         {
             let next = choose_variant(VariantRequest {
@@ -479,10 +487,12 @@ struct PerformerState {
     previous_note: Option<u8>,
     pending_resolution: Option<u8>,
     force_attack: bool,
+    legato_harmony: bool,
     last_attack_beat: Option<f64>,
     motion_direction: i8,
     pattern: PatternState,
     melody_plan: MelodyPlan,
+    melody_motif: MelodyPlan,
 }
 
 impl PerformerState {
@@ -494,10 +504,12 @@ impl PerformerState {
             previous_note: None,
             pending_resolution: None,
             force_attack: false,
+            legato_harmony: false,
             last_attack_beat: None,
             motion_direction: 0,
             pattern,
             melody_plan: MelodyPlan::empty(),
+            melody_motif: MelodyPlan::empty(),
         }
     }
 }
@@ -598,6 +610,7 @@ impl PerformerEngine {
         chord_voicing: Voicing,
         now_beat: f64,
     ) {
+        self.states[1].legato_harmony = chord != self.chord;
         self.chord = chord;
         self.tonal = tonal;
         self.chord_voicing = chord_voicing;
@@ -648,6 +661,7 @@ impl PerformerEngine {
             state.pending = None;
             state.last_step_key = None;
             state.pending_resolution = None;
+            state.legato_harmony = false;
         }
         self.states[0].force_attack = true;
         self.states[1].force_attack = true;
@@ -765,6 +779,10 @@ impl PerformerEngine {
                     self.chord_origin_beat,
                 );
                 self.states[index].pattern.last_cycle_index = timing.cycle_index;
+                if role == VoiceRole::Melody {
+                    self.states[index].melody_motif = MelodyPlan::empty();
+                    self.states[index].melody_plan = MelodyPlan::empty();
+                }
             } else if self.states[index].pattern.family != active_family {
                 timing = step_timing(
                     role,
@@ -791,6 +809,11 @@ impl PerformerEngine {
             let ensemble = self.ensemble_context();
             let forced = self.states[index].force_attack;
             self.states[index].force_attack = false;
+            let preserve_common = std::mem::take(&mut self.states[index].legato_harmony)
+                && matches!(
+                    self.states[index].pattern.family,
+                    PatternFamily::ChordsLongSustain | PatternFamily::ChordsBarSustain
+                );
             if behavior.activity <= 0.01
                 || (!forced
                     && !self.should_attack(index, role, timing, behavior, ensemble, now_beat))
@@ -805,6 +828,10 @@ impl PerformerEngine {
                     timing.position,
                     voice,
                     ensemble,
+                )),
+                VoiceRole::Bass if forced => NoteSet::single(nearest_pitch_class_near(
+                    self.chord.root.value(),
+                    (36.0 + voice.parameters.spread * 8.0).round() as u8,
                 )),
                 VoiceRole::Bass | VoiceRole::Texture => {
                     NoteSet::single(choose_role_note(RoleNoteRequest {
@@ -822,12 +849,22 @@ impl PerformerEngine {
                 }
             };
 
-            let velocity = attack_velocity(
+            let mut velocity = attack_velocity(
                 role,
                 voice.parameters.dynamics,
                 timing.position,
                 self.intensity,
             );
+            if role == VoiceRole::Melody {
+                let plan = &self.states[index].melody_plan;
+                velocity = match plan.intent(timing.position) {
+                    MelodyIntent::Skeleton(_) if timing.position == (plan.len * 5) / 8 => {
+                        velocity.saturating_add(9).min(127)
+                    }
+                    MelodyIntent::Skeleton(_) => velocity,
+                    _ => velocity.saturating_sub(9).max(1),
+                };
+            }
             let gate = if role == VoiceRole::Melody {
                 melody_gate_beats(
                     self.states[index].melody_plan.step(timing.position),
@@ -843,6 +880,7 @@ impl PerformerEngine {
                 velocity,
                 start_beat: start,
                 gate_beats: gate,
+                preserve_common,
             });
             self.start_due_attack(index, now_beat, &mut batch);
         }
@@ -917,8 +955,12 @@ impl PerformerEngine {
             return;
         }
 
-        if let Some(active) = self.states[index].sounding.take() {
+        let active = self.states[index].sounding.take();
+        if let Some(active) = active {
             for note in active.notes.iter() {
+                if pending.preserve_common && pending.notes.iter().any(|next| next == note) {
+                    continue;
+                }
                 batch.push(VoiceEvent::NoteOff {
                     voice_index: index,
                     note,
@@ -927,6 +969,11 @@ impl PerformerEngine {
         }
 
         for note in pending.notes.iter() {
+            if pending.preserve_common
+                && active.is_some_and(|old| old.notes.iter().any(|prior| prior == note))
+            {
+                continue;
+            }
             batch.push(VoiceEvent::NoteOn {
                 voice_index: index,
                 note,
@@ -1006,15 +1053,13 @@ impl PerformerEngine {
             return;
         }
 
-        let previous = state.melody_plan;
-        state.melody_plan = generate_melody_plan(
-            timing.steps_per_cycle.min(MAX_MELODY_STEPS),
-            behavior,
-            color,
-            previous,
-            timing.cycle_index,
-            variant,
-        );
+        let len = timing.steps_per_cycle.min(MAX_MELODY_STEPS);
+        let group = timing.cycle_index.div_euclid(4);
+        if state.melody_motif.len != len || state.melody_motif.cycle_index != group {
+            state.melody_motif =
+                generate_melody_plan(len, behavior, color, state.melody_motif, group, variant);
+        }
+        state.melody_plan = vary_melody_plan(state.melody_motif, timing.cycle_index, variant);
     }
 
     fn choose_melody_note(
@@ -1028,8 +1073,10 @@ impl PerformerEngine {
             return resolution;
         }
 
-        let intent = self.states[index].melody_plan.intent(position);
-        if let MelodyIntent::ChromaticApproach(contour) = intent {
+        let mut intent = self.states[index].melody_plan.intent(position);
+        if let MelodyIntent::ChromaticApproach(contour) = intent
+            && voice.parameters.color >= 0.80
+        {
             let resolution = melody_target_note(
                 MelodyIntent::Skeleton(contour),
                 self.chord,
@@ -1045,6 +1092,9 @@ impl PerformerEngine {
             );
             self.states[index].pending_resolution = Some(resolution);
             return chromatic_approach_note(resolution, self.chord, self.tonal);
+        }
+        if let MelodyIntent::ChromaticApproach(contour) = intent {
+            intent = MelodyIntent::Neighbor(contour);
         }
 
         melody_target_note(
@@ -1538,9 +1588,14 @@ fn choose_role_note(request: RoleNoteRequest) -> u8 {
     };
     let preferred_index = pattern_note_offset(request.variant, request.position);
     let preferred = pool.get(preferred_index);
+    let preferred_weight = match request.variant {
+        PatternVariant::BassChordToneOstinato | PatternVariant::BassRootBounce => 9.0,
+        PatternVariant::TextureThreeStepArp | PatternVariant::TextureRotatingThree => 6.0,
+        _ => 3.5,
+    };
     let movement_weight = match role {
         VoiceRole::Bass => 0.24,
-        VoiceRole::Texture => 0.38,
+        VoiceRole::Texture => 0.68,
         VoiceRole::Melody => 0.82,
         VoiceRole::Chords => 0.0,
     };
@@ -1550,6 +1605,7 @@ fn choose_role_note(request: RoleNoteRequest) -> u8 {
         target,
         request.previous_note,
         movement_weight,
+        preferred_weight,
         NoteScoringContext {
             role,
             color: request.voice.parameters.color,
@@ -1575,12 +1631,15 @@ fn choose_role_note(request: RoleNoteRequest) -> u8 {
         && request.position % 8 == 7
     {
         let destination = nearest_pitch_class_near(future.chord.root.value(), target as u8);
-        note = if matches!(request.variant, PatternVariant::BassChromaticApproach) {
+        note = if matches!(request.variant, PatternVariant::BassChromaticApproach)
+            && request.voice.parameters.color >= 0.80
+        {
             destination.saturating_sub(1).max(24)
         } else {
             diatonic_approach_note(destination, request.tonal, request.previous_note)
         };
     } else if matches!(request.variant, PatternVariant::BassChromaticApproach)
+        && request.voice.parameters.color >= 0.80
         && request.position % 8 == 7
     {
         // With no known future chord, CONNECT remains local to the current
@@ -1649,8 +1708,8 @@ fn pattern_note_offset(variant: PatternVariant, position: usize) -> usize {
             1..=3 => 1,
             _ => 0,
         },
+        PatternVariant::BassChordToneOstinato => [0, 1, 0, 2][(position / 2) % 4],
         PatternVariant::BassBroken
-        | PatternVariant::BassChordToneOstinato
         | PatternVariant::BassScaleApproach
         | PatternVariant::BassWalkingFragment => position / 2,
         PatternVariant::BassChromaticApproach => 0,
@@ -1698,6 +1757,7 @@ fn nearest_allowed_note(
     target: f32,
     previous_note: Option<u8>,
     movement_weight: f32,
+    preferred_weight: f32,
     scoring: NoteScoringContext,
 ) -> u8 {
     let NoteScoringContext {
@@ -1719,7 +1779,7 @@ fn nearest_allowed_note(
         let preference_cost = if note % 12 == preferred_pitch_class {
             0.0
         } else {
-            3.5
+            preferred_weight
         };
         let ensemble_cost = counterpoint_cost(note, previous_note, role, color, ensemble);
         let score = register_cost + movement_cost + preference_cost + ensemble_cost;
@@ -1823,32 +1883,6 @@ fn generate_melody_plan(
     variant: PatternVariant,
 ) -> MelodyPlan {
     let len = len.clamp(1, MAX_MELODY_STEPS);
-    let repeat_threshold = if matches!(variant, PatternVariant::MelodyMotifVariation) {
-        0.58
-    } else {
-        0.70
-    };
-
-    if previous.len == len
-        && previous.cycle_index != i64::MIN
-        && behavior.repeat >= repeat_threshold
-        && cycle_index.rem_euclid(2) == 1
-    {
-        let mut repeated = previous;
-        repeated.cycle_index = cycle_index;
-        repeated.generation = previous.generation.wrapping_add(1);
-
-        // A′ variation: preserve rhythm/gates and alter one non-structural
-        // melodic intent instead of regenerating the whole phrase.
-        let variation = ((cycle_index.unsigned_abs() as usize * 5) + 3) % len;
-        if matches!(repeated.steps[variation].intent, MelodyIntent::Fill(_)) {
-            repeated.steps[variation].intent = MelodyIntent::Neighbor(1);
-            repeated.steps[variation].articulation = MelodyArticulation::Short;
-            repeated.steps[variation].gate_steps = 1;
-        }
-        return repeated;
-    }
-
     let mut plan = MelodyPlan {
         steps: [MelodyStep::REST; MAX_MELODY_STEPS],
         len,
@@ -1909,8 +1943,7 @@ fn generate_melody_plan(
         let contour = arch_contour(position, len);
         let before_skeleton = position + 1 < len
             && matches!(plan.steps[position + 1].intent, MelodyIntent::Skeleton(_));
-        let chromatic_permission =
-            color >= 0.80 || matches!(variant, PatternVariant::MelodyChromaticPhrase);
+        let chromatic_permission = color >= 0.80;
 
         let intent = if chromatic_permission && before_skeleton {
             let target_contour = match plan.steps[position + 1].intent {
@@ -1935,6 +1968,49 @@ fn generate_melody_plan(
     }
 
     apply_melody_articulation(&mut plan, variant);
+    plan
+}
+
+fn vary_melody_plan(mut plan: MelodyPlan, cycle: i64, variant: PatternVariant) -> MelodyPlan {
+    plan.cycle_index = cycle;
+    let peak = (plan.len * 5) / 8;
+    let cadence = melody_cadence_position(plan.len);
+    match cycle.rem_euclid(4) {
+        // Keep rhythmic identity and change one real note, even in a sparse motif.
+        1 => {
+            let variation = (1..peak).rev().find(|&index| {
+                matches!(
+                    plan.steps[index].intent,
+                    MelodyIntent::Fill(_) | MelodyIntent::Neighbor(_)
+                )
+            });
+            if let Some(index) = variation {
+                plan.steps[index].intent = match plan.steps[index].intent {
+                    MelodyIntent::Fill(contour) => MelodyIntent::Neighbor(contour),
+                    MelodyIntent::Neighbor(contour) => MelodyIntent::Fill(contour),
+                    intent => intent,
+                };
+            } else if let MelodyIntent::Skeleton(contour) = plan.steps[peak].intent {
+                plan.steps[peak].intent = MelodyIntent::Skeleton(contour + 1);
+            }
+        }
+        // Answer the opening with a lower peak and a breath before the cadence.
+        3 if peak < cadence => {
+            if let MelodyIntent::Skeleton(contour) = plan.steps[peak].intent {
+                plan.steps[peak].intent = MelodyIntent::Skeleton(contour.saturating_sub(2).max(0));
+            }
+            if let Some(index) = ((peak + 1)..cadence).rev().find(|&index| {
+                !matches!(
+                    plan.steps[index].intent,
+                    MelodyIntent::Rest | MelodyIntent::Skeleton(_)
+                )
+            }) {
+                plan.steps[index] = MelodyStep::REST;
+            }
+            apply_melody_articulation(&mut plan, variant);
+        }
+        _ => {}
+    }
     plan
 }
 
@@ -2127,7 +2203,7 @@ fn melody_target_note(
         | MelodyIntent::ChromaticApproach(value) => value,
         MelodyIntent::Rest => 0,
     };
-    let stable_only = matches!(intent, MelodyIntent::Skeleton(_)) && color < 0.38;
+    let stable_only = matches!(intent, MelodyIntent::Skeleton(_));
     let mut pool = PitchPool::new();
 
     if stable_only || color < 0.38 {
@@ -2165,6 +2241,7 @@ fn melody_target_note(
         contour_target,
         previous_note,
         0.82,
+        if stable_only { 6.0 } else { 3.5 },
         scoring,
     )
 }
@@ -2483,6 +2560,87 @@ mod tests {
     }
 
     #[test]
+    fn melody_repeats_the_motif_and_answers_without_replacing_its_opening() {
+        let mut engine = PerformerEngine::new(
+            c_major(),
+            MusicalSettings::default().tonal,
+            Voicing::from_slice(&[52, 55, 60]),
+        );
+        let behavior = super::Behavior {
+            activity: 0.54,
+            space: 0.38,
+            repeat: 0.75,
+        };
+        let variant = PatternVariant::MelodyDevelopedPhrase;
+        let phrases = std::array::from_fn::<_, 5, _>(|cycle| {
+            let timing = super::StepTiming {
+                cycle_index: cycle as i64,
+                step_key: cycle as i64 * 16,
+                position: 0,
+                steps_per_cycle: 16,
+                step_length: 0.5,
+            };
+            engine.ensure_melody_plan(timing, 0.34, behavior, variant);
+            engine.states[3].melody_plan
+        });
+        let [a, varied, repeat, answer, next] = phrases;
+        assert_eq!(a.steps, repeat.steps);
+        assert_ne!(a.steps, varied.steps);
+        assert_eq!(
+            a.steps.map(|step| step.gate_steps),
+            varied.steps.map(|step| step.gate_steps)
+        );
+        assert_eq!(a.steps[..8], answer.steps[..8]);
+        assert_ne!(a.steps[8..16], answer.steps[8..16]);
+        assert_ne!(a.generation, next.generation);
+    }
+
+    #[test]
+    fn sustained_chords_keep_common_notes_until_the_new_gate_ends() {
+        let tonal = MusicalSettings::default().tonal;
+        let old_voicing = Voicing::from_slice(&[48, 52, 55]);
+        let mut engine = PerformerEngine::new(c_major(), tonal, old_voicing);
+        let mut voices = default_voices();
+        for (index, voice) in voices.iter_mut().enumerate() {
+            voice.parameters.density = if index == 1 { 0.15 } else { 0.0 };
+        }
+        engine.transport_started(0.0);
+        engine.update(0.0, 4.0, &voices);
+        engine.update(0.02, 4.0, &voices);
+        let new_chord = tonal.diatonic_chord(5, ChordExtension::Triad);
+        let current = Voicing::from_slice(&[48, 52, 57]);
+        engine.harmony_changed(new_chord, tonal, current, 0.5);
+        engine.update(0.5, 4.0, &voices);
+        let notes = engine.update(0.52, 4.0, &voices);
+        assert_eq!(notes.iter().count(), 2);
+        assert!(matches!(
+            notes.iter().next(),
+            Some(VoiceEvent::NoteOff {
+                voice_index: 1,
+                note: 55
+            })
+        ));
+        assert!(matches!(
+            notes.iter().last(),
+            Some(VoiceEvent::NoteOn {
+                voice_index: 1,
+                note: 57,
+                ..
+            })
+        ));
+        let released = engine.update(
+            0.53,
+            4.0,
+            &std::array::from_fn(|index| {
+                let mut voice = voices[index];
+                voice.parameters.density = 0.0;
+                voice
+            }),
+        );
+        assert_eq!(released.iter().count(), 3);
+    }
+
+    #[test]
     fn counterpoint_scoring_prefers_contrary_motion_when_other_costs_match() {
         let context = super::EnsembleContext {
             active_notes: [None, None, None, Some(60)],
@@ -2573,6 +2731,7 @@ mod tests {
             velocity: 90,
             start_beat: 1.0,
             gate_beats: 0.25,
+            preserve_common: false,
         });
         let mut batch = super::VoiceEventBatch::new();
         engine.start_due_attack(2, 1.5, &mut batch);
@@ -2596,6 +2755,7 @@ mod tests {
             velocity: 90,
             start_beat: 1.0,
             gate_beats: 0.5,
+            preserve_common: false,
         });
         let mut voices = default_voices();
         voices[2].parameters.density = 0.0;

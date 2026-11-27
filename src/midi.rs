@@ -25,6 +25,7 @@ use raw::{RawOutput, Selection};
 const VOICE_COUNT: usize = 4;
 const MIDI_CHANNEL_COUNT: u8 = 16;
 const DEFAULT_CHANNELS: [u8; VOICE_COUNT] = [0, 1, 2, 3];
+const TRANSPOSE_LIMIT: i16 = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Message {
@@ -96,6 +97,7 @@ pub struct MidiEngine {
     connection: MidiSink,
     ownership: NoteOwnership,
     channels: [u8; VOICE_COUNT],
+    transpose: [i8; VOICE_COUNT],
     clock: ClockOut,
     destination_name: String,
     trace: bool,
@@ -118,6 +120,7 @@ impl MidiEngine {
             connection: MidiSink::Alsa(connection),
             ownership: NoteOwnership::new(),
             channels: DEFAULT_CHANNELS,
+            transpose: [0; VOICE_COUNT],
             clock: ClockOut::default(),
             destination_name: format!("VIRTUAL: {port_name}"),
             trace: trace_enabled(),
@@ -183,6 +186,7 @@ impl MidiEngine {
                 connection: MidiSink::Alsa(connection),
                 ownership: NoteOwnership::new(),
                 channels: DEFAULT_CHANNELS,
+                transpose: [0; VOICE_COUNT],
                 clock: ClockOut::default(),
                 destination_name: name,
                 trace: trace_enabled(),
@@ -203,6 +207,7 @@ impl MidiEngine {
             connection: MidiSink::DryRun,
             ownership: NoteOwnership::new(),
             channels: DEFAULT_CHANNELS,
+            transpose: [0; VOICE_COUNT],
             clock: ClockOut::default(),
             destination_name: "DRY RUN - NO OUTPUT".to_owned(),
             trace: trace_enabled(),
@@ -218,6 +223,13 @@ impl MidiEngine {
                 midi.channels = channels;
             } else {
                 eprintln!("MIDI: expected four channel numbers from 1-16 in KHANA_MIDI_CHANNELS");
+            }
+        }
+        if let Some(value) = std::env::var_os("KHANA_MIDI_TRANSPOSE") {
+            if let Some(offsets) = value.to_str().and_then(parse_transpose) {
+                midi.transpose = offsets;
+            } else {
+                eprintln!("MIDI: expected four offsets from -24 to +24 in KHANA_MIDI_TRANSPOSE");
             }
         }
         Ok(midi)
@@ -254,6 +266,7 @@ impl MidiEngine {
                     connection: MidiSink::Raw(Box::new(RawOutput::new(selection))),
                     ownership: NoteOwnership::new(),
                     channels: DEFAULT_CHANNELS,
+                    transpose: [0; VOICE_COUNT],
                     clock: ClockOut::default(),
                     destination_name: String::new(),
                     trace: trace_enabled(),
@@ -414,8 +427,18 @@ impl MidiEngine {
                 voice_index,
                 note,
                 velocity,
-            } => self.note_on(voice_index, note, velocity),
-            VoiceEvent::NoteOff { voice_index, note } => self.note_off_if_owned(voice_index, note),
+            } => {
+                let Some(pitch) = self.output_pitch(voice_index, note) else {
+                    return Ok(());
+                };
+                self.note_on(voice_index, pitch, velocity)
+            }
+            VoiceEvent::NoteOff { voice_index, note } => {
+                let Some(pitch) = self.output_pitch(voice_index, note) else {
+                    return Ok(());
+                };
+                self.note_off_if_owned(voice_index, pitch)
+            }
         };
         match result {
             Ok(()) => Ok(()),
@@ -426,6 +449,24 @@ impl MidiEngine {
     /// Returns the performer channels as numbers shown to the user.
     pub fn channels(&self) -> [u8; VOICE_COUNT] {
         self.channels.map(|channel| channel + 1)
+    }
+
+    pub fn transpositions(&self) -> [i8; VOICE_COUNT] {
+        self.transpose
+    }
+
+    /// Apply a stopped-transport pitch change after releasing the wire notes.
+    pub fn adjust_transpose(&mut self, voice_index: usize, direction: i32) -> Result<(), String> {
+        self.stop_all()?;
+        let offset = &mut self.transpose[voice_index];
+        let limit = i32::from(TRANSPOSE_LIMIT);
+        *offset = (i32::from(*offset) + direction).clamp(-limit, limit) as i8;
+        Ok(())
+    }
+
+    fn output_pitch(&self, voice_index: usize, note: u8) -> Option<u8> {
+        let pitch = i16::from(note) + i16::from(*self.transpose.get(voice_index)?);
+        u8::try_from(pitch).ok().filter(|&pitch| pitch <= 127)
     }
 
     /// Apply a stopped-transport routing change after releasing the old notes.
@@ -658,6 +699,19 @@ fn parse_channels(value: &str) -> Option<[u8; VOICE_COUNT]> {
     values.next().is_none().then_some(channels)
 }
 
+fn parse_transpose(value: &str) -> Option<[i8; VOICE_COUNT]> {
+    let mut values = value.split(',');
+    let mut offsets = [0; VOICE_COUNT];
+    for offset in &mut offsets {
+        let value = values.next()?.trim().parse::<i16>().ok()?;
+        if !(-TRANSPOSE_LIMIT..=TRANSPOSE_LIMIT).contains(&value) {
+            return None;
+        }
+        *offset = value as i8;
+    }
+    values.next().is_none().then_some(offsets)
+}
+
 fn note_on_message(channel: u8, note: u8, velocity: u8) -> [u8; 3] {
     [0x90 | channel, note.min(127), velocity.min(127)]
 }
@@ -676,6 +730,43 @@ mod tests {
         for invalid in ["", "0,1,2,3", "1,2,3,17", "1,2,3", "1,2,3,4,5"] {
             assert_eq!(parse_channels(invalid), None);
         }
+    }
+
+    #[test]
+    fn transpose_uses_wire_pitch_for_shared_ownership_and_releases() {
+        let mut midi = MidiEngine::dry_run();
+        midi.connection = MidiSink::Capture(Vec::new());
+        midi.adjust_channel(1, -1).unwrap();
+        midi.adjust_transpose(0, 12).unwrap();
+        midi.adjust_transpose(1, -12).unwrap();
+        for (voice_index, note) in [(0, 48), (1, 72), (1, 11)] {
+            midi.apply_event(VoiceEvent::NoteOn {
+                voice_index,
+                note,
+                velocity: 90,
+            })
+            .unwrap();
+        }
+        midi.apply_event(VoiceEvent::NoteOff {
+            voice_index: 0,
+            note: 48,
+        })
+        .unwrap();
+        assert_eq!(midi.active_counts(), [0, 1, 0, 0]);
+        midi.adjust_transpose(1, 12).unwrap();
+        assert_eq!(midi.active_counts(), [0; 4]);
+        let MidiSink::Capture(messages) = &midi.connection else {
+            unreachable!()
+        };
+        assert_eq!(
+            messages,
+            &[
+                Message::Channel([0x90, 60, 90]),
+                Message::Channel([0x80, 60, 0])
+            ]
+        );
+        assert_eq!(parse_transpose("-24,0,+12,24"), Some([-24, 0, 12, 24]));
+        assert_eq!(parse_transpose("-25,0,12,24"), None);
     }
 
     #[test]

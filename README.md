@@ -1,4 +1,7 @@
-# Khaṇa v0.11.6
+# Khaṇa v0.12.0
+
+See [v0.12.0 transpose and musical continuity](docs/BRICK_V0.12.0.md) for
+per-performer MIDI transpose, the evolving Melody motif, and listening checks.
 
 See [v0.11.6 MIDI routing and external sync](docs/BRICK_V0.11.6.md) for
 assigning performer channels, following MIDI Clock In, and building with

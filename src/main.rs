@@ -1,4 +1,4 @@
-//! Khaṇa v0.11.6 MIDI channel routing and external synchronization.
+//! Khaṇa v0.12.0 performer transposition and musical continuity.
 //!
 //! v0.11 adds complete semantic chord voicings, rhythmic/gated Melody phrases,
 //! persistent cyclic Texture, and lightweight performer-to-performer awareness.
@@ -664,6 +664,7 @@ fn adjust_setting(
         }
         SettingField::MidiClockOut => {}
         SettingField::MidiChannel(voice) => midi.adjust_channel(voice, direction)?,
+        SettingField::MidiTranspose(voice) => midi.adjust_transpose(voice, direction)?,
         SettingField::MidiPanic => {}
         SettingField::MidiOutput => {
             if !transport.is_running() {

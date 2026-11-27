@@ -44,6 +44,7 @@ pub(crate) struct Frame {
     midi_destination: String,
     midi_clock: &'static str,
     midi_channels: [u8; 4],
+    midi_transpose: [i8; 4],
     midi_input: Option<String>,
     phrase: Option<Phrase>,
     phrase_index: usize,
@@ -92,6 +93,7 @@ impl Frame {
                 midi.clock_label()
             },
             midi_channels: midi.channels(),
+            midi_transpose: midi.transpositions(),
             midi_input: transport.midi_input_label().map(str::to_owned),
             phrase: if app.screen == Screen::PhraseEditor {
                 app.selected_phrase().cloned()
@@ -140,6 +142,7 @@ impl Frame {
                     midi_destination: &self.midi_destination,
                     midi_clock: self.midi_clock,
                     midi_channels: self.midi_channels,
+                    midi_transpose: self.midi_transpose,
                     midi_input: self.midi_input.as_deref(),
                 },
             ),
@@ -481,13 +484,21 @@ mod tests {
     fn stopped_settings_assign_channels_and_midi_input_blocks_clock_out() {
         let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
         worker.action(InputAction::ToggleSettings).unwrap();
-        for _ in 0..4 {
+        for _ in 0..8 {
             worker.action(InputAction::NavigateLeft).unwrap();
         }
         let settings = worker.snapshot().unwrap();
         assert_eq!(settings.setting_focus, Some(SettingField::MidiChannel(3)));
         worker.action(InputAction::NavigateUp).unwrap();
         assert_eq!(worker.snapshot().unwrap().midi_channels, [1, 2, 3, 5]);
+        worker.action(InputAction::NavigateRight).unwrap();
+        worker.action(InputAction::NavigateUp).unwrap();
+        let transpose = worker.snapshot().unwrap();
+        assert_eq!(
+            transpose.setting_focus,
+            Some(SettingField::MidiTranspose(0))
+        );
+        assert_eq!(transpose.midi_transpose, [1, 0, 0, 0]);
         worker.action(InputAction::MenuTap).unwrap();
         worker.action(InputAction::ToggleSettings).unwrap();
         for _ in 0..4 {

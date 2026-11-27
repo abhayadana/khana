@@ -33,6 +33,7 @@ pub struct PerformanceView<'a> {
     pub midi_destination: &'a str,
     pub midi_clock: &'static str,
     pub midi_channels: [u8; 4],
+    pub midi_transpose: [i8; 4],
     pub midi_input: Option<&'a str>,
 }
 
@@ -87,6 +88,7 @@ impl Ui {
             midi_destination,
             midi_clock,
             midi_channels,
+            midi_transpose,
             midi_input,
         } = view;
 
@@ -118,6 +120,11 @@ impl Ui {
                 "{} MIDI CHANNEL {}  UP/DOWN",
                 voices[voice].role.label(),
                 midi_channels[voice]
+            )),
+            Some(SettingField::MidiTranspose(voice)) => Some(format!(
+                "{} TRANSPOSE {:+} SEMITONES  UP/DOWN",
+                voices[voice].role.label(),
+                midi_transpose[voice]
             )),
             Some(SettingField::Tempo) if sync_status.running => {
                 Some("LIVE TEMPO: UP/DOWN 1 BPM".to_owned())
@@ -205,7 +212,7 @@ impl Ui {
             voices,
             performer_snapshots,
             scope,
-            midi_channels,
+            (midi_channels, midi_transpose),
             setting_focus,
         )?;
 
@@ -471,6 +478,7 @@ fn draw_header(
                     | SettingField::MidiClockOut
                     | SettingField::MidiPanic
                     | SettingField::MidiChannel(_)
+                    | SettingField::MidiTranspose(_)
             )
         )
         && !(sync_status.mode == SyncMode::MidiIn
@@ -567,7 +575,7 @@ fn draw_voice_rows(
     voices: &[Voice; 4],
     snapshots: [PerformerSnapshot; 4],
     scope: VoiceScope,
-    channels: [u8; 4],
+    (channels, transpose): ([u8; 4], [i8; 4]),
     focus: Option<SettingField>,
 ) -> Result<(), String> {
     draw_text(canvas, 36, 330, "PERFORMERS", 2, dim_text())?;
@@ -599,13 +607,19 @@ fn draw_voice_rows(
             52,
             y + 31,
             &format!(
-                "CH {}  RST {}  {}",
+                "CH {}  TR {:+}  {}  {}",
                 channels[index],
+                transpose[index],
                 snapshots[index].reset_rule.label(),
                 snapshots[index].family.label()
             ),
             1,
-            field_color(focus, SettingField::MidiChannel(index)),
+            if matches!(focus, Some(SettingField::MidiChannel(role) | SettingField::MidiTranspose(role)) if role == index)
+            {
+                accent()
+            } else {
+                dim_text()
+            },
         )?;
         draw_value_bar(canvas, 250, y + 4, voice.parameters.density)?;
         draw_value_bar(canvas, 420, y + 4, voice.parameters.dynamics)?;
