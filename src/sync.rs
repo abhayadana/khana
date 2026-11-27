@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::midi::{MidiFollower, RawClockInput};
 
 /// Clock source used by Khaṇa.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SyncMode {
     Internal,
     Link,
@@ -285,6 +285,7 @@ pub struct SyncTransport {
     #[cfg(feature = "ableton-link")]
     link: LinkTransport,
     link_start_stop_preference: bool,
+    restored_idle: bool,
     midi_port: Option<RawClockInput>,
     midi: MidiFollower,
 }
@@ -298,6 +299,7 @@ impl SyncTransport {
             #[cfg(feature = "ableton-link")]
             link: LinkTransport::new(bpm),
             link_start_stop_preference: false,
+            restored_idle: false,
             midi_port: None,
             midi: MidiFollower::new(bpm),
         }
@@ -342,7 +344,21 @@ impl SyncTransport {
             }
         }
         self.mode = mode;
+        self.restored_idle = false;
         true
+    }
+
+    pub(crate) fn restore_mode(&mut self, mode: SyncMode, quantum: f64, shared: bool) {
+        self.set_mode(mode, quantum);
+        self.set_link_start_stop_sync(shared);
+        if self.mode == SyncMode::MidiIn {
+            self.midi.disarm();
+        }
+        self.restored_idle = self.mode != SyncMode::Internal;
+    }
+
+    pub(crate) fn internal_tempo(&self) -> f64 {
+        self.internal.bpm
     }
 
     pub fn poll_midi(&mut self, now: Instant) {
@@ -383,6 +399,9 @@ impl SyncTransport {
 
     /// Returns whether Khaṇa transport is running.
     pub fn is_running(&mut self) -> bool {
+        if self.restored_idle {
+            return false;
+        }
         match self.mode {
             SyncMode::Internal => self.internal.running,
             SyncMode::MidiIn => self.midi.running(),
@@ -402,6 +421,7 @@ impl SyncTransport {
 
     /// Starts Khaṇa transport.
     pub fn start(&mut self, _quantum: f64) {
+        self.restored_idle = false;
         match self.mode {
             SyncMode::Internal => self.internal.start(),
             SyncMode::MidiIn => self.midi.arm(),
@@ -425,6 +445,9 @@ impl SyncTransport {
     }
 
     pub fn start_pending(&mut self) -> bool {
+        if self.restored_idle {
+            return false;
+        }
         #[cfg(feature = "ableton-link")]
         if self.mode == SyncMode::Link {
             return self.link.start_pending();
@@ -433,6 +456,9 @@ impl SyncTransport {
     }
 
     pub fn pending_beat(&mut self, _quantum: f64) -> Option<f64> {
+        if self.restored_idle {
+            return None;
+        }
         #[cfg(feature = "ableton-link")]
         if self.mode == SyncMode::Link {
             return self.link.pending_beat(_quantum);

@@ -1,4 +1,7 @@
-# Khaṇa v0.12.0
+# Khaṇa v0.12.1
+
+See [v0.12.1 live harmony and session restore](docs/BRICK_V0.12.1.md) for
+the new controls, looping, voicings, and save behavior.
 
 See [v0.12.0 transpose and musical continuity](docs/BRICK_V0.12.0.md) for
 per-performer MIDI transpose, the evolving Melody motif, and listening checks.

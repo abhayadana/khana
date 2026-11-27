@@ -324,6 +324,28 @@ impl MidiEngine {
         }
     }
 
+    pub(crate) fn clock_enabled(&self) -> bool {
+        self.clock.enabled
+    }
+
+    pub(crate) fn restore_routing(&mut self, channels: [u8; 4], transpose: [i8; 4], clock: bool) {
+        if std::env::var("KHANA_MIDI_CHANNELS")
+            .ok()
+            .and_then(|s| parse_channels(&s))
+            .is_none()
+        {
+            self.channels = channels.map(|channel| channel - 1);
+        }
+        if std::env::var("KHANA_MIDI_TRANSPOSE")
+            .ok()
+            .and_then(|s| parse_transpose(&s))
+            .is_none()
+        {
+            self.transpose = transpose;
+        }
+        self.clock.enabled = clock;
+    }
+
     pub fn toggle_clock_out(&mut self) {
         self.clock.toggle();
     }

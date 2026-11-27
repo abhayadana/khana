@@ -3,7 +3,7 @@
 use crate::music::chord::Chord;
 
 /// One performed chord event with phrase-relative timing.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChordEvent {
     pub chord: Chord,
     pub start_beat: f64,
@@ -16,7 +16,7 @@ pub struct ChordEvent {
 /// meter-aware: compound x/8 meters divisible by three use a dotted-quarter
 /// beat, while other meters use the denominator note. `Bar` always uses the
 /// full current measure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EditGrid {
     Sixteenth,
     Eighth,
@@ -85,9 +85,53 @@ impl EditGrid {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum LiveGrid {
+    #[default]
+    Immediate,
+    Eighth,
+    Quarter,
+    Beat,
+    Bar,
+}
+
+impl LiveGrid {
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Immediate => Self::Eighth,
+            Self::Eighth => Self::Quarter,
+            Self::Quarter => Self::Beat,
+            Self::Beat => Self::Bar,
+            Self::Bar => Self::Immediate,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Immediate => "NOW",
+            Self::Eighth => "1/8",
+            Self::Quarter => "1/4",
+            Self::Beat => "BEAT",
+            Self::Bar => "BAR",
+        }
+    }
+
+    pub fn quantum(self, meter: crate::music::settings::TimeSignature) -> Option<f64> {
+        let grid = match self {
+            Self::Immediate => return None,
+            Self::Eighth => EditGrid::Eighth,
+            Self::Quarter => EditGrid::Quarter,
+            Self::Beat => EditGrid::Beat,
+            Self::Bar => EditGrid::Bar,
+        };
+        Some(grid.beats(meter.numerator, meter.denominator))
+    }
+}
+
 /// Auto-numbered phrase containing semantic chord events.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Phrase {
+    pub looping: bool,
     pub id: u32,
     pub events: Vec<ChordEvent>,
 }
@@ -221,6 +265,15 @@ impl PhraseRecorder {
         RecorderStatus::Idle
     }
 
+    pub fn continue_numbering(&mut self, phrases: &[Phrase]) {
+        self.next_phrase_id = phrases
+            .iter()
+            .map(|phrase| phrase.id)
+            .max()
+            .unwrap_or_default()
+            .saturating_add(1);
+    }
+
     pub const fn quantize_beats(&self) -> f64 {
         self.quantize_beats
     }
@@ -301,6 +354,7 @@ impl PhraseRecorder {
         close_current_event(&mut completed, stop_beat);
 
         let phrase = Phrase {
+            looping: false,
             id: completed.phrase_id,
             events: completed.events,
         };
@@ -346,12 +400,13 @@ struct ScheduledPhrase {
 #[derive(Debug, Default)]
 pub struct PhrasePlaybackUpdate {
     pub chord: Option<Chord>,
+    pub chord_beat: Option<f64>,
     pub next_chord: Option<Chord>,
     pub next_chord_beat: Option<f64>,
     pub ended: bool,
 }
 
-/// One-shot semantic phrase player with quantized replacement queueing.
+/// Semantic phrase player supporting one-shot playback, loops, and bar-quantized replacement.
 pub struct PhrasePlayer {
     playing: Option<PlayingPhrase>,
     queued: Option<ScheduledPhrase>,
@@ -367,6 +422,10 @@ impl PhrasePlayer {
 
     pub fn playing_phrase(&self) -> Option<usize> {
         self.playing.map(|state| state.phrase_index)
+    }
+
+    pub fn clear_queue(&mut self) {
+        self.queued = None;
     }
 
     pub fn queued_phrase(&self) -> Option<usize> {
@@ -413,34 +472,56 @@ impl PhrasePlayer {
         let Some(phrase) = phrases.get(playing.phrase_index) else {
             self.playing = None;
             return PhrasePlaybackUpdate {
-                chord: None,
-                next_chord: None,
-                next_chord_beat: None,
                 ended: true,
+                ..PhrasePlaybackUpdate::default()
             };
         };
 
-        let relative_beat = now_beat - playing.started_beat;
-        let mut chord = None;
+        let duration = phrase.duration_beats();
+        if phrase.looping && duration > 0.0 && now_beat >= playing.started_beat + duration {
+            let loops = ((now_beat - playing.started_beat) / duration)
+                .floor()
+                .max(1.0);
+            playing.started_beat += loops * duration;
+            playing.next_event_index = 0;
+        }
+        let mut current = None;
 
         while let Some(event) = phrase.events.get(playing.next_event_index) {
-            if relative_beat + f64::EPSILON < event.start_beat {
+            let start = playing.started_beat + event.start_beat;
+            if now_beat < start {
                 break;
             }
 
-            chord = Some(event.chord);
+            current = Some((event.chord, start));
             playing.next_event_index += 1;
         }
 
-        let ended = relative_beat >= phrase.duration_beats();
+        let ended = now_beat >= playing.started_beat + duration;
 
         let next_event = if ended {
             None
         } else {
             phrase.events.get(playing.next_event_index)
         };
-        let next_chord = next_event.map(|event| event.chord);
-        let next_chord_beat = next_event.map(|event| playing.started_beat + event.start_beat);
+        let next = next_event
+            .map(|event| (event.chord, playing.started_beat + event.start_beat))
+            .or_else(|| {
+                phrase
+                    .looping
+                    .then(|| phrase.events.first())
+                    .flatten()
+                    .map(|event| (event.chord, playing.started_beat + duration))
+            });
+        let queued = self.queued.and_then(|entry| {
+            let chord = phrases.get(entry.phrase_index)?.events.first()?.chord;
+            Some((chord, entry.start_beat))
+        });
+        let next = match (next, queued) {
+            (Some(a), Some(b)) => Some(if a.1 < b.1 { a } else { b }),
+            (a, b) => a.or(b),
+        };
+        let (next_chord, next_chord_beat) = next.unzip();
 
         if ended {
             self.playing = None;
@@ -448,8 +529,10 @@ impl PhrasePlayer {
             self.playing = Some(playing);
         }
 
+        let (chord, chord_beat) = current.unzip();
         PhrasePlaybackUpdate {
             chord,
+            chord_beat,
             next_chord,
             next_chord_beat,
             ended,
@@ -488,7 +571,7 @@ fn next_boundary(now_beat: f64, quantum: f64) -> f64 {
     }
 }
 
-fn next_strict_boundary(now_beat: f64, quantum: f64) -> f64 {
+pub fn next_strict_boundary(now_beat: f64, quantum: f64) -> f64 {
     ((now_beat / quantum).floor() + 1.0) * quantum
 }
 
@@ -524,6 +607,7 @@ mod tests {
     #[test]
     fn phrase_player_emits_semantic_chords() {
         let phrases = vec![Phrase {
+            looping: false,
             id: 1,
             events: vec![
                 ChordEvent {
@@ -555,11 +639,58 @@ mod tests {
     }
 
     #[test]
+    fn loop_wraps_at_recorded_length_and_queued_phrase_takes_the_next_bar() {
+        let events = [
+            ChordEvent {
+                chord: c_major(),
+                start_beat: 0.0,
+                duration_beats: 1.0,
+            },
+            ChordEvent {
+                chord: d_minor(),
+                start_beat: 1.0,
+                duration_beats: 1.3,
+            },
+        ];
+        let phrases = [
+            Phrase {
+                looping: true,
+                id: 1,
+                events: events.to_vec(),
+            },
+            Phrase {
+                looping: false,
+                id: 2,
+                events: vec![ChordEvent {
+                    start_beat: 0.0,
+                    ..events[1]
+                }],
+            },
+        ];
+        let mut player = PhrasePlayer::new();
+        player.request(0, 4.0, 4.0);
+        assert_eq!(player.update(&phrases, 4.0).chord, Some(c_major()));
+        let last = player.update(&phrases, 5.0);
+        assert_eq!(last.chord, Some(d_minor()));
+        assert_eq!(last.next_chord_beat, Some(6.3));
+        let seam = player.update(&phrases, 6.3);
+        assert_eq!(seam.chord, Some(c_major()));
+        assert_eq!(seam.chord_beat, Some(6.3));
+        assert!(!seam.ended);
+        player.request(1, 6.5, 4.0);
+        assert_eq!(player.update(&phrases, 7.31).next_chord_beat, Some(8.0));
+        assert_eq!(player.update(&phrases, 8.0).chord, Some(d_minor()));
+        assert_eq!(player.playing_phrase(), Some(1));
+        assert_eq!(player.queued_phrase(), None);
+    }
+
+    #[test]
     fn off_grid_duration_snaps_to_adjacent_boundary() {
         let chord = crate::music::settings::MusicalSettings::default()
             .tonal
             .tonic_chord();
         let mut phrase = Phrase {
+            looping: false,
             id: 1,
             events: vec![ChordEvent {
                 chord,

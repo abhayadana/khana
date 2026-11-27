@@ -2,8 +2,8 @@
 
 use super::chord::{Chord, ChordExtension, ChordQuality, PitchClass};
 
-/// Seven diatonic modes supported by the MVP.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Playable seven-note scales and modes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ScaleMode {
     Ionian,
     Dorian,
@@ -12,10 +12,12 @@ pub enum ScaleMode {
     Mixolydian,
     Aeolian,
     Locrian,
+    HarmonicMinor,
+    MelodicMinor,
 }
 
 impl ScaleMode {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Ionian,
         Self::Dorian,
         Self::Phrygian,
@@ -23,6 +25,8 @@ impl ScaleMode {
         Self::Mixolydian,
         Self::Aeolian,
         Self::Locrian,
+        Self::HarmonicMinor,
+        Self::MelodicMinor,
     ];
 
     /// Compact mode name.
@@ -35,6 +39,8 @@ impl ScaleMode {
             Self::Mixolydian => "MIXOLYDIAN",
             Self::Aeolian => "AEOLIAN",
             Self::Locrian => "LOCRIAN",
+            Self::HarmonicMinor => "HARM MIN",
+            Self::MelodicMinor => "MEL MIN",
         }
     }
 
@@ -48,6 +54,8 @@ impl ScaleMode {
             Self::Mixolydian => [0, 2, 4, 5, 7, 9, 10],
             Self::Aeolian => [0, 2, 3, 5, 7, 8, 10],
             Self::Locrian => [0, 1, 3, 5, 6, 8, 10],
+            Self::HarmonicMinor => [0, 2, 3, 5, 7, 8, 11],
+            Self::MelodicMinor => [0, 2, 3, 5, 7, 9, 11],
         }
     }
 
@@ -71,7 +79,7 @@ impl ScaleMode {
 }
 
 /// Supported time signatures for the MVP.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TimeSignature {
     pub numerator: u8,
     pub denominator: u8,
@@ -127,7 +135,7 @@ impl TimeSignature {
 }
 
 /// Tonal context used by the recommendation engine.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TonalContext {
     pub tonic: PitchClass,
     pub mode: ScaleMode,
@@ -148,6 +156,8 @@ impl TonalContext {
         let seventh = interval_above(scale[seventh_index], root_interval, degree + 6 >= 7);
 
         let quality = match (third, fifth, seventh) {
+            (4, 8, _) => ChordQuality::AugmentedMajor,
+            (3, 7, 11) => ChordQuality::MinorMajor,
             (4, 7, 10) => ChordQuality::Dominant,
             (4, 7, _) => ChordQuality::Major,
             (3, 6, 10) => ChordQuality::HalfDiminished,
@@ -214,7 +224,7 @@ fn interval_above(note_interval: u8, root_interval: u8, wrapped: bool) -> u8 {
 }
 
 /// Editable musical settings for Khaṇa.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MusicalSettings {
     pub tonal: TonalContext,
     pub tempo_bpm: f64,
@@ -245,13 +255,16 @@ pub enum SettingField {
     StartStopSync,
     MidiChannel(usize),
     MidiTranspose(usize),
+    ChordHold,
+    BassArrival,
+    Voicing,
     MidiClockOut,
     MidiPanic,
     MidiOutput,
 }
 
 impl SettingField {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 20] = [
         Self::Tonic,
         Self::Mode,
         Self::Tempo,
@@ -266,6 +279,9 @@ impl SettingField {
         Self::MidiTranspose(1),
         Self::MidiTranspose(2),
         Self::MidiTranspose(3),
+        Self::ChordHold,
+        Self::BassArrival,
+        Self::Voicing,
         Self::MidiClockOut,
         Self::MidiPanic,
         Self::MidiOutput,
@@ -305,6 +321,27 @@ mod tests {
 
         assert_eq!(chord.root, PitchClass::from_value(7));
         assert_eq!(chord.quality, ChordQuality::Dominant);
+    }
+
+    #[test]
+    fn minor_modes_harmonize_every_seventh_from_the_scale() {
+        for mode in [ScaleMode::HarmonicMinor, ScaleMode::MelodicMinor] {
+            let context = TonalContext {
+                tonic: PitchClass::from_value(0),
+                mode,
+            };
+            let scale = mode.intervals();
+            for degree in 0..7 {
+                let seventh = context.diatonic_chord(degree, ChordExtension::Seventh);
+                let expected = [0, 2, 4, 6].map(|offset| scale[(degree + offset) % 7]);
+                let actual = seventh
+                    .intervals()
+                    .iter()
+                    .map(|step| (scale[degree] + step) % 12)
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "{mode:?} degree {degree}");
+            }
+        }
     }
 
     #[test]

@@ -65,13 +65,43 @@ impl Voicing {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum VoicingStyle {
+    #[default]
+    Smooth,
+    Close,
+    Open,
+}
+
+impl VoicingStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Smooth => "SMOOTH",
+            Self::Close => "CLOSE",
+            Self::Open => "OPEN",
+        }
+    }
+    pub fn next(self, direction: i32) -> Self {
+        let styles = [Self::Smooth, Self::Close, Self::Open];
+        let index = styles
+            .iter()
+            .position(|&style| style == self)
+            .unwrap_or_default();
+        styles[(index as i32 + direction).rem_euclid(3) as usize]
+    }
+}
+
 /// Produces smooth complete chord voicings.
-pub struct VoicingEngine;
+pub struct VoicingEngine {
+    pub style: VoicingStyle,
+}
 
 impl VoicingEngine {
     /// Creates a voicing engine.
     pub const fn new() -> Self {
-        Self
+        Self {
+            style: VoicingStyle::Smooth,
+        }
     }
 
     /// Finds a smooth complete realization for the Chords performer.
@@ -149,8 +179,20 @@ impl VoicingEngine {
                         continue;
                     }
 
-                    let score =
-                        score_voicing(candidate, previous, spread) + inversion as f32 * 0.35;
+                    let score = score_voicing(candidate, previous, spread)
+                        + inversion as f32 * 0.35
+                        + match self.style {
+                            VoicingStyle::Smooth => 0.0,
+                            VoicingStyle::Close => {
+                                f32::from(candidate.top_note() - candidate.note(0)) * 4.0
+                            }
+                            VoicingStyle::Open => {
+                                (24.0 + 10.0 * spread
+                                    - f32::from(candidate.top_note() - candidate.note(0)))
+                                .abs()
+                                    * 4.0
+                            }
+                        };
                     if score < best_score {
                         best = candidate;
                         best_score = score;
@@ -337,6 +379,31 @@ mod tests {
     }
 
     #[test]
+    fn open_and_close_styles_change_span_with_complete_membership() {
+        let chord = Chord::new(
+            PitchClass::from_value(0),
+            ChordQuality::MinorMajor,
+            ChordExtension::Seventh,
+        );
+        let close = VoicingEngine {
+            style: super::VoicingStyle::Close,
+        }
+        .realize(chord, None, 0.5);
+        let open = VoicingEngine {
+            style: super::VoicingStyle::Open,
+        }
+        .realize(chord, None, 0.5);
+        let span = |voicing: super::Voicing| voicing.note(voicing.len() - 1) - voicing.note(0);
+        assert!(span(open) > span(close));
+        let mut close_pcs = pitch_classes(close);
+        let mut open_pcs = pitch_classes(open);
+        close_pcs.sort_unstable();
+        open_pcs.sort_unstable();
+        assert_eq!(close_pcs, vec![0, 3, 7, 11]);
+        assert_eq!(open_pcs, close_pcs);
+    }
+
+    #[test]
     fn every_current_chord_type_realizes_complete_unique_membership() {
         let qualities = [
             ChordQuality::Major,
@@ -344,6 +411,8 @@ mod tests {
             ChordQuality::Dominant,
             ChordQuality::Diminished,
             ChordQuality::HalfDiminished,
+            ChordQuality::MinorMajor,
+            ChordQuality::AugmentedMajor,
         ];
         let extensions = [
             ChordExtension::Triad,

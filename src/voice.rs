@@ -25,7 +25,7 @@ impl VoiceRole {
 }
 
 /// Live parameters for one performer.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VoiceParameters {
     pub density: f32,
     pub dynamics: f32,
@@ -99,6 +99,7 @@ pub struct VoiceRender {
 pub struct VoiceEngine {
     voicing_engine: VoicingEngine,
     current_voicing: Option<Voicing>,
+    pub style: crate::music::voicing::VoicingStyle,
 }
 
 impl VoiceEngine {
@@ -107,6 +108,7 @@ impl VoiceEngine {
         Self {
             voicing_engine: VoicingEngine::new(),
             current_voicing: None,
+            style: crate::music::voicing::VoicingStyle::Smooth,
         }
     }
 
@@ -120,8 +122,13 @@ impl VoiceEngine {
         self.render(chord, voices)
     }
 
+    pub fn cycle_style(&mut self, direction: i32) {
+        self.style = self.style.next(direction);
+    }
+
     fn render(&mut self, chord: Chord, voices: &[Voice; 4]) -> VoiceRender {
         let chord_spread = voices[1].parameters.spread;
+        self.voicing_engine.style = self.style;
         let voicing = self
             .voicing_engine
             .realize(chord, self.current_voicing, chord_spread);

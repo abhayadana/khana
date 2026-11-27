@@ -9,6 +9,7 @@ mod music;
 mod performer;
 mod phrase;
 mod runtime;
+mod session;
 mod sync;
 mod ui;
 mod voice;
@@ -24,7 +25,7 @@ use music::recommendation::{
 };
 use music::settings::{MusicalSettings, SettingField};
 use performer::PerformerEngine;
-use phrase::{EditGrid, Phrase, PhrasePlayer, PhraseRecorder};
+use phrase::{EditGrid, LiveGrid, Phrase, PhrasePlayer, PhraseRecorder};
 use sdl2::event::Event;
 use sync::{SyncMode, SyncTransport};
 use ui::Ui;
@@ -64,6 +65,8 @@ struct App {
     editor_event_index: usize,
     editor_zoom: f32,
     editor_grid: EditGrid,
+    live_grid: LiveGrid,
+    pending_chord: Option<(Chord, f64)>,
 }
 
 impl App {
@@ -116,6 +119,8 @@ impl App {
             editor_event_index: 0,
             editor_zoom: 82.0,
             editor_grid: EditGrid::Quarter,
+            live_grid: LiveGrid::Immediate,
+            pending_chord: None,
         }
     }
 
@@ -447,6 +452,7 @@ fn toggle_transport(app: &mut App, transport: &mut SyncTransport) {
         app.recorder.cancel_pending_start();
     }
     if transport.is_running() || transport.start_pending() {
+        app.pending_chord = None;
         transport.stop();
     } else {
         transport.start(app.settings.meter.beats_per_bar());
@@ -481,9 +487,20 @@ fn handle_performance_action(
             app.selected_row = (app.selected_row + 1) % 3;
         }
         InputAction::Primary => {
-            app.phrase_player.stop();
-            app.set_harmony(app.chosen_chord(), now_beat, transport.is_running(), true);
+            let chord = app.chosen_chord();
+            if transport.is_running()
+                && let Some(quantum) = app.live_grid.quantum(app.settings.meter)
+            {
+                app.pending_chord = Some((chord, phrase::next_strict_boundary(now_beat, quantum)));
+            } else {
+                app.pending_chord = None;
+                app.phrase_player.stop();
+                app.set_harmony(chord, now_beat, transport.is_running(), true);
+            }
         }
+        InputAction::RightClick => app.live_grid = app.live_grid.next(),
+        InputAction::LeftClick => app.performer_engine.toggle_hold(app.scope),
+        InputAction::Vary => app.performer_engine.request_variation(app.scope),
         InputAction::Secondary => {
             app.recommendation_engine.reroll();
             app.surprise = false;
@@ -665,6 +682,12 @@ fn adjust_setting(
         SettingField::MidiClockOut => {}
         SettingField::MidiChannel(voice) => midi.adjust_channel(voice, direction)?,
         SettingField::MidiTranspose(voice) => midi.adjust_transpose(voice, direction)?,
+        SettingField::ChordHold => app.performer_engine.cycle_hold_length(direction),
+        SettingField::BassArrival => app.performer_engine.toggle_bass_arrival(),
+        SettingField::Voicing => {
+            app.voice_engine.cycle_style(direction);
+            app.revoice_current();
+        }
         SettingField::MidiPanic => {}
         SettingField::MidiOutput => {
             if !transport.is_running() {
@@ -714,6 +737,7 @@ fn handle_editor_action(
                     transport.start(app.settings.meter.beats_per_bar());
                 }
 
+                app.pending_chord = None;
                 app.performer_engine.set_enabled(true);
                 app.phrase_player.request(
                     app.editor_phrase_index,
@@ -724,6 +748,12 @@ fn handle_editor_action(
                 );
             }
         }
+        InputAction::LeftClick => {
+            if let Some(phrase) = app.selected_phrase_mut() {
+                phrase.looping = !phrase.looping;
+            }
+        }
+        InputAction::RightClick => app.phrase_player.clear_queue(),
         InputAction::Secondary => {
             replace_selected_with_safe_choice(app);
         }
@@ -824,6 +854,7 @@ fn print_controls() {
     println!("PERFORMANCE:");
     println!("  arrows  browse Safe / Colorful / Bold");
     println!("  Z       commit highlighted chord");
+    println!("  F5 / F6 / F7  Hold scoped pattern / live grid / Vary");
     println!("  X       reroll same vocabulary");
     println!("  S       surprise / broaden vocabulary");
     println!("  Q/E/W   Resolve / Neutral / Tension bias");
@@ -858,7 +889,9 @@ fn print_controls() {
     println!("  Performance: A commit B reroll X surprise Y neutral L/R1 scope L/R2 bias");
     println!("  SELECT+A record, SELECT+B arm next, SELECT+X settings / live internal tempo");
     println!("  Sticks: left X/Y density/dynamics, right X/Y spread/color");
+    println!("  Performance: SELECT+L1 Hold, SELECT+R1 live grid, SELECT+Y Vary");
     println!("  Editor: A play B change X duplicate Y back; SELECT+Y delete");
+    println!("  Editor: SELECT+X Loop, SELECT+B clear queue (desktop F5 / F6)");
     println!("  L/R1 phrase, L/R2 duration, SELECT+L/R1 zoom, D-pad grid/event");
 }
 

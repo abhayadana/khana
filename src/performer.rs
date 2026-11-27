@@ -10,7 +10,7 @@
 use crate::music::chord::Chord;
 use crate::music::settings::TonalContext;
 use crate::music::voicing::{MAX_VOICING_NOTES, Voicing};
-use crate::voice::{Voice, VoiceRole};
+use crate::voice::{Voice, VoiceRole, VoiceScope};
 
 const VOICE_COUNT: usize = 4;
 const MAX_NOTES_PER_VOICE: usize = MAX_VOICING_NOTES;
@@ -88,6 +88,9 @@ impl PatternFamily {
 /// Specific pattern inside a role-specific family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PatternVariant {
+    BassSyncopatedPedal,
+    BassOctaveAnswer,
+    BassTurnaround,
     BassRootHold,
     BassRootPedal,
     BassRootFifth,
@@ -139,20 +142,23 @@ enum PatternVariant {
 
 const BASS_ANCHOR: [PatternVariant; 2] =
     [PatternVariant::BassRootHold, PatternVariant::BassRootPedal];
-const BASS_FOUNDATION: [PatternVariant; 3] = [
+const BASS_FOUNDATION: [PatternVariant; 4] = [
     PatternVariant::BassRootFifth,
     PatternVariant::BassRootOctave,
     PatternVariant::BassRootBounce,
+    PatternVariant::BassSyncopatedPedal,
 ];
-const BASS_MOVING: [PatternVariant; 3] = [
+const BASS_MOVING: [PatternVariant; 4] = [
     PatternVariant::BassRootFifthOctave,
     PatternVariant::BassBroken,
     PatternVariant::BassChordToneOstinato,
+    PatternVariant::BassOctaveAnswer,
 ];
-const BASS_CONNECTING: [PatternVariant; 3] = [
+const BASS_CONNECTING: [PatternVariant; 4] = [
     PatternVariant::BassScaleApproach,
     PatternVariant::BassChromaticApproach,
     PatternVariant::BassWalkingFragment,
+    PatternVariant::BassTurnaround,
 ];
 const CHORDS_LONG_SUSTAIN: [PatternVariant; 2] = [
     PatternVariant::ChordsFourBarHold,
@@ -493,6 +499,10 @@ struct PerformerState {
     pattern: PatternState,
     melody_plan: MelodyPlan,
     melody_motif: MelodyPlan,
+    held: bool,
+    vary_queued: bool,
+    gesture_boundary: Option<i64>,
+    return_variant: Option<PatternVariant>,
 }
 
 impl PerformerState {
@@ -510,6 +520,10 @@ impl PerformerState {
             pattern,
             melody_plan: MelodyPlan::empty(),
             melody_motif: MelodyPlan::empty(),
+            held: false,
+            vary_queued: false,
+            gesture_boundary: None,
+            return_variant: None,
         }
     }
 }
@@ -520,6 +534,8 @@ pub struct PerformerSnapshot {
     pub active_notes: [Option<u8>; MAX_NOTES_PER_VOICE],
     pub reset_rule: ResetRule,
     pub family: PatternFamily,
+    pub held: bool,
+    pub vary_queued: bool,
 }
 
 /// Lightweight snapshot of what the other performers are doing.
@@ -547,6 +563,28 @@ struct FutureHarmony {
     start_beat: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ChordHold {
+    #[default]
+    Auto,
+    Four,
+    Eight,
+    Sixteen,
+    UntilChange,
+}
+
+impl ChordHold {
+    fn beats(self, bar: f64) -> Option<f64> {
+        Some(match self {
+            Self::Auto => return None,
+            Self::Four => 4.0 * bar,
+            Self::Eight => 8.0 * bar,
+            Self::Sixteen => 16.0 * bar,
+            Self::UntilChange => f64::INFINITY,
+        })
+    }
+}
+
 /// Four independent role-aware performers sharing one active harmony.
 pub struct PerformerEngine {
     chord: Chord,
@@ -557,11 +595,66 @@ pub struct PerformerEngine {
     enabled: bool,
     intensity: f32,
     states: [PerformerState; VOICE_COUNT],
+    pub(crate) hold_length: ChordHold,
+    pub(crate) voice_led_bass: bool,
     expired_attacks: u64,
     max_attack_lateness_beats: f64,
 }
 
 impl PerformerEngine {
+    pub(crate) fn cycle_hold_length(&mut self, direction: i32) {
+        let choices = [
+            ChordHold::Auto,
+            ChordHold::Four,
+            ChordHold::Eight,
+            ChordHold::Sixteen,
+            ChordHold::UntilChange,
+        ];
+        let index = choices
+            .iter()
+            .position(|&hold| hold == self.hold_length)
+            .unwrap_or_default();
+        self.hold_length = choices[(index as i32 + direction).rem_euclid(5) as usize];
+    }
+    pub(crate) fn hold_label(&self) -> &'static str {
+        match self.hold_length {
+            ChordHold::Auto => "AUTO",
+            ChordHold::Four => "4 BARS",
+            ChordHold::Eight => "8 BARS",
+            ChordHold::Sixteen => "16 BARS",
+            ChordHold::UntilChange => "UNTIL CHANGE",
+        }
+    }
+    pub(crate) fn toggle_bass_arrival(&mut self) {
+        self.voice_led_bass = !self.voice_led_bass;
+    }
+    pub(crate) fn bass_label(&self) -> &'static str {
+        if self.voice_led_bass {
+            "VOICE-LED"
+        } else {
+            "ROOT"
+        }
+    }
+    pub(crate) fn toggle_hold(&mut self, scope: VoiceScope) {
+        let hold = self
+            .states
+            .iter()
+            .enumerate()
+            .any(|(index, state)| in_scope(scope, index) && !state.held);
+        for (index, state) in self.states.iter_mut().enumerate() {
+            if in_scope(scope, index) {
+                state.held = hold;
+            }
+        }
+    }
+    pub(crate) fn request_variation(&mut self, scope: VoiceScope) {
+        for (index, state) in self.states.iter_mut().enumerate() {
+            if in_scope(scope, index) {
+                state.vary_queued = true;
+            }
+        }
+    }
+
     /// Creates a stopped performer engine around an initial harmony.
     pub const fn new(chord: Chord, tonal: TonalContext, chord_voicing: Voicing) -> Self {
         Self {
@@ -572,6 +665,8 @@ impl PerformerEngine {
             next_chord_target: None,
             enabled: false,
             intensity: 0.0,
+            hold_length: ChordHold::Auto,
+            voice_led_bass: false,
             expired_attacks: 0,
             max_attack_lateness_beats: 0.0,
             states: [
@@ -610,7 +705,8 @@ impl PerformerEngine {
         chord_voicing: Voicing,
         now_beat: f64,
     ) {
-        self.states[1].legato_harmony = chord != self.chord;
+        self.states[1].legato_harmony =
+            chord != self.chord || self.hold_length == ChordHold::UntilChange;
         self.chord = chord;
         self.tonal = tonal;
         self.chord_voicing = chord_voicing;
@@ -647,6 +743,7 @@ impl PerformerEngine {
     /// a destination without inventing one.
     pub fn set_next_chord_target(&mut self, chord: Option<Chord>, start_beat: Option<f64>) {
         self.next_chord_target = chord
+            .filter(|&future| future != self.chord)
             .zip(start_beat)
             .map(|(chord, start_beat)| FutureHarmony { chord, start_beat });
     }
@@ -676,6 +773,8 @@ impl PerformerEngine {
             state.last_step_key = None;
             state.pending_resolution = None;
             state.force_attack = false;
+            state.vary_queued = false;
+            state.gesture_boundary = None;
         }
     }
 
@@ -703,6 +802,8 @@ impl PerformerEngine {
     /// Returns current UI state for all four performers.
     pub fn snapshots(&self) -> [PerformerSnapshot; VOICE_COUNT] {
         std::array::from_fn(|index| PerformerSnapshot {
+            held: self.states[index].held,
+            vary_queued: self.states[index].vary_queued,
             active_notes: self.states[index]
                 .sounding
                 .map_or([None; MAX_NOTES_PER_VOICE], |sounding| {
@@ -760,13 +861,19 @@ impl PerformerEngine {
                 self.chord_origin_beat,
             );
 
-            let family_changed = self.states[index].pattern.update(
-                desired_family,
-                family_boundary,
-                timing.cycle_index,
-                behavior.activity,
-                behavior.repeat,
-            );
+            let family_changed = (!self.states[index].held
+                || self.states[index].pattern.last_cycle_index == i64::MIN)
+                && self.states[index].pattern.update(
+                    desired_family,
+                    family_boundary,
+                    if role == VoiceRole::Bass {
+                        timing.cycle_index.div_euclid(2)
+                    } else {
+                        timing.cycle_index
+                    },
+                    behavior.activity,
+                    behavior.repeat,
+                );
 
             if family_changed {
                 self.stop_sounding_now(index, &mut batch);
@@ -778,7 +885,11 @@ impl PerformerEngine {
                     beats_per_bar,
                     self.chord_origin_beat,
                 );
-                self.states[index].pattern.last_cycle_index = timing.cycle_index;
+                self.states[index].pattern.last_cycle_index = if role == VoiceRole::Bass {
+                    timing.cycle_index.div_euclid(2)
+                } else {
+                    timing.cycle_index
+                };
                 if role == VoiceRole::Melody {
                     self.states[index].melody_motif = MelodyPlan::empty();
                     self.states[index].melody_plan = MelodyPlan::empty();
@@ -793,17 +904,59 @@ impl PerformerEngine {
                 );
             }
 
-            let variant = self.states[index].pattern.variant;
-
-            if self.states[index].last_step_key == Some(timing.step_key)
-                && !self.states[index].force_attack
+            let state = &mut self.states[index];
+            let mut vary_melody = false;
+            if state.gesture_boundary != Some(family_boundary) {
+                state.gesture_boundary = Some(family_boundary);
+                if let Some(variant) = state.return_variant.take() {
+                    state.pattern.variant = variant;
+                }
+                if std::mem::take(&mut state.vary_queued) {
+                    let variants = variants_for(state.pattern.family);
+                    let current = state.pattern.variant;
+                    let choice = variants
+                        .iter()
+                        .position(|&variant| variant == current)
+                        .unwrap_or_default();
+                    if role == VoiceRole::Melody {
+                        vary_melody = true;
+                    } else if variants.len() > 1 {
+                        state.return_variant = state.held.then_some(current);
+                        state.pattern.variant = variants[(choice + 1) % variants.len()];
+                    }
+                }
+            }
+            let variant = state.pattern.variant;
+            if matches!(
+                variant,
+                PatternVariant::BassOctaveAnswer | PatternVariant::BassTurnaround
+            ) && timing.cycle_index.rem_euclid(2) == 1
             {
+                timing.position += timing.steps_per_cycle;
+            }
+
+            let sustain = if matches!(
+                state.pattern.family,
+                PatternFamily::ChordsLongSustain | PatternFamily::ChordsBarSustain
+            ) {
+                self.hold_length.beats(beats_per_bar)
+            } else {
+                None
+            };
+            let renew_hold =
+                sustain.is_some() && state.sounding.is_none() && state.pending.is_none();
+            if state.last_step_key == Some(timing.step_key) && !state.force_attack && !renew_hold {
                 continue;
             }
             self.states[index].last_step_key = Some(timing.step_key);
 
             if role == VoiceRole::Melody {
                 self.ensure_melody_plan(timing, voice.parameters.color, behavior, variant);
+                if vary_melody {
+                    let melody = &mut self.states[index];
+                    melody.melody_plan = vary_melody_plan(melody.melody_motif, 3, variant);
+                    melody.melody_plan.cycle_index = timing.cycle_index;
+                }
             }
 
             let ensemble = self.ensemble_context();
@@ -814,10 +967,12 @@ impl PerformerEngine {
                     self.states[index].pattern.family,
                     PatternFamily::ChordsLongSustain | PatternFamily::ChordsBarSustain
                 );
-            if behavior.activity <= 0.01
-                || (!forced
-                    && !self.should_attack(index, role, timing, behavior, ensemble, now_beat))
-            {
+            let should_attack = if sustain.is_some() {
+                renew_hold
+            } else {
+                self.should_attack(index, role, timing, behavior, ensemble, now_beat)
+            };
+            if behavior.activity <= 0.01 || (!forced && !should_attack) {
                 continue;
             }
 
@@ -829,9 +984,11 @@ impl PerformerEngine {
                     voice,
                     ensemble,
                 )),
-                VoiceRole::Bass if forced => NoteSet::single(nearest_pitch_class_near(
-                    self.chord.root.value(),
-                    (36.0 + voice.parameters.spread * 8.0).round() as u8,
+                VoiceRole::Bass if forced => NoteSet::single(bass_arrival(
+                    self.chord,
+                    voice.parameters.spread,
+                    self.states[index].previous_note,
+                    self.voice_led_bass,
                 )),
                 VoiceRole::Bass | VoiceRole::Texture => {
                     NoteSet::single(choose_role_note(RoleNoteRequest {
@@ -840,6 +997,7 @@ impl PerformerEngine {
                         chord: self.chord,
                         tonal: self.tonal,
                         position: timing.position,
+                        steps: timing.steps_per_cycle,
                         chord_voicing: self.chord_voicing,
                         previous_note: self.states[index].previous_note,
                         next_chord: self.next_chord_target,
@@ -871,7 +1029,9 @@ impl PerformerEngine {
                     timing.step_length,
                 )
             } else {
-                gate_beats(role, variant, timing, behavior.space, self.intensity)
+                sustain.unwrap_or_else(|| {
+                    gate_beats(role, variant, timing, behavior.space, self.intensity)
+                })
             };
             let start = now_beat + timing_offset_beats(role);
 
@@ -1055,11 +1215,17 @@ impl PerformerEngine {
 
         let len = timing.steps_per_cycle.min(MAX_MELODY_STEPS);
         let group = timing.cycle_index.div_euclid(4);
-        if state.melody_motif.len != len || state.melody_motif.cycle_index != group {
+        if state.melody_motif.len != len || (!state.held && state.melody_motif.cycle_index != group)
+        {
             state.melody_motif =
                 generate_melody_plan(len, behavior, color, state.melody_motif, group, variant);
         }
-        state.melody_plan = vary_melody_plan(state.melody_motif, timing.cycle_index, variant);
+        state.melody_plan = if state.held {
+            state.melody_motif
+        } else {
+            vary_melody_plan(state.melody_motif, timing.cycle_index, variant)
+        };
+        state.melody_plan.cycle_index = timing.cycle_index;
     }
 
     fn choose_melody_note(
@@ -1129,6 +1295,7 @@ struct RoleNoteRequest {
     chord: Chord,
     tonal: TonalContext,
     position: usize,
+    steps: usize,
     chord_voicing: Voicing,
     previous_note: Option<u8>,
     next_chord: Option<FutureHarmony>,
@@ -1387,6 +1554,23 @@ fn pattern_hit(variant: PatternVariant, position: usize, steps: usize) -> bool {
     let last = steps.saturating_sub(1);
 
     match variant {
+        PatternVariant::BassSyncopatedPedal => {
+            position == 0 || position == (steps * 3 / 8) || position == last
+        }
+        PatternVariant::BassOctaveAnswer => {
+            if position < steps {
+                position == 0 || position == half
+            } else {
+                position == steps || position - steps == quarter || position - steps == last
+            }
+        }
+        PatternVariant::BassTurnaround => {
+            if position < steps {
+                position == 0 || position == half
+            } else {
+                position == steps || position - steps >= half
+            }
+        }
         PatternVariant::BassRootHold => position == 0,
         PatternVariant::BassRootPedal => position == 0,
         PatternVariant::BassRootFifth => position == 0 || position == half,
@@ -1527,7 +1711,9 @@ fn role_note_pool(
             }
             if matches!(
                 variant,
-                PatternVariant::BassScaleApproach | PatternVariant::BassWalkingFragment
+                PatternVariant::BassScaleApproach
+                    | PatternVariant::BassWalkingFragment
+                    | PatternVariant::BassTurnaround
             ) && color >= 0.35
             {
                 for interval in tonal.mode.intervals() {
@@ -1619,6 +1805,12 @@ fn choose_role_note(request: RoleNoteRequest) -> u8 {
     if matches!(request.variant, PatternVariant::BassRootFifthOctave) && request.position >= 4 {
         note = note.saturating_add(12).min(88);
     }
+    if request.variant == PatternVariant::BassOctaveAnswer && request.position > request.steps {
+        note = nearest_pitch_class_near(
+            request.chord.root.value(),
+            (target as u8).saturating_add(12),
+        );
+    }
     if let Some(future) = request.next_chord
         && future.start_beat >= request.now_beat
         && future.start_beat - request.now_beat <= 1.0
@@ -1627,8 +1819,9 @@ fn choose_role_note(request: RoleNoteRequest) -> u8 {
             PatternVariant::BassScaleApproach
                 | PatternVariant::BassChromaticApproach
                 | PatternVariant::BassWalkingFragment
+                | PatternVariant::BassTurnaround
         )
-        && request.position % 8 == 7
+        && (request.variant == PatternVariant::BassTurnaround || request.position % 8 == 7)
     {
         let destination = nearest_pitch_class_near(future.chord.root.value(), target as u8);
         note = if matches!(request.variant, PatternVariant::BassChromaticApproach)
@@ -1687,7 +1880,11 @@ fn diatonic_approach_note(destination: u8, tonal: TonalContext, previous_note: O
 
 fn pattern_note_offset(variant: PatternVariant, position: usize) -> usize {
     match variant {
-        PatternVariant::BassRootHold | PatternVariant::BassRootPedal => 0,
+        PatternVariant::BassRootHold
+        | PatternVariant::BassRootPedal
+        | PatternVariant::BassSyncopatedPedal => 0,
+        PatternVariant::BassOctaveAnswer => 0,
+        PatternVariant::BassTurnaround => [0, 1, 0, 2][position % 4],
         PatternVariant::BassRootFifth => {
             if position == 0 {
                 0
@@ -1725,6 +1922,33 @@ fn pattern_note_offset(variant: PatternVariant, position: usize) -> usize {
         | PatternVariant::TextureExtensionFigure => position + 1,
         _ => 0,
     }
+}
+
+fn in_scope(scope: VoiceScope, index: usize) -> bool {
+    scope == VoiceScope::All || scope == VoiceScope::One(index)
+}
+
+fn bass_arrival(chord: Chord, spread: f32, previous: Option<u8>, voice_led: bool) -> u8 {
+    let center = (36.0 + spread * 8.0).round() as u8;
+    let root = chord.root.value();
+    let Some(last) = previous.filter(|_| voice_led) else {
+        return nearest_pitch_class_near(root, center);
+    };
+    chord
+        .intervals()
+        .into_iter()
+        .take(3)
+        .map(|degree| {
+            let pitch = nearest_pitch_class_near((root + degree) % 12, last);
+            (
+                pitch,
+                u16::from(pitch.abs_diff(last)) * 4
+                    + u16::from(pitch.abs_diff(center))
+                    + if degree == 0 { 0 } else { 5 },
+            )
+        })
+        .min_by_key(|&(_, score)| score)
+        .map_or(center, |(pitch, _)| pitch)
 }
 
 fn nearest_pitch_class_near(pitch_class: u8, target: u8) -> u8 {
@@ -1896,11 +2120,18 @@ fn generate_melody_plan(
     let three_quarter = ((len * 3) / 4).min(len - 1);
     let cadence = melody_cadence_position(len);
     let skeleton = melody_skeleton(variant);
+    let entrance = if variant == PatternVariant::MelodyAnsweringPhrase {
+        (len / 8).min(quarter)
+    } else {
+        0
+    };
+    let carry = variant == PatternVariant::MelodyDevelopedPhrase;
+    let pickup = if carry { half.saturating_sub(2) } else { half };
 
     for (position, contour) in [
-        (0, skeleton[0]),
+        (entrance, skeleton[0]),
         (quarter, skeleton[1]),
-        (half, skeleton[2]),
+        (pickup, skeleton[2]),
         (peak, skeleton[3]),
         (three_quarter, skeleton[4]),
         (cadence, skeleton[5]),
@@ -1922,8 +2153,12 @@ fn generate_melody_plan(
     let base_fill =
         (0.14 + behavior.activity * 0.70 - behavior.space * 0.22 + variant_fill).clamp(0.02, 0.96);
 
-    let mut position = 1;
+    let mut position = entrance + 1;
     while position < cadence {
+        if carry && position > pickup && position <= half {
+            position += 1;
+            continue;
+        }
         if plan.steps[position].intent != MelodyIntent::Rest {
             position += 1;
             continue;
@@ -2120,6 +2355,12 @@ fn melody_desired_gate_steps(
         MelodyIntent::Suspension(_) => 3,
         MelodyIntent::ModalTension(_) => 3,
         MelodyIntent::Skeleton(_) if position == melody_cadence_position(len) => 6,
+        MelodyIntent::Skeleton(_)
+            if variant == PatternVariant::MelodyDevelopedPhrase
+                && position == (len / 2).saturating_sub(2) =>
+        {
+            4
+        }
         MelodyIntent::Skeleton(_) if position.abs_diff((len * 5) / 8) <= 1 => 4,
         MelodyIntent::Skeleton(_) if matches!(variant, PatternVariant::MelodySparseSkeleton) => 4,
         MelodyIntent::Skeleton(_) => 2,
@@ -2436,6 +2677,68 @@ mod tests {
             .count();
 
         assert_eq!(chord_note_ons, 3);
+    }
+
+    #[test]
+    fn eight_bar_hold_keeps_chord_until_release_and_until_change_revoices_legato() {
+        let settings = MusicalSettings::default();
+        let mut voices = default_voices();
+        voices[1].parameters.density = 0.08;
+        let mut engine = PerformerEngine::new(
+            c_major(),
+            settings.tonal,
+            Voicing::from_slice(&[48, 52, 55]),
+        );
+        let chord_off =
+            |event: VoiceEvent| matches!(event, VoiceEvent::NoteOff { voice_index: 1, .. });
+        engine.hold_length = super::ChordHold::Eight;
+        engine.transport_started(0.0);
+        engine.update(0.0, 4.0, &voices);
+        engine.update(0.02, 4.0, &voices);
+        for beat in [4.0, 16.0, 31.99] {
+            assert!(!engine.update(beat, 4.0, &voices).iter().any(chord_off));
+        }
+        assert_eq!(
+            engine
+                .update(32.02, 4.0, &voices)
+                .iter()
+                .filter(|event| chord_off(*event))
+                .count(),
+            3
+        );
+
+        engine.hold_length = super::ChordHold::UntilChange;
+        engine.transport_started(0.0);
+        engine.update(0.0, 4.0, &voices);
+        engine.update(0.02, 4.0, &voices);
+        assert!(!engine.update(68.0, 4.0, &voices).iter().any(chord_off));
+        let minor = Chord::new(
+            PitchClass::from_value(9),
+            ChordQuality::Minor,
+            ChordExtension::Triad,
+        );
+        engine.harmony_changed(
+            minor,
+            settings.tonal,
+            Voicing::from_slice(&[48, 52, 57]),
+            68.0,
+        );
+        engine.update(68.0, 4.0, &voices);
+        let transition = engine.update(68.02, 4.0, &voices);
+        assert!(transition.iter().any(|event| matches!(
+            event,
+            VoiceEvent::NoteOff {
+                voice_index: 1,
+                note: 55
+            }
+        )));
+        assert!(transition.iter().all(|event| !matches!(
+            event,
+            VoiceEvent::NoteOff {
+                voice_index: 1,
+                note: 48 | 52
+            }
+        )));
     }
 
     #[test]

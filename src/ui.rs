@@ -13,6 +13,9 @@ use sdl2::rect::Rect;
 
 /// All state needed to render the live Performance screen.
 pub struct PerformanceView<'a> {
+    pub timing: &'a str,
+    pub beat_flash: Option<bool>,
+    pub options: &'a str,
     pub settings: MusicalSettings,
     pub setting_focus: Option<SettingField>,
     pub sync_status: SyncStatus,
@@ -39,6 +42,8 @@ pub struct PerformanceView<'a> {
 
 /// All state needed to render the Phrase Editor screen.
 pub struct PhraseEditorView<'a> {
+    pub timing: &'a str,
+    pub beat_flash: Option<bool>,
     pub settings: MusicalSettings,
     pub sync_status: SyncStatus,
     pub phrase: Option<&'a Phrase>,
@@ -68,6 +73,9 @@ impl Ui {
         view: PerformanceView<'_>,
     ) -> Result<(), String> {
         let PerformanceView {
+            timing,
+            beat_flash,
+            options,
             settings,
             setting_focus,
             sync_status,
@@ -96,7 +104,11 @@ impl Ui {
         canvas.clear();
 
         draw_header(canvas, settings, setting_focus, sync_status, "PERFORMANCE")?;
+        draw_beat_strip(canvas, timing, beat_flash)?;
         let settings_hint = match setting_focus {
+            Some(SettingField::ChordHold | SettingField::BassArrival | SettingField::Voicing) => {
+                Some(options.to_owned())
+            }
             Some(SettingField::MidiOutput) => {
                 let label: String = midi_destination.chars().take(42).collect();
                 Some(format!("MIDI OUTPUT: {label}"))
@@ -225,6 +237,20 @@ impl Ui {
             phrase_count,
             midi_destination,
         )?;
+        if setting_focus.is_none() {
+            draw_text(
+                canvas,
+                585,
+                729,
+                if self.brick {
+                    "SEL+L1 HOLD  SEL+R1 GRID  SEL+Y VARY"
+                } else {
+                    "F5 HOLD  F6 GRID  F7 VARY"
+                },
+                1,
+                dim_text(),
+            )?;
+        }
         if self.brick {
             let hints = if setting_focus.is_some() && sync_status.running {
                 "U/D BPM  A/B/MENU CLOSE  START STOP"
@@ -247,6 +273,8 @@ impl Ui {
         view: PhraseEditorView<'_>,
     ) -> Result<(), String> {
         let PhraseEditorView {
+            timing,
+            beat_flash,
             settings,
             sync_status,
             phrase,
@@ -263,6 +291,7 @@ impl Ui {
         canvas.clear();
 
         draw_header(canvas, settings, None, sync_status, "PHRASE EDITOR")?;
+        draw_beat_strip(canvas, timing, beat_flash)?;
 
         let Some(phrase) = phrase else {
             draw_text(canvas, 360, 310, "NO PHRASES YET", 4, dim_text())?;
@@ -297,6 +326,9 @@ impl Ui {
         draw_text(canvas, 130, 90, &format!("[{}]", current), 3, text_color())?;
         draw_text(canvas, 260, 90, &next, 3, dim_text())?;
 
+        if phrase.looping {
+            draw_text(canvas, 850, 52, "LOOP ON", 1, accent())?;
+        }
         let playback = playback_label(playing_phrase, queued_phrase);
         draw_text(canvas, 430, 90, &playback, 2, accent())?;
 
@@ -391,8 +423,35 @@ impl Ui {
             )?;
         }
 
+        draw_text(
+            canvas,
+            32,
+            746,
+            if self.brick {
+                "SEL+X LOOP  SEL+B CLEAR QUEUE"
+            } else {
+                "F5 LOOP  F6 CLEAR QUEUE"
+            },
+            1,
+            dim_text(),
+        )?;
         Ok(())
     }
+}
+
+fn draw_beat_strip(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    timing: &str,
+    flash: Option<bool>,
+) -> Result<(), String> {
+    if let Some(downbeat) = flash {
+        draw_panel(
+            canvas,
+            Rect::new(84, 51, if downbeat { 16 } else { 8 }, 8),
+            if downbeat { accent() } else { text_color() },
+        )?;
+    }
+    draw_text(canvas, 106, 52, timing, 1, accent())
 }
 
 fn draw_header(
@@ -479,6 +538,9 @@ fn draw_header(
                     | SettingField::MidiPanic
                     | SettingField::MidiChannel(_)
                     | SettingField::MidiTranspose(_)
+                    | SettingField::ChordHold
+                    | SettingField::BassArrival
+                    | SettingField::Voicing
             )
         )
         && !(sync_status.mode == SyncMode::MidiIn
@@ -607,11 +669,18 @@ fn draw_voice_rows(
             52,
             y + 31,
             &format!(
-                "CH {}  TR {:+}  {}  {}",
+                "CH {} TR {:+} {} {}{}",
                 channels[index],
                 transpose[index],
                 snapshots[index].reset_rule.label(),
-                snapshots[index].family.label()
+                snapshots[index].family.label(),
+                if snapshots[index].vary_queued {
+                    " VARY"
+                } else if snapshots[index].held {
+                    " HOLD"
+                } else {
+                    ""
+                }
             ),
             1,
             if matches!(focus, Some(SettingField::MidiChannel(role) | SettingField::MidiTranspose(role)) if role == index)

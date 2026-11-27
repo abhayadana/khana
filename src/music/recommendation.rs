@@ -739,6 +739,8 @@ fn tension_score(chord: Chord, context: TonalContext) -> f32 {
         ChordQuality::Diminished => 0.92,
         ChordQuality::HalfDiminished => 0.76,
         ChordQuality::Dominant => 0.80,
+        ChordQuality::MinorMajor => 0.64,
+        ChordQuality::AugmentedMajor => 0.83,
     };
 
     let function = match function_of(chord, context) {

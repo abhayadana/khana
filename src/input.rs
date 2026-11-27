@@ -28,6 +28,9 @@ pub enum InputAction {
     ArmNextRecording,
     ToggleScreen,
     ToggleTransport,
+    LeftClick,
+    RightClick,
+    Vary,
     ToggleSettings,
     EditDuplicate,
     EditDelete,
@@ -108,6 +111,9 @@ pub fn map_key(keycode: Keycode) -> Option<InputAction> {
         Keycode::LeftBracket => Some(GridPrevious),
         Keycode::RightBracket => Some(GridNext),
         Keycode::Escape => Some(Quit),
+        Keycode::F5 => Some(LeftClick),
+        Keycode::F6 => Some(RightClick),
+        Keycode::F7 => Some(Vary),
         _ => None,
     }
 }
@@ -194,6 +200,8 @@ fn map_controller_button(button: Button) -> Option<InputAction> {
         Button::X => Some(Tertiary),
         Button::Y => Some(ToggleScreen),
         Button::Back => Some(ToggleSettings),
+        Button::LeftStick => Some(LeftClick),
+        Button::RightStick => Some(RightClick),
         Button::Start => Some(ToggleTransport),
         Button::LeftShoulder => Some(ScopePrevious),
         Button::RightShoulder => Some(ScopeNext),
@@ -248,6 +256,8 @@ const AXIS_DEAD_ZONE: f32 = 0.12;
 pub struct HandheldInput {
     instance: Option<u32>,
     select: bool,
+    left_click: Option<u8>,
+    right_click: Option<u8>,
     menu_down: Option<Instant>,
     menu_consumed: bool,
     axes: [i16; 6],
@@ -261,6 +271,8 @@ impl HandheldInput {
         Self {
             instance,
             select: false,
+            left_click: click_button("KHANA_L3_BUTTON"),
+            right_click: click_button("KHANA_R3_BUTTON"),
             menu_down: None,
             menu_consumed: false,
             axes: [0, 0, i16::MIN, 0, 0, i16::MIN],
@@ -300,7 +312,20 @@ impl HandheldInput {
                     }
                     None
                 }
-                button => brick_button(page, button, self.select),
+                button if Some(button) == self.left_click => Some(InputAction::LeftClick),
+                button if Some(button) == self.right_click => {
+                    Some(if self.select && page == InputPage::Performance {
+                        InputAction::Vary
+                    } else {
+                        InputAction::RightClick
+                    })
+                }
+                button => {
+                    if button > 8 {
+                        println!("INPUT: unassigned Brick button index {button}");
+                    }
+                    brick_button(page, button, self.select)
+                }
             },
             Event::JoyButtonUp {
                 which, button_idx, ..
@@ -436,6 +461,14 @@ fn trigger_action(page: InputPage, trigger: usize) -> Option<InputAction> {
     }
 }
 
+fn click_button(variable: &str) -> Option<u8> {
+    std::env::var(variable)
+        .ok()?
+        .parse::<u8>()
+        .ok()
+        .filter(|&index| index > 8)
+}
+
 fn brick_button(page: InputPage, button: u8, select: bool) -> Option<InputAction> {
     use InputAction::*;
     if button == 7 && !select {
@@ -451,6 +484,11 @@ fn brick_button(page: InputPage, button: u8, select: bool) -> Option<InputAction
         (InputPage::Performance, true, 1) => Some(ToggleRecord),
         (InputPage::Performance, true, 0) => Some(ArmNextRecording),
         (InputPage::Performance, true, 3) => Some(ToggleSettings),
+        (InputPage::Performance, true, 4) => Some(LeftClick),
+        (InputPage::Performance, true, 5) => Some(RightClick),
+        (InputPage::Performance, true, 2) => Some(Vary),
+        (InputPage::Editor, true, 3) => Some(LeftClick),
+        (InputPage::Editor, true, 0) => Some(RightClick),
         (InputPage::Editor, false, 1) => Some(Primary),
         (InputPage::Editor, false, 0) => Some(Secondary),
         (InputPage::Editor, false, 3) => Some(EditDuplicate),

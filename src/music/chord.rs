@@ -3,7 +3,7 @@
 use std::fmt;
 
 /// One of the twelve chromatic pitch classes.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PitchClass(u8);
 
 impl PitchClass {
@@ -60,17 +60,21 @@ impl PitchClass {
 }
 
 /// Chord quality independent of extension.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ChordQuality {
     Major,
     Minor,
     Diminished,
     HalfDiminished,
     Dominant,
+    MinorMajor,
+    AugmentedMajor,
 }
 
 /// Amount of chordal color encoded directly in the chord identity.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub enum ChordExtension {
     Triad,
     Seventh,
@@ -78,7 +82,7 @@ pub enum ChordExtension {
 }
 
 /// A chord identity before register-specific voicing.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Chord {
     pub root: PitchClass,
     pub quality: ChordQuality,
@@ -98,9 +102,17 @@ impl Chord {
     /// Returns semitone intervals from the root used to realize this chord.
     pub fn intervals(self) -> Vec<u8> {
         use ChordExtension::{Ninth, Seventh, Triad};
-        use ChordQuality::{Diminished, Dominant, HalfDiminished, Major, Minor};
+        use ChordQuality::{
+            AugmentedMajor, Diminished, Dominant, HalfDiminished, Major, Minor, MinorMajor,
+        };
 
         match (self.quality, self.extension) {
+            (MinorMajor, Triad) => vec![0, 3, 7],
+            (MinorMajor, Seventh) => vec![0, 3, 7, 11],
+            (MinorMajor, Ninth) => vec![0, 3, 7, 11, 14],
+            (AugmentedMajor, Triad) => vec![0, 4, 8],
+            (AugmentedMajor, Seventh) => vec![0, 4, 8, 11],
+            (AugmentedMajor, Ninth) => vec![0, 4, 8, 11, 14],
             (Major, Triad) => vec![0, 4, 7],
             (Major, Seventh) => vec![0, 4, 7, 11],
             (Major, Ninth) => vec![0, 4, 7, 11, 14],
@@ -122,6 +134,16 @@ impl Chord {
     /// Returns the chord-quality / extension suffix without its root.
     pub const fn suffix(self) -> &'static str {
         match self.quality {
+            ChordQuality::MinorMajor => match self.extension {
+                ChordExtension::Triad => "M",
+                ChordExtension::Seventh => "M(MAJ7)",
+                ChordExtension::Ninth => "M(MAJ9)",
+            },
+            ChordQuality::AugmentedMajor => match self.extension {
+                ChordExtension::Triad => "AUG",
+                ChordExtension::Seventh => "AUGMAJ7",
+                ChordExtension::Ninth => "AUGMAJ9",
+            },
             ChordQuality::Major => match self.extension {
                 ChordExtension::Triad => "",
                 ChordExtension::Seventh => "MAJ7",

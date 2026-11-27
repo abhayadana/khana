@@ -53,6 +53,9 @@ pub(crate) struct Frame {
     playing_phrase: Option<usize>,
     queued_phrase: Option<usize>,
     edit_grid: EditGrid,
+    timing: String,
+    beat_flash: Option<bool>,
+    options: String,
 }
 
 impl Frame {
@@ -65,6 +68,11 @@ impl Frame {
         let now_beat = transport.beat(app.settings.meter.beats_per_bar());
         let sync_status = transport.status();
         app.settings.tempo_bpm = sync_status.tempo_bpm;
+        let bar = app.settings.meter.beats_per_bar();
+        let beat =
+            EditGrid::Beat.beats(app.settings.meter.numerator, app.settings.meter.denominator);
+        let bar_phase = now_beat.rem_euclid(bar);
+        let beat_index = (bar_phase / beat).floor() as u32;
         Self {
             screen: app.screen,
             worker_ticks,
@@ -106,6 +114,35 @@ impl Frame {
             playing_phrase: app.phrase_player.playing_phrase(),
             queued_phrase: app.phrase_player.queued_phrase(),
             edit_grid: app.editor_grid,
+            timing: {
+                let pulse = if sync_status.running {
+                    (beat_index + 1).to_string()
+                } else {
+                    "-".into()
+                };
+                let pending = app.pending_chord.map_or(String::new(), |(chord, at)| {
+                    format!(
+                        "  {} NEXT {:.1}B",
+                        app.settings.tonal.chord_symbol(chord),
+                        (at - now_beat).max(0.0)
+                    )
+                });
+                format!("BEAT {pulse}  GRID {}{pending}", app.live_grid.label())
+            },
+            beat_flash: (sync_status.running && bar_phase.rem_euclid(beat) < beat * 0.22)
+                .then_some(beat_index == 0),
+            options: match app.setting_focus {
+                Some(SettingField::ChordHold) => {
+                    format!("CHORD HOLD {}", app.performer_engine.hold_label())
+                }
+                Some(SettingField::BassArrival) => {
+                    format!("BASS ARRIVAL {}", app.performer_engine.bass_label())
+                }
+                Some(SettingField::Voicing) => {
+                    format!("VOICING {}", app.voice_engine.style.label())
+                }
+                _ => String::new(),
+            },
         }
     }
 
@@ -122,8 +159,11 @@ impl Frame {
             Screen::Performance => ui.draw_performance(
                 canvas,
                 PerformanceView {
+                    timing: &self.timing,
+                    beat_flash: self.beat_flash,
                     settings: self.settings,
                     setting_focus: self.setting_focus,
+                    options: &self.options,
                     sync_status: self.sync_status,
                     current_chord: self.current_chord,
                     chord_elapsed_beats: self.chord_elapsed_beats,
@@ -149,6 +189,8 @@ impl Frame {
             Screen::PhraseEditor => ui.draw_phrase_editor(
                 canvas,
                 PhraseEditorView {
+                    timing: &self.timing,
+                    beat_flash: self.beat_flash,
                     settings: self.settings,
                     sync_status: self.sync_status,
                     phrase: self.phrase.as_ref(),
@@ -180,10 +222,21 @@ pub(crate) struct Worker {
 
 impl Worker {
     pub(crate) fn spawn(brick: bool) -> Result<Self, String> {
-        Self::start_with(move || MidiEngine::configured(brick))
+        Self::start_with_session(
+            move || MidiEngine::configured(brick),
+            crate::session::path(brick),
+        )
     }
 
+    #[cfg(test)]
     fn start_with<F>(make_midi: F) -> Result<Self, String>
+    where
+        F: FnOnce() -> Result<MidiEngine, String> + Send + 'static,
+    {
+        Self::start_with_session(make_midi, None)
+    }
+
+    fn start_with_session<F>(make_midi: F, path: Option<std::path::PathBuf>) -> Result<Self, String>
     where
         F: FnOnce() -> Result<MidiEngine, String> + Send + 'static,
     {
@@ -197,12 +250,18 @@ impl Worker {
                 let mut app = App::new();
                 let mut transport = SyncTransport::new(app.settings.tempo_bpm);
                 let mut midi = make_midi()?;
+                let mut store = path.and_then(|path| {
+                    crate::session::Store::open(path, &mut app, &mut transport, &mut midi)
+                });
                 if ready_tx.send(()).is_err() {
                     return Ok(());
                 }
-                let result = run(&rx, &mut app, &mut transport, &mut midi);
+                let result = run(&rx, &mut app, &mut transport, &mut midi, store.as_mut());
                 let stop_clock = midi.stop_clock();
                 let cleanup = midi.stop_all();
+                if let Some(store) = store {
+                    store.finish(&app, &mut transport, &midi);
+                }
                 result.and(stop_clock).and(cleanup)
             })
             .map_err(|error| format!("Cannot start music worker: {error}"))?;
@@ -269,7 +328,10 @@ fn run(
     app: &mut App,
     transport: &mut SyncTransport,
     midi: &mut MidiEngine,
+    mut store: Option<&mut crate::session::Store>,
 ) -> Result<(), String> {
+    let mut save_at = None;
+    let mut phrases = app.phrases.len();
     let mut was_running = false;
     let mut last_poll = Instant::now();
     let mut last_report = last_poll;
@@ -283,9 +345,18 @@ fn run(
         max_gap = max_gap.max(poll.duration_since(last_poll));
         last_poll = poll;
         midi.service();
-        tick(app, transport, midi, &mut was_running)?;
+        let live_commit = tick(app, transport, midi, &mut was_running)?;
         midi.service();
         max_work = max_work.max(poll.elapsed());
+        if live_commit || phrases != app.phrases.len() {
+            phrases = app.phrases.len();
+            save_at = Some(poll + Duration::from_millis(650));
+        }
+        if save_at.is_some_and(|at| poll >= at) {
+            save_at = store.as_deref_mut().and_then(|store| {
+                (!store.offer(app, transport, midi)).then(|| poll + Duration::from_millis(650))
+            });
+        }
         if poll.duration_since(last_report) >= Duration::from_secs(5) {
             let (expired, late_beats) = app.performer_engine.take_timing_diagnostics();
             println!(
@@ -306,6 +377,7 @@ fn run(
         match rx.recv_timeout(POLL_PERIOD.saturating_sub(poll.elapsed())) {
             Ok(Command::Action(action, reply)) => {
                 let quit = dispatch_action(action, app, transport, midi)?;
+                save_at = Some(Instant::now() + Duration::from_millis(650));
                 // Apply transport transitions before acknowledging the action.
                 if !quit {
                     tick(app, transport, midi, &mut was_running)?;
@@ -330,12 +402,26 @@ fn run(
     Ok(())
 }
 
+fn advance_recorder(app: &mut App, beat: f64) {
+    if let Some(phrase) = app.recorder.update(beat, app.current_chord) {
+        println!(
+            "CAPTURED P{:02}: {} events, {:.1} beats",
+            phrase.id,
+            phrase.events.len(),
+            phrase.duration_beats()
+        );
+        app.phrases.push(phrase);
+        app.editor_phrase_index = app.phrases.len().saturating_sub(1);
+        app.editor_event_index = 0;
+    }
+}
+
 fn tick(
     app: &mut App,
     transport: &mut SyncTransport,
     midi: &mut MidiEngine,
     was_running: &mut bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     transport.poll_midi(Instant::now());
     let bar_beats = app.settings.meter.beats_per_bar();
     let now_beat = transport.beat(bar_beats);
@@ -347,6 +433,7 @@ fn tick(
     midi.update_clock(now_beat, clock_running, link_launch)?;
 
     if transport.take_midi_restart() {
+        app.pending_chord = None;
         app.recorder.reset_timeline();
         if *was_running {
             app.phrase_player.stop();
@@ -362,6 +449,7 @@ fn tick(
             app.chord_started_beat = now_beat;
             app.performer_engine.transport_started(now_beat);
         } else {
+            app.pending_chord = None;
             app.phrase_player.stop();
             app.performer_engine.transport_stopped();
             midi.stop_all()?;
@@ -369,37 +457,86 @@ fn tick(
         *was_running = running_now;
     }
 
+    let mut live_commit = false;
     if running_now {
-        if let Some(phrase) = app.recorder.update(now_beat, app.current_chord) {
-            println!(
-                "CAPTURED P{:02}: {} events, {:.1} beats",
-                phrase.id,
-                phrase.events.len(),
-                phrase.duration_beats()
-            );
-            app.phrases.push(phrase);
-            app.editor_phrase_index = app.phrases.len().saturating_sub(1);
-            app.editor_event_index = 0;
+        if let Some((chord, at)) = app.pending_chord
+            && now_beat >= at
+        {
+            advance_recorder(app, at);
+            live_commit = true;
+            app.pending_chord = None;
+            app.phrase_player.stop();
+            app.set_harmony(chord, at, true, true);
         }
-
+        advance_recorder(app, now_beat);
         let playback = app.phrase_player.update(&app.phrases, now_beat);
-        if let Some(chord) = playback.chord {
-            app.set_harmony(chord, now_beat, true, false);
+        if let Some((chord, at)) = playback.chord.zip(playback.chord_beat)
+            && chord != app.current_chord
+        {
+            app.set_harmony(chord, at, true, false);
         }
+        let phrase_next = playback.next_chord.zip(playback.next_chord_beat);
+        let next = match (app.pending_chord, phrase_next) {
+            (Some(a), Some(b)) => Some(if a.1 <= b.1 { a } else { b }),
+            (a, b) => a.or(b),
+        };
         app.performer_engine
-            .set_next_chord_target(playback.next_chord, playback.next_chord_beat);
+            .set_next_chord_target(next.map(|(chord, _)| chord), next.map(|(_, beat)| beat));
         if playback.ended && app.phrase_player.queued_phrase().is_none() {
             app.performer_engine.set_enabled(false);
             midi.stop_all()?;
         }
         app.update_performers(now_beat, midi)?;
     }
-    Ok(())
+    Ok(live_commit)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handle_performance_action;
+
+    #[test]
+    fn live_commit_replaces_pending_chord_and_records_its_boundary() {
+        let mut app = App::new();
+        let mut midi = MidiEngine::dry_run();
+        let mut transport = SyncTransport::new(app.settings.tempo_bpm);
+        transport.start(4.0);
+        let mut running = false;
+        tick(&mut app, &mut transport, &mut midi, &mut running).unwrap();
+        app.recorder.toggle(0.0, 0.25);
+        app.live_grid = crate::phrase::LiveGrid::Bar;
+        let initial = app.current_chord;
+        handle_performance_action(InputAction::Primary, &mut app, &mut transport, &mut midi)
+            .unwrap();
+        let first = app.pending_chord.unwrap();
+        assert_eq!(first.1, 4.0);
+        handle_performance_action(
+            InputAction::NavigateDown,
+            &mut app,
+            &mut transport,
+            &mut midi,
+        )
+        .unwrap();
+        handle_performance_action(InputAction::Primary, &mut app, &mut transport, &mut midi)
+            .unwrap();
+        let replacement = app.pending_chord.unwrap();
+        assert_ne!(replacement.0, first.0);
+        assert_eq!(replacement.1, 4.0);
+        assert_eq!(app.current_chord, initial);
+
+        // Supply a boundary the clock has already crossed to exercise the worker
+        // without waiting an entire bar in the test.
+        app.pending_chord = Some((replacement.0, 0.0));
+        assert!(tick(&mut app, &mut transport, &mut midi, &mut running).unwrap());
+        assert_eq!(app.current_chord, replacement.0);
+        assert_eq!(app.pending_chord, None);
+        app.recorder.toggle(0.1, 0.25);
+        let recorded = app.recorder.update(0.25, app.current_chord).unwrap();
+        assert_eq!(recorded.events.len(), 1);
+        assert_eq!(recorded.events[0].chord, replacement.0);
+        assert_eq!(recorded.events[0].start_beat, 0.0);
+    }
 
     #[test]
     fn worker_advances_without_ui_requests_and_acknowledges_stop() {
@@ -484,7 +621,7 @@ mod tests {
     fn stopped_settings_assign_channels_and_midi_input_blocks_clock_out() {
         let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
         worker.action(InputAction::ToggleSettings).unwrap();
-        for _ in 0..8 {
+        for _ in 0..11 {
             worker.action(InputAction::NavigateLeft).unwrap();
         }
         let settings = worker.snapshot().unwrap();

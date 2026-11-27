@@ -35,7 +35,7 @@ enum Phase {
 
 #[derive(Debug, Default)]
 pub(super) struct ClockOut {
-    enabled: bool,
+    pub(super) enabled: bool,
     phase: Phase,
     resume_at: Option<i64>,
     skipped: u64,
