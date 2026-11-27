@@ -5,15 +5,17 @@
 //! tracks a set of active notes for every channel so stale Note Off messages
 //! cannot terminate unrelated notes.
 
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-use std::path::Path;
-use std::time::Duration;
+mod raw;
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::performer::VoiceEvent;
+#[cfg(feature = "alsa-sequencer")]
 use midir::os::unix::VirtualOutput;
+#[cfg(feature = "alsa-sequencer")]
 use midir::{MidiOutput, MidiOutputConnection};
+use raw::{RawOutput, Selection};
 
 const VOICE_COUNT: usize = 4;
 
@@ -48,10 +50,11 @@ impl NoteOwnership {
     }
 }
 
-/// The selected output backend. Raw MIDI is explicit, never guessed.
+/// The selected output backend. Raw MIDI is the handheld default.
 enum MidiSink {
+    #[cfg(feature = "alsa-sequencer")]
     Alsa(MidiOutputConnection),
-    Raw(File),
+    Raw(Box<RawOutput>),
     DryRun,
 }
 
@@ -69,7 +72,8 @@ impl MidiEngine {
     /// # Errors
     ///
     /// Returns an error if the MIDI subsystem or virtual port cannot be opened.
-    pub fn new_virtual(port_name: &str) -> Result<Self, String> {
+    #[cfg(feature = "alsa-sequencer")]
+    fn new_virtual(port_name: &str) -> Result<Self, String> {
         let midi_output = MidiOutput::new("Khana").map_err(|error| error.to_string())?;
         let connection = midi_output
             .create_virtual(port_name)
@@ -88,7 +92,8 @@ impl MidiEngine {
     ///
     /// `KHANA_MIDI_PORT` can contain a case-insensitive substring used to
     /// select among multiple physical destinations.
-    pub fn new_auto(virtual_port_name: &str) -> Result<Self, String> {
+    #[cfg(feature = "alsa-sequencer")]
+    fn new_auto(virtual_port_name: &str) -> Result<Self, String> {
         let midi_output = MidiOutput::new("Khana").map_err(|error| error.to_string())?;
         let ports = midi_output.ports();
         let requested = std::env::var("KHANA_MIDI_PORT")
@@ -163,53 +168,99 @@ impl MidiEngine {
         }
     }
 
-    /// Open the requested Linux raw MIDI character device without blocking.
-    ///
-    /// This bypasses ALSA sequencer discovery, not the kernel USB MIDI driver.
-    fn new_raw(path: &Path) -> Result<Self, String> {
-        // Linux O_NONBLOCK on x86_64 and aarch64. No new libc dependency.
-        const O_NONBLOCK: i32 = 0x800;
-        let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
-        if !metadata.file_type().is_char_device() {
-            return Err(format!("Not a MIDI character device: {}", path.display()));
-        }
-        let file = OpenOptions::new()
-            .write(true)
-            .custom_flags(O_NONBLOCK)
-            .open(path)
-            .map_err(|error| format!("Raw MIDI {}: {error}", path.display()))?;
-        let destination_name = format!("RAW: {}", path.display());
-        println!("MIDI: {destination_name}");
-        Ok(Self {
-            connection: MidiSink::Raw(file),
-            ownership: NoteOwnership::new(),
-            destination_name,
-            trace: trace_enabled(),
-        })
-    }
-
-    /// Resolve explicit output requests before attempting automatic discovery.
-    /// Only an unrequested auto connection may fall back to Brick dry-run.
+    /// Select the backend without requiring ALSA userspace on Brick.
+    /// Explicit dry-run takes precedence; otherwise a raw path implies raw.
     pub fn configured(brick: bool) -> Result<Self, String> {
         if std::env::var("KHANA_MIDI_DRY_RUN").as_deref() == Ok("1") {
             return Ok(Self::dry_run());
         }
-
-        let raw = std::env::var_os("KHANA_MIDI_RAW_DEVICE").filter(|path| !path.is_empty());
-        let requested = explicit_port();
-        if let Some(path) = raw {
-            if requested {
-                return Err("Set only one of KHANA_MIDI_PORT and KHANA_MIDI_RAW_DEVICE".to_owned());
-            }
-            return Self::new_raw(Path::new(&path));
+        let path = std::env::var_os("KHANA_MIDI_RAW_DEVICE").filter(|path| !path.is_empty());
+        let name = std::env::var("KHANA_MIDI_PORT")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        if path.is_some() && name.is_some() {
+            return Err("Set only one of KHANA_MIDI_PORT and KHANA_MIDI_RAW_DEVICE".to_owned());
         }
-
-        match Self::new_auto("Khana MIDI") {
-            Err(error) if brick && !requested => {
-                eprintln!("MIDI unavailable: {error}; starting UI-only dry run");
-                Ok(Self::dry_run())
+        let backend = std::env::var("KHANA_MIDI_BACKEND").unwrap_or_else(|_| {
+            if brick || path.is_some() || !cfg!(feature = "alsa-sequencer") {
+                "raw".to_owned()
+            } else {
+                "sequencer".to_owned()
             }
-            result => result,
+        });
+        match backend.as_str() {
+            "raw" => {
+                let selection = if let Some(path) = path {
+                    Selection::Path(PathBuf::from(path))
+                } else if let Some(name) = name {
+                    Selection::Name(name.trim().to_lowercase())
+                } else {
+                    Selection::Auto
+                };
+                Ok(Self {
+                    connection: MidiSink::Raw(Box::new(RawOutput::new(selection))),
+                    ownership: NoteOwnership::new(),
+                    destination_name: String::new(),
+                    trace: trace_enabled(),
+                })
+            }
+            "sequencer" if path.is_some() => {
+                Err("KHANA_MIDI_RAW_DEVICE requires the raw backend".to_owned())
+            }
+            "sequencer" => {
+                #[cfg(feature = "alsa-sequencer")]
+                {
+                    Self::new_auto("Khana MIDI")
+                }
+                #[cfg(not(feature = "alsa-sequencer"))]
+                {
+                    Err("ALSA sequencer not built; use raw MIDI".to_owned())
+                }
+            }
+            _ => Err("KHANA_MIDI_BACKEND must be raw or sequencer".to_owned()),
+        }
+    }
+
+    /// Poll raw output on the control loop, not only on rendered frames. Ownership is
+    /// invalid after a connection fault; old attacks are never replayed.
+    pub fn service(&mut self) {
+        if let MidiSink::Raw(output) = &mut self.connection {
+            output.service(Instant::now());
+            if !output.connected() {
+                self.ownership = NoteOwnership::new();
+            }
+        }
+    }
+
+    pub fn report(&self) {
+        if let MidiSink::Raw(output) = &self.connection {
+            output.report();
+        }
+    }
+
+    fn available(&self) -> bool {
+        match &self.connection {
+            MidiSink::Raw(output) => output.connected(),
+            _ => true,
+        }
+    }
+
+    fn flush_output(&mut self) -> Result<(), String> {
+        if let MidiSink::Raw(output) = &mut self.connection {
+            output.flush()?;
+        }
+        Ok(())
+    }
+
+    fn recover_raw(&mut self, error: String) -> Result<(), String> {
+        if let MidiSink::Raw(output) = &mut self.connection {
+            if output.connected() {
+                output.fault(&error);
+            }
+            self.ownership = NoteOwnership::new();
+            Ok(())
+        } else {
+            Err(error)
         }
     }
 
@@ -219,22 +270,32 @@ impl MidiEngine {
 
     /// Human-readable connected MIDI destination.
     pub fn destination_name(&self) -> &str {
-        &self.destination_name
+        match &self.connection {
+            MidiSink::Raw(output) => output.label(),
+            _ => &self.destination_name,
+        }
     }
 
     /// Applies one performer event while preserving per-note ownership.
     ///
     /// # Errors
     ///
-    /// Returns an error if a MIDI message cannot be sent.
+    /// Returns an error on sequencer send failure. Raw failures enter reconnect mode.
     pub fn apply_event(&mut self, event: VoiceEvent) -> Result<(), String> {
-        match event {
+        if !self.available() {
+            return Ok(());
+        }
+        let result = match event {
             VoiceEvent::NoteOn {
                 voice_index,
                 note,
                 velocity,
             } => self.note_on(voice_index, note, velocity),
             VoiceEvent::NoteOff { voice_index, note } => self.note_off_if_owned(voice_index, note),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => self.recover_raw(error),
         }
     }
 
@@ -272,8 +333,12 @@ impl MidiEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if a MIDI message cannot be sent.
+    /// Returns an error on sequencer send failure. Raw failures enter reconnect mode.
     pub fn stop_all(&mut self) -> Result<(), String> {
+        if !self.available() {
+            self.ownership = NoteOwnership::new();
+            return Ok(());
+        }
         let mut first_error = None;
         for voice_index in 0..VOICE_COUNT {
             for note in 0_u8..=127 {
@@ -289,7 +354,13 @@ impl MidiEngine {
                 }
             }
         }
-        first_error.map_or(Ok(()), Err)
+        if let Some(error) = first_error {
+            return self.recover_raw(error);
+        }
+        match self.flush_output() {
+            Ok(()) => Ok(()),
+            Err(error) => self.recover_raw(error),
+        }
     }
 
     fn send(&mut self, message: [u8; 3]) -> Result<(), String> {
@@ -300,12 +371,11 @@ impl MidiEngine {
             );
         }
         match &mut self.connection {
+            #[cfg(feature = "alsa-sequencer")]
             MidiSink::Alsa(connection) => {
                 connection.send(&message).map_err(|error| error.to_string())
             }
-            MidiSink::Raw(file) => file
-                .write_all(&message)
-                .map_err(|error| format!("Raw MIDI write: {error}")),
+            MidiSink::Raw(output) => output.enqueue(message),
             MidiSink::DryRun => Ok(()),
         }
     }
@@ -322,43 +392,23 @@ impl Drop for MidiEngine {
 
 /// Print both discovery paths, even when the sequencer cannot initialize.
 pub fn list_destinations() {
+    #[cfg(feature = "alsa-sequencer")]
     match MidiOutput::new("Khana probe") {
         Ok(output) => {
             let ports = output.ports();
             println!("ALSA sequencer destinations: {}", ports.len());
             for (index, port) in ports.iter().enumerate() {
-                let name = output.port_name(port).unwrap_or_else(|error| error.to_string());
+                let name = output
+                    .port_name(port)
+                    .unwrap_or_else(|error| error.to_string());
                 println!("  {index}: {name}");
             }
         }
         Err(error) => eprintln!("ALSA sequencer unavailable: {error}"),
     }
-    match std::fs::read_dir("/dev/snd") {
-        Ok(entries) => {
-            let mut paths: Vec<_> = entries
-                .filter_map(Result::ok)
-                .filter(|entry| raw_device_name(&entry.file_name().to_string_lossy()))
-                .map(|entry| entry.path())
-                .collect();
-            paths.sort();
-            println!("Raw MIDI device nodes: {}", paths.len());
-            for path in paths {
-                println!("  {}", path.display());
-            }
-        }
-        Err(error) => eprintln!("Cannot enumerate /dev/snd: {error}"),
-    }
-}
-
-fn raw_device_name(name: &str) -> bool {
-    let Some((card, device)) = name.strip_prefix("midiC").and_then(|rest| rest.split_once('D'))
-    else {
-        return false;
-    };
-    !card.is_empty()
-        && !device.is_empty()
-        && card.bytes().all(|byte| byte.is_ascii_digit())
-        && device.bytes().all(|byte| byte.is_ascii_digit())
+    #[cfg(not(feature = "alsa-sequencer"))]
+    println!("ALSA sequencer backend not built");
+    raw::list();
 }
 
 fn explicit_port() -> bool {
@@ -366,13 +416,18 @@ fn explicit_port() -> bool {
 }
 
 /// Exercise the four channels with a short, explicit-destination audition.
-pub fn smoke_test() -> Result<(), String> {
+pub fn smoke_test(brick: bool) -> Result<(), String> {
     let dry = std::env::var("KHANA_MIDI_DRY_RUN").as_deref() == Ok("1");
     let raw = std::env::var_os("KHANA_MIDI_RAW_DEVICE").is_some_and(|path| !path.is_empty());
     if !dry && !raw && !explicit_port() {
-        return Err("MIDI test requires KHANA_MIDI_PORT, KHANA_MIDI_RAW_DEVICE or dry-run".to_owned());
+        return Err(
+            "MIDI test requires KHANA_MIDI_PORT, KHANA_MIDI_RAW_DEVICE or dry-run".to_owned(),
+        );
     }
-    let mut midi = MidiEngine::configured(false)?;
+    let mut midi = MidiEngine::configured(brick)?;
+    if !midi.available() {
+        return Err(midi.destination_name().to_owned());
+    }
     let groups: [&[u8]; VOICE_COUNT] = [&[48], &[60, 64, 67], &[72], &[76]];
     for (voice_index, notes) in groups.into_iter().enumerate() {
         println!("Testing channel {}: {notes:?}", voice_index + 1);
@@ -383,11 +438,21 @@ pub fn smoke_test() -> Result<(), String> {
                 velocity: 72,
             })?;
         }
+        if !midi.available() {
+            return Err(midi.destination_name().to_owned());
+        }
+        midi.flush_output()?;
         println!("Owned notes: {:?}", midi.active_counts());
         std::thread::sleep(Duration::from_millis(350));
         midi.stop_all()?;
+        if !midi.available() {
+            return Err(midi.destination_name().to_owned());
+        }
     }
-    println!("MIDI test complete; owned notes: {:?}", midi.active_counts());
+    println!(
+        "MIDI test complete; owned notes: {:?}",
+        midi.active_counts()
+    );
     Ok(())
 }
 
@@ -468,15 +533,6 @@ mod tests {
 
         assert!(!ownership.contains(2, 60));
         assert!(ownership.contains(2, 64));
-    }
-
-    #[test]
-    fn raw_device_names_exclude_pcm_and_control_nodes() {
-        assert!(super::raw_device_name("midiC1D0"));
-        assert!(super::raw_device_name("midiC12D3"));
-        for name in ["seq", "controlC1", "pcmC1D0p", "midiCD0", "midiC1D0x"] {
-            assert!(!super::raw_device_name(name));
-        }
     }
 
     #[test]

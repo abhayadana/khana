@@ -2600,10 +2600,11 @@ mod tests {
         let mut voices = default_voices();
         voices[2].parameters.density = 0.0;
         let batch = engine.update(1.0, 4.0, &voices);
-        assert!(!batch.iter().any(|event| matches!(
-            event,
-            VoiceEvent::NoteOn { voice_index: 2, .. }
-        )));
+        assert!(
+            !batch
+                .iter()
+                .any(|event| matches!(event, VoiceEvent::NoteOn { voice_index: 2, .. }))
+        );
         assert!(engine.states[2].pending.is_none());
     }
 

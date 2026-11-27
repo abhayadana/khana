@@ -1,4 +1,4 @@
-//! Khaṇa v0.11.2 MIDI bring-up and timing diagnostics.
+//! Khaṇa v0.11.3 raw MIDI platform.
 //!
 //! v0.11 adds complete semantic chord voicings, rhythmic/gated Melody phrases,
 //! persistent cyclic Texture, and lightweight performer-to-performer awareness.
@@ -260,6 +260,8 @@ fn ui_period(value: Option<&str>) -> Result<Duration, String> {
 }
 
 fn main() -> Result<(), String> {
+    let brick = std::env::var("KHANA_BRICK").as_deref() == Ok("1")
+        || std::env::var("PLATFORM").as_deref() == Ok("tg5040");
     // Headless diagnostics deliberately run before SDL/video initialization.
     let mut args = std::env::args().skip(1);
     if let Some(command) = args.next() {
@@ -271,12 +273,10 @@ fn main() -> Result<(), String> {
                 midi::list_destinations();
                 Ok(())
             }
-            "--midi-test" => midi::smoke_test(),
+            "--midi-test" => midi::smoke_test(brick),
             _ => Err(format!("Unknown option: {command}")),
         };
     }
-    let brick = std::env::var("KHANA_BRICK").as_deref() == Ok("1")
-        || std::env::var("PLATFORM").as_deref() == Ok("tg5040");
     let frame_period = ui_period(std::env::var("BRICK_UI_FPS").ok().as_deref())?;
     let input_log = std::env::var("KHANA_INPUT_LOG").as_deref() == Ok("1");
     let sdl_context = sdl2::init()?;
@@ -336,7 +336,6 @@ fn main() -> Result<(), String> {
     let mut app = App::new();
     let mut transport = SyncTransport::new(app.settings.tempo_bpm);
     let mut midi = MidiEngine::configured(brick)?;
-    let midi_destination = midi.destination_name().to_owned();
     let mut was_running = false;
 
     print_controls();
@@ -348,6 +347,7 @@ fn main() -> Result<(), String> {
 
     'running: loop {
         let poll = Instant::now();
+        midi.service();
         max_gap = max_gap.max(poll.duration_since(last_poll));
         last_poll = poll;
         if poll.duration_since(last_report) >= Duration::from_secs(5) {
@@ -360,6 +360,7 @@ fn main() -> Result<(), String> {
                 late_beats,
                 midi.active_counts()
             );
+            midi.report();
             max_gap = Duration::ZERO;
             max_render = Duration::ZERO;
             last_report = poll;
@@ -407,6 +408,8 @@ fn main() -> Result<(), String> {
 
             app.update_performers(now_beat, &mut midi)?;
         }
+        // Deliver freshly queued bytes before SDL input/rendering can stall.
+        midi.service();
 
         for event in event_pump.poll_iter() {
             if matches!(event, Event::Quit { .. }) {
@@ -483,7 +486,7 @@ fn main() -> Result<(), String> {
                         next_recording_armed: app.recorder.next_is_armed(),
                         quantize_beats: app.recorder.quantize_beats(),
                         phrase_count: app.phrases.len(),
-                        midi_destination: &midi_destination,
+                        midi_destination: midi.destination_name(),
                     },
                 )?;
             }

@@ -1,4 +1,7 @@
-# Khaṇa v0.11.2
+# Khaṇa v0.11.3
+
+See [v0.11.3 raw MIDI platform](docs/BRICK_V0.11.3.md) for the new Brick default,
+device selection, reconnection behavior, build flags and hardware tests.
 
 See [v0.11.2 MIDI bring-up](docs/BRICK_V0.11.2.md) for headless MIDI discovery,
 explicit raw USB MIDI output, timing diagnostics and the hardware test plan.
