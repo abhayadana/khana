@@ -1,4 +1,8 @@
-# Khaṇa v0.11.5
+# Khaṇa v0.11.6
+
+See [v0.11.6 MIDI routing and external sync](docs/BRICK_V0.11.6.md) for
+assigning performer channels, following MIDI Clock In, and building with
+Ableton Link for Brick Pro.
 
 With transport stopped, hold **Select** and press **X** on Performance
 (desktop **M**) to edit tonic, mode, tempo, meter, and sync settings. Use

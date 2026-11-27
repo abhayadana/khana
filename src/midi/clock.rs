@@ -81,7 +81,7 @@ impl ClockOut {
         beat: f64,
         running: bool,
         available: bool,
-        link_quantum: Option<f64>,
+        link_launch: Option<(f64, Option<f64>)>,
         now: Instant,
     ) -> Option<Realtime> {
         if !self.enabled {
@@ -106,13 +106,16 @@ impl ClockOut {
                     .saturating_add((current - next_pulse + 1) as u64);
                 return self.stop(false);
             }
-            return self.stop(link_quantum.is_none());
+            return self.stop(link_launch.is_none());
         }
 
         if matches!(self.phase, Phase::Stopped) {
-            let (pulse, command) = if let Some(quantum) = link_quantum {
-                let bar = ((beat / quantum).floor() + 1.0) * quantum;
-                ((bar * PULSES_PER_QUARTER).round() as i64, Realtime::Start)
+            let (pulse, command) = if let Some((quantum, target)) = link_launch {
+                let bar = target.unwrap_or_else(|| ((beat / quantum).floor() + 1.0) * quantum);
+                (
+                    ((bar * PULSES_PER_QUARTER) - 1.0e-6).ceil() as i64,
+                    Realtime::Start,
+                )
             } else if let Some(resume_at) = self.resume_at {
                 (resume_at.max(current + 1), Realtime::Continue)
             } else {
@@ -259,7 +262,7 @@ mod tests {
     #[test]
     fn link_waits_for_the_local_meter_boundary_on_each_launch() {
         let mut clock = enabled();
-        let quantum = Some(3.0);
+        let quantum = Some((3.0, None));
         let now = Instant::now();
         let later = now + TRANSPORT_LEAD;
         assert_eq!(clock.update(1.5, true, true, quantum, now), None);

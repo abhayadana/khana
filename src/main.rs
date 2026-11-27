@@ -1,4 +1,4 @@
-//! Khaṇa v0.11.5 MIDI Clock Out and live tempo.
+//! Khaṇa v0.11.6 MIDI channel routing and external synchronization.
 //!
 //! v0.11 adds complete semantic chord voicings, rhythmic/gated Melody phrases,
 //! persistent cyclic Texture, and lightweight performer-to-performer awareness.
@@ -442,10 +442,14 @@ fn dispatch_action(
 
 fn toggle_transport(app: &mut App, transport: &mut SyncTransport) {
     app.setting_focus = None;
-    if transport.is_running() {
+    if transport.start_pending() {
+        app.phrase_player.stop();
+        app.recorder.cancel_pending_start();
+    }
+    if transport.is_running() || transport.start_pending() {
         transport.stop();
     } else {
-        transport.start();
+        transport.start(app.settings.meter.beats_per_bar());
     }
 }
 
@@ -519,13 +523,17 @@ fn handle_performance_action(
         }
         InputAction::ToggleRecord => {
             if !transport.is_running() {
-                transport.start();
+                if transport.mode() == SyncMode::MidiIn {
+                    return Ok(());
+                }
+                transport.start(app.settings.meter.beats_per_bar());
             }
 
-            app.recorder.toggle(
-                transport.beat(app.settings.meter.beats_per_bar()),
-                app.settings.meter.beats_per_bar(),
-            );
+            let bar = app.settings.meter.beats_per_bar();
+            let beat = transport
+                .pending_beat(bar)
+                .unwrap_or_else(|| transport.beat(bar));
+            app.recorder.toggle(beat, bar);
         }
         InputAction::ArmNextRecording => {
             app.recorder.toggle_arm_next();
@@ -534,7 +542,7 @@ fn handle_performance_action(
             app.screen = Screen::PhraseEditor;
             app.clamp_editor_selection();
         }
-        InputAction::ToggleSettings if !transport.is_running() => {
+        InputAction::ToggleSettings if !transport.is_running() && !transport.start_pending() => {
             app.setting_focus = Some(SettingField::Tonic);
         }
         InputAction::ToggleSettings if transport.mode() == SyncMode::Internal => {
@@ -554,7 +562,7 @@ fn handle_setting_action(
     transport: &mut SyncTransport,
     midi: &mut MidiEngine,
 ) -> Result<(), String> {
-    let running = transport.is_running();
+    let running = transport.is_running() || transport.start_pending();
     match action {
         InputAction::Primary if !running && field == SettingField::MidiPanic => {
             midi.panic()?;
@@ -613,11 +621,12 @@ fn adjust_setting(
                 midi,
             )?;
         }
-        SettingField::Tempo => {
+        SettingField::Tempo if transport.mode() != SyncMode::MidiIn => {
             app.settings.tempo_bpm =
                 (app.settings.tempo_bpm + f64::from(direction)).clamp(30.0, 300.0);
             transport.set_tempo(app.settings.tempo_bpm);
         }
+        SettingField::Tempo => {}
         SettingField::Meter => {
             app.settings.meter = if direction > 0 {
                 app.settings.meter.next()
@@ -626,10 +635,17 @@ fn adjust_setting(
             };
         }
         SettingField::Sync => {
-            let next_mode = match transport.mode() {
-                SyncMode::Internal => SyncMode::Link,
-                SyncMode::Link => SyncMode::Internal,
+            let modes: &[SyncMode] = if transport.link_available() {
+                &[SyncMode::Internal, SyncMode::MidiIn, SyncMode::Link]
+            } else {
+                &[SyncMode::Internal, SyncMode::MidiIn]
             };
+            let index = modes
+                .iter()
+                .position(|&mode| mode == transport.mode())
+                .unwrap_or(0);
+            let next = (index as i32 + direction).rem_euclid(modes.len() as i32) as usize;
+            let next_mode = modes[next];
 
             if transport.set_mode(next_mode, app.settings.meter.beats_per_bar()) {
                 midi.reset_clock_position();
@@ -643,7 +659,11 @@ fn adjust_setting(
             let status = transport.status();
             transport.set_link_start_stop_sync(!status.link_start_stop_sync);
         }
-        SettingField::MidiClockOut => midi.toggle_clock_out(),
+        SettingField::MidiClockOut if transport.mode() != SyncMode::MidiIn => {
+            midi.toggle_clock_out()
+        }
+        SettingField::MidiClockOut => {}
+        SettingField::MidiChannel(voice) => midi.adjust_channel(voice, direction)?,
         SettingField::MidiPanic => {}
         SettingField::MidiOutput => {
             if !transport.is_running() {
@@ -687,13 +707,18 @@ fn handle_editor_action(
         InputAction::Primary => {
             if app.selected_phrase().is_some() {
                 if !transport.is_running() {
-                    transport.start();
+                    if transport.mode() == SyncMode::MidiIn {
+                        return Ok(());
+                    }
+                    transport.start(app.settings.meter.beats_per_bar());
                 }
 
                 app.performer_engine.set_enabled(true);
                 app.phrase_player.request(
                     app.editor_phrase_index,
-                    transport.beat(app.settings.meter.beats_per_bar()),
+                    transport
+                        .pending_beat(app.settings.meter.beats_per_bar())
+                        .unwrap_or_else(|| transport.beat(app.settings.meter.beats_per_bar())),
                     app.settings.meter.beats_per_bar(),
                 );
             }
@@ -746,7 +771,7 @@ fn handle_editor_action(
         InputAction::ZoomIn => {
             app.editor_zoom = (app.editor_zoom + 12.0).min(180.0);
         }
-        InputAction::ToggleSettings if !transport.is_running() => {
+        InputAction::ToggleSettings if !transport.is_running() && !transport.start_pending() => {
             app.screen = Screen::Performance;
             app.setting_focus = Some(SettingField::Tonic);
         }
@@ -811,8 +836,9 @@ fn print_controls() {
     println!("  M       settings (stopped), or tempo (playing on internal clock)");
     println!("SETTINGS:");
     println!("  Left/Right field   Up/Down value   Z/M exit");
-    println!("  SYNC INTERNAL/LINK; STARTSYNC OFF/ON");
-    println!("  CLOCK OUT: Up/Down toggle; MIDI PANIC: Z send on channels 1-4");
+    println!("  SYNC INTERNAL/MIDI IN/LINK; STARTSYNC OFF/ON");
+    println!("  MIDI CHANNEL: Up/Down change; CLOCK OUT: Up/Down toggle");
+    println!("  MIDI PANIC: Z sends on assigned channels");
     println!("PERFORMERS:");
     println!("  Bass CHD | Chords BAR | Texture 2BAR | Melody PHR");
     println!("PHRASE EDITOR:");

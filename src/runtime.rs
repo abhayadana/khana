@@ -43,6 +43,8 @@ pub(crate) struct Frame {
     phrase_count: usize,
     midi_destination: String,
     midi_clock: &'static str,
+    midi_channels: [u8; 4],
+    midi_input: Option<String>,
     phrase: Option<Phrase>,
     phrase_index: usize,
     selected_event: usize,
@@ -84,7 +86,13 @@ impl Frame {
             quantize_beats: app.recorder.quantize_beats(),
             phrase_count: app.phrases.len(),
             midi_destination: midi.destination_name().to_owned(),
-            midi_clock: midi.clock_label(),
+            midi_clock: if sync_status.mode == SyncMode::MidiIn {
+                "CLOCK OUT BLOCKED"
+            } else {
+                midi.clock_label()
+            },
+            midi_channels: midi.channels(),
+            midi_input: transport.midi_input_label().map(str::to_owned),
             phrase: if app.screen == Screen::PhraseEditor {
                 app.selected_phrase().cloned()
             } else {
@@ -131,6 +139,8 @@ impl Frame {
                     phrase_count: self.phrase_count,
                     midi_destination: &self.midi_destination,
                     midi_clock: self.midi_clock,
+                    midi_channels: self.midi_channels,
+                    midi_input: self.midi_input.as_deref(),
                 },
             ),
             Screen::PhraseEditor => ui.draw_phrase_editor(
@@ -323,11 +333,25 @@ fn tick(
     midi: &mut MidiEngine,
     was_running: &mut bool,
 ) -> Result<(), String> {
+    transport.poll_midi(Instant::now());
     let bar_beats = app.settings.meter.beats_per_bar();
     let now_beat = transport.beat(bar_beats);
     let running_now = transport.is_running();
-    let link_quantum = (transport.mode() == SyncMode::Link).then_some(bar_beats);
-    midi.update_clock(now_beat, running_now, link_quantum)?;
+    let link_target = transport.pending_beat(bar_beats);
+    let link_launch = (transport.mode() == SyncMode::Link).then_some((bar_beats, link_target));
+    let clock_running =
+        transport.mode() != SyncMode::MidiIn && (running_now || link_target.is_some());
+    midi.update_clock(now_beat, clock_running, link_launch)?;
+
+    if transport.take_midi_restart() {
+        app.recorder.reset_timeline();
+        if *was_running {
+            app.phrase_player.stop();
+            app.performer_engine.transport_stopped();
+            midi.stop_all()?;
+            *was_running = false;
+        }
+    }
 
     if running_now != *was_running {
         if running_now {
@@ -450,6 +474,31 @@ mod tests {
         let stopped = worker.snapshot().unwrap();
         assert_eq!(stopped.midi_clock, "CLOCK OUT READY");
         assert_eq!(stopped.active_midi, [0; 4]);
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn stopped_settings_assign_channels_and_midi_input_blocks_clock_out() {
+        let mut worker = Worker::start_with(|| Ok(MidiEngine::dry_run())).unwrap();
+        worker.action(InputAction::ToggleSettings).unwrap();
+        for _ in 0..4 {
+            worker.action(InputAction::NavigateLeft).unwrap();
+        }
+        let settings = worker.snapshot().unwrap();
+        assert_eq!(settings.setting_focus, Some(SettingField::MidiChannel(3)));
+        worker.action(InputAction::NavigateUp).unwrap();
+        assert_eq!(worker.snapshot().unwrap().midi_channels, [1, 2, 3, 5]);
+        worker.action(InputAction::MenuTap).unwrap();
+        worker.action(InputAction::ToggleSettings).unwrap();
+        for _ in 0..4 {
+            worker.action(InputAction::NavigateRight).unwrap();
+        }
+        worker.action(InputAction::NavigateUp).unwrap();
+        let settings = worker.snapshot().unwrap();
+        assert_eq!(settings.sync_status.mode, SyncMode::MidiIn);
+        assert_eq!(settings.midi_clock, "CLOCK OUT BLOCKED");
+        worker.action(InputAction::ToggleTransport).unwrap();
+        assert!(!worker.snapshot().unwrap().sync_status.running);
         worker.shutdown().unwrap();
     }
 }

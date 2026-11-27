@@ -1,15 +1,62 @@
-//! Musical timing backend: standalone internal clock or Ableton Link.
+//! Musical timing backend: internal clock, MIDI Clock In, or Ableton Link.
 //!
 //! Link support is optional at compile time. Build with:
 //! `cargo run --features ableton-link`
 
 use std::time::Instant;
 
+use crate::midi::{MidiFollower, RawClockInput};
+
 /// Clock source used by Khaṇa.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncMode {
     Internal,
     Link,
+    MidiIn,
+}
+
+#[cfg(all(test, feature = "ableton-link"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_link_launch_is_quantized_and_can_be_cancelled() {
+        for share_transport in [false, true] {
+            check_quantized_launch(share_transport);
+        }
+    }
+
+    fn check_quantized_launch(share_transport: bool) {
+        let mut transport = LinkTransport::new(120.0);
+        transport.join(120.0, share_transport);
+        let quantum = 4.0;
+        let time = transport.link.clock_micros();
+        transport
+            .link
+            .capture_app_session_state(&mut transport.state);
+        transport.state.force_beat_at_time(1.0, time, quantum);
+        transport.link.commit_app_session_state(&transport.state);
+
+        assert!(!transport.is_running());
+        transport.start(quantum);
+        assert_eq!(transport.pending_beat(quantum), Some(4.0));
+        assert!(!transport.is_running());
+        transport.stop();
+        assert!(!transport.start_pending());
+        assert!(!transport.is_running());
+
+        transport.start(quantum);
+        let time = transport.link.clock_micros();
+        transport
+            .link
+            .capture_app_session_state(&mut transport.state);
+        transport.state.force_beat_at_time(4.01, time, quantum);
+        transport.link.commit_app_session_state(&transport.state);
+        assert!(transport.is_running());
+        assert!(transport.is_running());
+        transport.stop();
+        assert!(!transport.is_running());
+    }
 }
 
 /// Snapshot of transport/synchronization state for UI rendering.
@@ -17,10 +64,12 @@ pub enum SyncMode {
 pub struct SyncStatus {
     pub mode: SyncMode,
     pub running: bool,
+    pub starting: bool,
     pub tempo_bpm: f64,
     pub link_peers: u64,
     pub link_start_stop_sync: bool,
     pub link_available: bool,
+    pub midi_status: &'static str,
 }
 
 struct InternalTransport {
@@ -73,7 +122,6 @@ impl InternalTransport {
         self.anchor = Instant::now();
     }
 
-    #[cfg(feature = "ableton-link")]
     fn set_position(&mut self, beat: f64) {
         self.stored_beat = beat;
         self.anchor = Instant::now();
@@ -85,6 +133,7 @@ struct LinkTransport {
     link: rusty_link::AblLink,
     state: rusty_link::SessionState,
     local_running: bool,
+    local_start: Option<(f64, f64)>,
 }
 
 #[cfg(feature = "ableton-link")]
@@ -97,11 +146,23 @@ impl LinkTransport {
             link,
             state: rusty_link::SessionState::new(),
             local_running: false,
+            local_start: None,
         }
     }
 
     fn enable(&self, enabled: bool) {
         self.link.enable(enabled);
+    }
+
+    fn join(&mut self, bpm: f64, share_transport: bool) {
+        self.enable(false);
+        self.local_running = false;
+        self.local_start = None;
+        self.link.enable_start_stop_sync(false);
+        self.set_tempo(bpm);
+        self.enable(true);
+        // Joining is passive. Only a transport gesture publishes Start/Stop.
+        self.link.enable_start_stop_sync(share_transport);
     }
 
     fn beat(&mut self, quantum: f64) -> f64 {
@@ -126,27 +187,89 @@ impl LinkTransport {
         self.link.is_start_stop_sync_enabled()
     }
 
-    fn set_start_stop_sync(&self, enabled: bool) {
+    fn set_start_stop_sync(&mut self, enabled: bool) {
+        if enabled != self.start_stop_sync() {
+            self.local_running = self.is_running();
+            self.local_start = None;
+        }
         self.link.enable_start_stop_sync(enabled);
     }
 
     fn is_running(&mut self) -> bool {
+        let shared = self.start_stop_sync();
+        if shared {
+            self.link.capture_app_session_state(&mut self.state);
+            if self.state.is_playing() {
+                self.local_start = None;
+                return self.state.time_for_is_playing() <= self.link.clock_micros();
+            }
+        }
+        if let Some((target, quantum)) = self.local_start
+            && self.beat(quantum) >= target
+        {
+            self.local_start = None;
+            if shared {
+                // Publish at launch. A future-dated shared Start would take
+                // precedence over a Stop pressed before the bar arrives.
+                let now = self.link.clock_micros();
+                self.state.set_is_playing(true, now);
+                self.link.commit_app_session_state(&self.state);
+            } else {
+                self.local_running = true;
+            }
+            return true;
+        }
+        !shared && self.local_running
+    }
+
+    fn start_pending(&mut self) -> bool {
+        if self.local_start.is_some() {
+            return true;
+        }
         if self.start_stop_sync() {
             self.link.capture_app_session_state(&mut self.state);
-            self.state.is_playing()
+            self.state.is_playing() && self.state.time_for_is_playing() > self.link.clock_micros()
         } else {
-            self.local_running
+            false
         }
     }
 
-    fn set_running(&mut self, running: bool) {
-        self.local_running = running;
-
+    fn pending_beat(&mut self, quantum: f64) -> Option<f64> {
+        if let Some((beat, _)) = self.local_start {
+            return Some(beat);
+        }
         if self.start_stop_sync() {
             self.link.capture_app_session_state(&mut self.state);
-            let now = self.link.clock_micros();
-            self.state.set_is_playing(running, now);
-            self.link.commit_app_session_state(&self.state);
+            let time = self.state.time_for_is_playing();
+            (self.state.is_playing() && time > self.link.clock_micros())
+                .then(|| self.state.beat_at_time(time, quantum))
+        } else {
+            None
+        }
+    }
+
+    fn start(&mut self, quantum: f64) {
+        if self.is_running() || self.start_pending() {
+            return;
+        }
+        let now = self.link.clock_micros();
+        self.link.capture_app_session_state(&mut self.state);
+        let beat = self.state.beat_at_time(now, quantum);
+        let target = ((beat / quantum).floor() + 1.0) * quantum;
+        self.local_start = Some((target, quantum));
+    }
+
+    fn stop(&mut self) {
+        self.local_running = false;
+        self.local_start = None;
+        if self.start_stop_sync() {
+            self.link.capture_app_session_state(&mut self.state);
+            if self.state.is_playing() {
+                let now = self.link.clock_micros();
+                let time = now.max(self.state.time_for_is_playing().saturating_add(1));
+                self.state.set_is_playing(false, time);
+                self.link.commit_app_session_state(&self.state);
+            }
         }
     }
 
@@ -162,6 +285,8 @@ pub struct SyncTransport {
     #[cfg(feature = "ableton-link")]
     link: LinkTransport,
     link_start_stop_preference: bool,
+    midi_port: Option<RawClockInput>,
+    midi: MidiFollower,
 }
 
 impl SyncTransport {
@@ -173,6 +298,8 @@ impl SyncTransport {
             #[cfg(feature = "ableton-link")]
             link: LinkTransport::new(bpm),
             link_start_stop_preference: false,
+            midi_port: None,
+            midi: MidiFollower::new(bpm),
         }
     }
 
@@ -194,61 +321,51 @@ impl SyncTransport {
         if mode == self.mode {
             return true;
         }
+        if mode == SyncMode::Link && !self.link_available() {
+            return false;
+        }
+        let beat = self.beat(quantum);
+        let tempo = self.tempo();
+        self.internal.stop();
+        self.internal.set_bpm(tempo);
+        self.internal.set_position(beat);
+        self.midi_port = (mode == SyncMode::MidiIn).then(RawClockInput::new);
+        self.midi = MidiFollower::new(tempo);
 
-        match mode {
-            SyncMode::Internal => {
-                #[cfg(feature = "ableton-link")]
-                {
-                    let beat = self.link.beat(quantum);
-                    let tempo = self.link.tempo();
-                    let running = self.link.is_running();
-                    self.link.enable(false);
-                    self.internal.set_position(beat);
-                    self.internal.set_bpm(tempo);
-
-                    if running {
-                        self.internal.start();
-                    } else {
-                        self.internal.stop();
-                    }
-                }
-
-                self.mode = SyncMode::Internal;
-                true
+        #[cfg(feature = "ableton-link")]
+        {
+            if self.mode == SyncMode::Link {
+                self.link.enable(false);
             }
-            SyncMode::Link => {
-                #[cfg(feature = "ableton-link")]
-                {
-                    let bpm = self.internal.bpm;
-                    let running = self.internal.running;
-
-                    // Set our private Link timeline before networking is
-                    // enabled. Once enabled, an existing Link session is free
-                    // to supply its own session tempo/phase without Khaṇa
-                    // pushing its standalone tempo into the jam.
-                    self.link.set_tempo(bpm);
-                    self.link
-                        .set_start_stop_sync(self.link_start_stop_preference);
-                    self.link.enable(true);
-                    self.link.set_running(running);
-
-                    self.mode = SyncMode::Link;
-                    true
-                }
-
-                #[cfg(not(feature = "ableton-link"))]
-                {
-                    let _ = quantum;
-                    false
-                }
+            if mode == SyncMode::Link {
+                self.link.join(tempo, self.link_start_stop_preference);
             }
         }
+        self.mode = mode;
+        true
+    }
+
+    pub fn poll_midi(&mut self, now: Instant) {
+        if let Some(port) = &mut self.midi_port {
+            self.midi.check_timeout(now);
+            let connected = port.poll(now, |bytes| self.midi.receive(bytes, now));
+            self.midi.update_port(connected, now);
+        }
+    }
+
+    pub fn midi_input_label(&self) -> Option<&str> {
+        self.midi_port.as_ref().map(RawClockInput::label)
+    }
+
+    pub fn take_midi_restart(&mut self) -> bool {
+        self.mode == SyncMode::MidiIn && self.midi.take_restart()
     }
 
     /// Returns current beat using the active source.
     pub fn beat(&mut self, quantum: f64) -> f64 {
         match self.mode {
             SyncMode::Internal => self.internal.beat(),
+            SyncMode::MidiIn => self.midi.beat(Instant::now()),
             SyncMode::Link => {
                 #[cfg(feature = "ableton-link")]
                 {
@@ -268,6 +385,7 @@ impl SyncTransport {
     pub fn is_running(&mut self) -> bool {
         match self.mode {
             SyncMode::Internal => self.internal.running,
+            SyncMode::MidiIn => self.midi.running(),
             SyncMode::Link => {
                 #[cfg(feature = "ableton-link")]
                 {
@@ -283,12 +401,13 @@ impl SyncTransport {
     }
 
     /// Starts Khaṇa transport.
-    pub fn start(&mut self) {
+    pub fn start(&mut self, _quantum: f64) {
         match self.mode {
             SyncMode::Internal => self.internal.start(),
+            SyncMode::MidiIn => self.midi.arm(),
             SyncMode::Link => {
                 #[cfg(feature = "ableton-link")]
-                self.link.set_running(true);
+                self.link.start(_quantum);
             }
         }
     }
@@ -297,17 +416,35 @@ impl SyncTransport {
     pub fn stop(&mut self) {
         match self.mode {
             SyncMode::Internal => self.internal.stop(),
+            SyncMode::MidiIn => self.midi.disarm(),
             SyncMode::Link => {
                 #[cfg(feature = "ableton-link")]
-                self.link.set_running(false);
+                self.link.stop();
             }
         }
+    }
+
+    pub fn start_pending(&mut self) -> bool {
+        #[cfg(feature = "ableton-link")]
+        if self.mode == SyncMode::Link {
+            return self.link.start_pending();
+        }
+        false
+    }
+
+    pub fn pending_beat(&mut self, _quantum: f64) -> Option<f64> {
+        #[cfg(feature = "ableton-link")]
+        if self.mode == SyncMode::Link {
+            return self.link.pending_beat(_quantum);
+        }
+        None
     }
 
     /// Returns the current session tempo.
     pub fn tempo(&mut self) -> f64 {
         match self.mode {
             SyncMode::Internal => self.internal.bpm,
+            SyncMode::MidiIn => self.midi.tempo(),
             SyncMode::Link => {
                 #[cfg(feature = "ableton-link")]
                 {
@@ -326,6 +463,7 @@ impl SyncTransport {
     pub fn set_tempo(&mut self, bpm: f64) {
         match self.mode {
             SyncMode::Internal => self.internal.set_bpm(bpm),
+            SyncMode::MidiIn => {}
             SyncMode::Link => {
                 #[cfg(feature = "ableton-link")]
                 self.link.set_tempo(bpm);
@@ -359,10 +497,12 @@ impl SyncTransport {
         SyncStatus {
             mode: self.mode,
             running,
+            starting: self.start_pending(),
             tempo_bpm,
             link_peers: peers,
             link_start_stop_sync: self.link_start_stop_preference,
             link_available: self.link_available(),
+            midi_status: self.midi.label(),
         }
     }
 }

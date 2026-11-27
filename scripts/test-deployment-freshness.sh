@@ -7,6 +7,7 @@ trap 'rm -rf "$TEMP"' EXIT
 trap 'exit 1' HUP INT TERM
 mkdir -p "$TEMP/repo/scripts" "$TEMP/bin" "$TEMP/device"
 cp "$ROOT/scripts/build-device.sh" "$ROOT/scripts/package-khana.sh" "$ROOT/scripts/deploy-khana.sh" "$TEMP/repo/scripts/"
+cp "$ROOT/Cross-link.toml" "$TEMP/repo/"
 cp -R "$ROOT/packaging" "$TEMP/repo/"
 export TEST_ROOT="$TEMP/repo" TEST_DEVICE="$TEMP/device"
 export PATH="$TEMP/bin:$PATH" BRICK_HOST=mock-brick
@@ -15,6 +16,11 @@ cat > "$TEMP/bin/cross" <<'STUB'
 set -eu
 [ "$PWD" = "$TEST_ROOT" ]
 [ "${FAIL_BUILD:-0}" != 1 ] || exit 42
+if [ "${KHANA_LINK:-0}" = 1 ]; then
+    [ "$CROSS_CONFIG" = "$TEST_ROOT/Cross-link.toml" ]
+    [ -f "$CROSS_CONFIG" ]
+    case " $* " in *" --no-default-features --features ableton-link "*) ;; *) exit 43 ;; esac
+fi
 printf 'build\n' >> "$TEST_ROOT/build.calls"
 mkdir -p target/aarch64-unknown-linux-gnu/release
 printf fresh > target/aarch64-unknown-linux-gnu/release/khana
@@ -54,5 +60,7 @@ fi
 # Replacing an existing installation must also refresh the binary.
 printf old-install > "$INSTALLED"
 "$TEST_ROOT/scripts/deploy-khana.sh"
+[ "$(cat "$INSTALLED")" = fresh ]
+KHANA_LINK=1 CROSS_CONFIG= "$TEST_ROOT/scripts/deploy-khana.sh"
 [ "$(cat "$INSTALLED")" = fresh ]
 echo 'PASS: package/deploy freshness, failure isolation and replacement'

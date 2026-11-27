@@ -251,6 +251,15 @@ impl PhraseRecorder {
         self.arm_next = !self.arm_next;
     }
 
+    pub fn cancel_pending_start(&mut self) {
+        self.pending_start = None;
+    }
+
+    pub fn reset_timeline(&mut self) {
+        self.pending_start = None;
+        self.active = None;
+    }
+
     pub fn chord_changed(&mut self, now_beat: f64, new_chord: Chord) {
         let Some(active) = self.active.as_mut() else {
             return;

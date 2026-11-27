@@ -32,6 +32,8 @@ pub struct PerformanceView<'a> {
     pub phrase_count: usize,
     pub midi_destination: &'a str,
     pub midi_clock: &'static str,
+    pub midi_channels: [u8; 4],
+    pub midi_input: Option<&'a str>,
 }
 
 /// All state needed to render the Phrase Editor screen.
@@ -84,6 +86,8 @@ impl Ui {
             phrase_count,
             midi_destination,
             midi_clock,
+            midi_channels,
+            midi_input,
         } = view;
 
         canvas.set_draw_color(background());
@@ -95,12 +99,26 @@ impl Ui {
                 let label: String = midi_destination.chars().take(42).collect();
                 Some(format!("MIDI OUTPUT: {label}"))
             }
+            Some(SettingField::MidiClockOut) if sync_status.mode == SyncMode::MidiIn => {
+                Some("MIDI IN BLOCKS CLOCK OUT".to_owned())
+            }
             Some(SettingField::MidiClockOut) => Some("UP/DOWN TOGGLE MIDI CLOCK".to_owned()),
+            Some(SettingField::Tempo) if sync_status.mode == SyncMode::MidiIn => {
+                Some("TEMPO FROM MIDI INPUT".to_owned())
+            }
+            Some(SettingField::Sync) if sync_status.mode == SyncMode::MidiIn => {
+                Some("MIDI IN: WAIT FOR EXTERNAL TRANSPORT".to_owned())
+            }
             Some(SettingField::MidiPanic) => Some(if self.brick {
-                "MIDI PANIC: A SENDS ON CH 1-4".to_owned()
+                "A: PANIC ON ASSIGNED CHANNELS".to_owned()
             } else {
-                "MIDI PANIC: Z SENDS ON CH 1-4".to_owned()
+                "Z: PANIC ON ASSIGNED CHANNELS".to_owned()
             }),
+            Some(SettingField::MidiChannel(voice)) => Some(format!(
+                "{} MIDI CHANNEL {}  UP/DOWN",
+                voices[voice].role.label(),
+                midi_channels[voice]
+            )),
             Some(SettingField::Tempo) if sync_status.running => {
                 Some("LIVE TEMPO: UP/DOWN 1 BPM".to_owned())
             }
@@ -108,6 +126,18 @@ impl Ui {
         };
         if let Some(hint) = settings_hint {
             draw_text(canvas, 360, 52, &hint, 1, accent())?;
+        } else if setting_focus.is_none()
+            && let Some(input) = midi_input
+        {
+            let label: String = input.chars().take(42).collect();
+            draw_text(
+                canvas,
+                360,
+                52,
+                &format!("{}  {label}", sync_status.midi_status),
+                1,
+                accent(),
+            )?;
         }
         draw_text(
             canvas,
@@ -169,7 +199,15 @@ impl Ui {
             accent(),
         )?;
 
-        draw_voice_rows(canvas, settings.tonal, voices, performer_snapshots, scope)?;
+        draw_voice_rows(
+            canvas,
+            settings.tonal,
+            voices,
+            performer_snapshots,
+            scope,
+            midi_channels,
+            setting_focus,
+        )?;
 
         draw_panel(canvas, Rect::new(32, 660, 960, 82), panel())?;
         draw_recording_strip(
@@ -395,6 +433,7 @@ fn draw_header(
     let sync_label = match sync_status.mode {
         SyncMode::Internal => "INT".to_owned(),
         SyncMode::Link => format!("LINK {}", sync_status.link_peers),
+        SyncMode::MidiIn => "MIDI IN".to_owned(),
     };
     draw_text(
         canvas,
@@ -408,9 +447,15 @@ fn draw_header(
         canvas,
         930,
         23,
-        if sync_status.running { "PLAY" } else { "STOP" },
-        2,
         if sync_status.running {
+            "PLAY"
+        } else if sync_status.starting {
+            "WAIT"
+        } else {
+            "STOP"
+        },
+        2,
+        if sync_status.running || sync_status.starting {
             accent()
         } else {
             dim_text()
@@ -421,8 +466,15 @@ fn draw_header(
         && !sync_status.running
         && !matches!(
             focus,
-            Some(SettingField::MidiOutput | SettingField::MidiClockOut | SettingField::MidiPanic)
+            Some(
+                SettingField::MidiOutput
+                    | SettingField::MidiClockOut
+                    | SettingField::MidiPanic
+                    | SettingField::MidiChannel(_)
+            )
         )
+        && !(sync_status.mode == SyncMode::MidiIn
+            && matches!(focus, Some(SettingField::Sync | SettingField::Tempo)))
     {
         let link_text = if sync_status.link_available {
             format!(
@@ -515,6 +567,8 @@ fn draw_voice_rows(
     voices: &[Voice; 4],
     snapshots: [PerformerSnapshot; 4],
     scope: VoiceScope,
+    channels: [u8; 4],
+    focus: Option<SettingField>,
 ) -> Result<(), String> {
     draw_text(canvas, 36, 330, "PERFORMERS", 2, dim_text())?;
     draw_text(canvas, 260, 330, "DENS", 2, dim_text())?;
@@ -545,12 +599,13 @@ fn draw_voice_rows(
             52,
             y + 31,
             &format!(
-                "RST {}  {}",
+                "CH {}  RST {}  {}",
+                channels[index],
                 snapshots[index].reset_rule.label(),
                 snapshots[index].family.label()
             ),
             1,
-            dim_text(),
+            field_color(focus, SettingField::MidiChannel(index)),
         )?;
         draw_value_bar(canvas, 250, y + 4, voice.parameters.density)?;
         draw_value_bar(canvas, 420, y + 4, voice.parameters.dynamics)?;

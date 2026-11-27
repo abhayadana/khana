@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -210,11 +210,22 @@ fn select<'a>(
     selection: &Selection,
     pinned: Option<&Identity>,
 ) -> Result<&'a RawPort, &'static str> {
+    select_port(ports, selection, pinned, |port| port.output)
+}
+
+fn select_port<'a>(
+    ports: &'a [RawPort],
+    selection: &Selection,
+    pinned: Option<&Identity>,
+    supports_direction: impl Fn(&RawPort) -> bool,
+) -> Result<&'a RawPort, &'static str> {
     let prefer_usb = pinned.is_none()
         && matches!(selection, Selection::Auto)
-        && ports.iter().any(|port| port.output && port.kind() == "USB");
+        && ports
+            .iter()
+            .any(|port| supports_direction(port) && port.kind() == "USB");
     let mut matches = ports.iter().filter(|port| {
-        port.output
+        supports_direction(port)
             && if let Some(identity) = pinned {
                 &port.identity == identity
             } else {
@@ -232,6 +243,102 @@ fn select<'a>(
         return Err("AMBIGUOUS - SELECT PORT");
     }
     Ok(first)
+}
+
+/// Read the clock independently of the output connection and its port selection.
+pub(crate) struct RawClockInput {
+    selection: Selection,
+    pinned: Option<(Identity, PathBuf)>,
+    file: Option<File>,
+    next_scan: Instant,
+    label: String,
+}
+
+impl RawClockInput {
+    pub(crate) fn new() -> Self {
+        let selection = std::env::var("KHANA_MIDI_CLOCK_IN_PORT").ok();
+        let selection = match selection.as_deref().map(str::trim) {
+            Some(path) if path.starts_with('/') => Selection::Path(PathBuf::from(path)),
+            Some(name) if !name.is_empty() => Selection::Name(name.to_lowercase()),
+            _ => Selection::Auto,
+        };
+        Self {
+            selection,
+            pinned: None,
+            file: None,
+            next_scan: Instant::now(),
+            label: "INPUT SCANNING".to_owned(),
+        }
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn poll(&mut self, now: Instant, mut consume: impl FnMut(&[u8])) -> bool {
+        if now >= self.next_scan {
+            self.next_scan = now + RESCAN;
+            self.scan();
+        }
+        let Some(file) = &mut self.file else {
+            return false;
+        };
+
+        // Bound work per poll even when the source sends dense note or SysEx data.
+        let mut bytes = [0; 256];
+        for _ in 0..4 {
+            match file.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(count) => consume(&bytes[..count]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    self.file = None;
+                    self.label = format!("INPUT LOST: {error}");
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn scan(&mut self) {
+        let supports_input = |port: &RawPort| port.input || !port.directions_known;
+        let ports = discover().unwrap_or_default();
+        if self.file.is_some() {
+            if !ports.iter().any(|port| {
+                self.pinned.as_ref().is_some_and(|(identity, path)| {
+                    &port.identity == identity && &port.path == path && supports_input(port)
+                })
+            }) {
+                self.file = None;
+                self.label = "INPUT LOST: DEVICE REMOVED".to_owned();
+            }
+            return;
+        }
+
+        let pinned = self.pinned.as_ref().map(|(identity, _)| identity);
+        let port = match select_port(&ports, &self.selection, pinned, supports_input) {
+            Ok(port) => port,
+            Err(reason) => {
+                self.label = format!("INPUT: {reason}");
+                return;
+            }
+        };
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&port.path)
+        {
+            Ok(file) => {
+                self.label = port.label();
+                self.pinned = Some((port.identity.clone(), port.path.clone()));
+                self.file = Some(file);
+                println!("MIDI clock input: {}", self.label);
+            }
+            Err(error) => self.label = format!("INPUT WAIT: {error}"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -324,6 +431,7 @@ pub(super) struct RawOutput {
     queue: VecDeque<Pending>,
     next_scan: Instant,
     label: String,
+    note_channels: u16,
     needs_cleanup: bool,
     first_clock_after: Option<Instant>,
     sent_bytes: u64,
@@ -340,6 +448,7 @@ impl RawOutput {
             queue: VecDeque::with_capacity(QUEUE_CAPACITY),
             next_scan: Instant::now(),
             label: "RAW WAIT".to_owned(),
+            note_channels: 0,
             needs_cleanup: false,
             first_clock_after: None,
             sent_bytes: 0,
@@ -368,7 +477,17 @@ impl RawOutput {
         if !self.connected() {
             return Err("Raw MIDI disconnected".to_owned());
         }
-        queue_message(&mut self.queue, message, Instant::now())
+        let skipped = queue_message(&mut self.queue, message, Instant::now())?;
+        if let Message::Channel([status @ 0x90..=0x9F, _, 1..=127]) = message {
+            self.note_channels |= 1 << (status & 0x0F);
+        }
+        Ok(skipped)
+    }
+
+    pub(super) fn notes_released(&mut self) {
+        if self.connected() {
+            self.note_channels = 0;
+        }
     }
 
     /// Called only after the MIDI engine has flushed owned note releases.
@@ -412,6 +531,7 @@ impl RawOutput {
         self.queue.clear();
         self.first_clock_after = None;
         self.pinned = None;
+        self.note_channels = 0;
         self.needs_cleanup = false;
         self.selection = choices.swap_remove(next);
         self.next_scan = Instant::now();
@@ -461,10 +581,12 @@ impl RawOutput {
                 };
                 self.set_label(format!("RAW {mode}: {}", port.label()));
                 // Only after a fault, on the previously pinned device. Clear
-                // potentially orphaned notes on Khaṇa's four channels before
+                // potentially orphaned notes on channels used before the fault, before
                 // sending any new attacks. Never replay old musical events.
                 if self.needs_cleanup {
-                    for channel in 0_u8..4 {
+                    for channel in
+                        (0_u8..16).filter(|&channel| self.note_channels & (1 << channel) != 0)
+                    {
                         self.queue.push_back(Pending {
                             message: Message::Channel([0xB0 | channel, 120, 0]),
                             offset: 0,
@@ -562,6 +684,31 @@ impl RawOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn raw_clock_poll_shares_no_state_with_output_and_reads_realtime_bytes() {
+        use crate::midi::MidiFollower;
+
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let now = Instant::now();
+        let mut input = RawClockInput {
+            selection: Selection::Auto,
+            pinned: None,
+            file: Some(File::from(OwnedFd::from(reader))),
+            next_scan: now + RESCAN,
+            label: "TEST INPUT".to_owned(),
+        };
+        let mut follower = MidiFollower::new(120.0);
+        writer.write_all(&[0xFA, 0x90, 60, 0xF8, 90]).unwrap();
+        assert!(input.poll(now, |bytes| follower.receive(bytes, now)));
+        assert!(follower.running());
+        writer.write_all(&[0xFC]).unwrap();
+        assert!(input.poll(now, |bytes| follower.receive(bytes, now)));
+        assert!(!follower.running());
+    }
 
     struct ShortWriter {
         bytes: Vec<u8>,

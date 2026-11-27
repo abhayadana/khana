@@ -6,6 +6,7 @@
 //! cannot terminate unrelated notes.
 
 mod clock;
+mod follow;
 mod raw;
 
 use std::path::PathBuf;
@@ -13,13 +14,17 @@ use std::time::{Duration, Instant};
 
 use crate::performer::VoiceEvent;
 use clock::{ClockOut, Realtime};
+pub(crate) use follow::MidiFollower;
 #[cfg(feature = "alsa-sequencer")]
 use midir::os::unix::VirtualOutput;
 #[cfg(feature = "alsa-sequencer")]
 use midir::{MidiOutput, MidiOutputConnection};
+pub(crate) use raw::RawClockInput;
 use raw::{RawOutput, Selection};
 
 const VOICE_COUNT: usize = 4;
+const MIDI_CHANNEL_COUNT: u8 = 16;
+const DEFAULT_CHANNELS: [u8; VOICE_COUNT] = [0, 1, 2, 3];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Message {
@@ -82,12 +87,15 @@ enum MidiSink {
     Alsa(MidiOutputConnection),
     Raw(Box<RawOutput>),
     DryRun,
+    #[cfg(test)]
+    Capture(Vec<Message>),
 }
 
 /// MIDI transport for the four Khaṇa performers.
 pub struct MidiEngine {
     connection: MidiSink,
     ownership: NoteOwnership,
+    channels: [u8; VOICE_COUNT],
     clock: ClockOut,
     destination_name: String,
     trace: bool,
@@ -109,6 +117,7 @@ impl MidiEngine {
         Ok(Self {
             connection: MidiSink::Alsa(connection),
             ownership: NoteOwnership::new(),
+            channels: DEFAULT_CHANNELS,
             clock: ClockOut::default(),
             destination_name: format!("VIRTUAL: {port_name}"),
             trace: trace_enabled(),
@@ -173,6 +182,7 @@ impl MidiEngine {
             return Ok(Self {
                 connection: MidiSink::Alsa(connection),
                 ownership: NoteOwnership::new(),
+                channels: DEFAULT_CHANNELS,
                 clock: ClockOut::default(),
                 destination_name: name,
                 trace: trace_enabled(),
@@ -192,6 +202,7 @@ impl MidiEngine {
         Self {
             connection: MidiSink::DryRun,
             ownership: NoteOwnership::new(),
+            channels: DEFAULT_CHANNELS,
             clock: ClockOut::default(),
             destination_name: "DRY RUN - NO OUTPUT".to_owned(),
             trace: trace_enabled(),
@@ -201,6 +212,18 @@ impl MidiEngine {
     /// Select the backend without requiring ALSA userspace on Brick.
     /// Explicit dry-run takes precedence; otherwise a raw path implies raw.
     pub fn configured(brick: bool) -> Result<Self, String> {
+        let mut midi = Self::select_backend(brick)?;
+        if let Some(value) = std::env::var_os("KHANA_MIDI_CHANNELS") {
+            if let Some(channels) = value.to_str().and_then(parse_channels) {
+                midi.channels = channels;
+            } else {
+                eprintln!("MIDI: expected four channel numbers from 1-16 in KHANA_MIDI_CHANNELS");
+            }
+        }
+        Ok(midi)
+    }
+
+    fn select_backend(brick: bool) -> Result<Self, String> {
         if std::env::var("KHANA_MIDI_DRY_RUN").as_deref() == Ok("1") {
             return Ok(Self::dry_run());
         }
@@ -230,6 +253,7 @@ impl MidiEngine {
                 Ok(Self {
                     connection: MidiSink::Raw(Box::new(RawOutput::new(selection))),
                     ownership: NoteOwnership::new(),
+                    channels: DEFAULT_CHANNELS,
                     clock: ClockOut::default(),
                     destination_name: String::new(),
                     trace: trace_enabled(),
@@ -304,12 +328,12 @@ impl MidiEngine {
         &mut self,
         beat: f64,
         running: bool,
-        link_quantum: Option<f64>,
+        link_launch: Option<(f64, Option<f64>)>,
     ) -> Result<(), String> {
         let available = self.available();
         if let Some(message) =
             self.clock
-                .update(beat, running, available, link_quantum, Instant::now())
+                .update(beat, running, available, link_launch, Instant::now())
         {
             self.send_realtime(message)?;
         }
@@ -399,33 +423,51 @@ impl MidiEngine {
         }
     }
 
+    /// Returns the performer channels as numbers shown to the user.
+    pub fn channels(&self) -> [u8; VOICE_COUNT] {
+        self.channels.map(|channel| channel + 1)
+    }
+
+    /// Apply a stopped-transport routing change after releasing the old notes.
+    pub fn adjust_channel(&mut self, voice_index: usize, direction: i32) -> Result<(), String> {
+        self.stop_all()?;
+        let channel = &mut self.channels[voice_index];
+        *channel =
+            (i32::from(*channel) + direction).rem_euclid(i32::from(MIDI_CHANNEL_COUNT)) as u8;
+        Ok(())
+    }
+
+    fn other_owner(&self, voice_index: usize, channel: u8, note: u8) -> bool {
+        self.channels.iter().enumerate().any(|(index, &assigned)| {
+            index != voice_index && assigned == channel && self.ownership.contains(index, note)
+        })
+    }
+
     fn note_on(&mut self, voice_index: usize, note: u8, velocity: u8) -> Result<(), String> {
-        if voice_index >= VOICE_COUNT {
+        let Some(&channel) = self.channels.get(voice_index) else {
             return Ok(());
-        }
+        };
 
-        // Rearticulating the same pitch first releases only that pitch. Other
-        // Chords notes on the channel remain owned and sounding.
-        if self.ownership.contains(voice_index, note) {
-            self.send(note_off_message(voice_index, note))?;
-            self.ownership.remove(voice_index, note);
+        // A shared channel has one wire-level note for a given pitch. Only
+        // rearticulate a pitch if this performer is its sole owner.
+        if !self.other_owner(voice_index, channel, note) {
+            if self.ownership.contains(voice_index, note) {
+                self.note_off_if_owned(voice_index, note)?;
+            }
+            self.send(note_on_message(channel, note, velocity))?;
         }
-
-        self.send(note_on_message(voice_index, note, velocity))?;
         self.ownership.insert(voice_index, note);
         Ok(())
     }
 
     fn note_off_if_owned(&mut self, voice_index: usize, note: u8) -> Result<(), String> {
-        if voice_index >= VOICE_COUNT {
-            return Ok(());
-        }
-
         if self.ownership.contains(voice_index, note) {
-            self.send(note_off_message(voice_index, note))?;
+            let channel = self.channels[voice_index];
+            if !self.other_owner(voice_index, channel, note) {
+                self.send(note_off_message(channel, note))?;
+            }
             self.ownership.remove(voice_index, note);
         }
-
         Ok(())
     }
 
@@ -442,15 +484,8 @@ impl MidiEngine {
         let mut first_error = None;
         for voice_index in 0..VOICE_COUNT {
             for note in 0_u8..=127 {
-                if self.ownership.contains(voice_index, note) {
-                    match self.send(note_off_message(voice_index, note)) {
-                        Ok(()) => self.ownership.remove(voice_index, note),
-                        Err(error) => {
-                            if first_error.is_none() {
-                                first_error = Some(error);
-                            }
-                        }
-                    }
+                if let Err(error) = self.note_off_if_owned(voice_index, note) {
+                    first_error.get_or_insert(error);
                 }
             }
         }
@@ -458,21 +493,30 @@ impl MidiEngine {
             return self.recover_raw(error);
         }
         match self.flush_output() {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let MidiSink::Raw(output) = &mut self.connection {
+                    output.notes_released();
+                }
+                Ok(())
+            }
             Err(error) => self.recover_raw(error),
         }
     }
 
-    /// Explicitly silence all four reserved channels, including unowned notes.
+    /// Explicitly silence the assigned output channels, including unowned notes.
     pub fn panic(&mut self) -> Result<(), String> {
         self.stop_all()?;
         if !self.available() {
             eprintln!("MIDI panic: output unavailable");
             return Ok(());
         }
-        for channel in 0..VOICE_COUNT {
+        let assigned = self
+            .channels
+            .iter()
+            .fold(0_u16, |mask, &channel| mask | (1 << channel));
+        for channel in (0..MIDI_CHANNEL_COUNT).filter(|&channel| assigned & (1 << channel) != 0) {
             for control in [120, 123] {
-                let status = 0xB0 | channel_nibble(channel);
+                let status = 0xB0 | channel;
                 if let Err(error) = self.send([status, control, 0]) {
                     return self.recover_raw(error);
                 }
@@ -481,7 +525,7 @@ impl MidiEngine {
         if let Err(error) = self.flush_output() {
             return self.recover_raw(error);
         }
-        println!("MIDI panic: cleared channels 1-4");
+        println!("MIDI panic: cleared currently assigned channels");
         Ok(())
     }
 
@@ -507,6 +551,11 @@ impl MidiEngine {
                 .map_err(|error| error.to_string()),
             MidiSink::Raw(output) => output.enqueue(message),
             MidiSink::DryRun => Ok(false),
+            #[cfg(test)]
+            MidiSink::Capture(messages) => {
+                messages.push(message);
+                Ok(false)
+            }
         }
     }
 }
@@ -560,7 +609,10 @@ pub fn smoke_test(brick: bool) -> Result<(), String> {
     }
     let groups: [&[u8]; VOICE_COUNT] = [&[48], &[60, 64, 67], &[72], &[76]];
     for (voice_index, notes) in groups.into_iter().enumerate() {
-        println!("Testing channel {}: {notes:?}", voice_index + 1);
+        println!(
+            "Testing channel {}: {notes:?}",
+            midi.channels()[voice_index]
+        );
         for &note in notes {
             midi.apply_event(VoiceEvent::NoteOn {
                 voice_index,
@@ -594,26 +646,71 @@ fn note_bit(note: u8) -> u128 {
     1_u128 << note.min(127)
 }
 
-fn note_on_message(channel_index: usize, note: u8, velocity: u8) -> [u8; 3] {
-    [
-        0x90 | channel_nibble(channel_index),
-        note.min(127),
-        velocity.min(127),
-    ]
+fn parse_channels(value: &str) -> Option<[u8; VOICE_COUNT]> {
+    let mut values = value.split(',');
+    let mut channels = DEFAULT_CHANNELS;
+    for channel in &mut channels {
+        let value = values.next()?.trim().parse::<u8>().ok()?;
+        *channel = value
+            .checked_sub(1)
+            .filter(|&value| value < MIDI_CHANNEL_COUNT)?;
+    }
+    values.next().is_none().then_some(channels)
 }
 
-fn note_off_message(channel_index: usize, note: u8) -> [u8; 3] {
-    [0x80 | channel_nibble(channel_index), note.min(127), 0]
+fn note_on_message(channel: u8, note: u8, velocity: u8) -> [u8; 3] {
+    [0x90 | channel, note.min(127), velocity.min(127)]
 }
 
-fn channel_nibble(channel_index: usize) -> u8 {
-    debug_assert!(channel_index < VOICE_COUNT);
-    channel_index as u8
+fn note_off_message(channel: u8, note: u8) -> [u8; 3] {
+    [0x80 | channel, note.min(127), 0]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{NoteOwnership, note_off_message, note_on_message};
+    use super::*;
+
+    #[test]
+    fn channel_defaults_can_be_supplied_by_the_launcher() {
+        assert_eq!(parse_channels("16, 5, 5, 1"), Some([15, 4, 4, 0]));
+        for invalid in ["", "0,1,2,3", "1,2,3,17", "1,2,3", "1,2,3,4,5"] {
+            assert_eq!(parse_channels(invalid), None);
+        }
+    }
+
+    #[test]
+    fn routing_releases_old_notes_and_shared_channel_sends_one_note_and_panic() {
+        let mut midi = MidiEngine::dry_run();
+        midi.connection = MidiSink::Capture(Vec::new());
+        midi.note_on(0, 60, 93).unwrap();
+        midi.adjust_channel(0, -1).unwrap();
+        midi.adjust_channel(1, -2).unwrap();
+        assert_eq!(midi.channels(), [16, 16, 3, 4]);
+        midi.note_on(0, 60, 93).unwrap();
+        midi.note_on(1, 60, 75).unwrap();
+        midi.note_off_if_owned(0, 60).unwrap();
+        assert_eq!(midi.active_counts(), [0, 1, 0, 0]);
+        midi.note_off_if_owned(1, 60).unwrap();
+        midi.panic().unwrap();
+        let MidiSink::Capture(messages) = &midi.connection else {
+            unreachable!();
+        };
+        assert_eq!(
+            messages.iter().map(Message::bytes).collect::<Vec<_>>(),
+            [
+                &[0x90, 60, 93],
+                &[0x80, 60, 0],
+                &[0x9F, 60, 93],
+                &[0x8F, 60, 0],
+                &[0xB2, 120, 0],
+                &[0xB2, 123, 0],
+                &[0xB3, 120, 0],
+                &[0xB3, 123, 0],
+                &[0xBF, 120, 0],
+                &[0xBF, 123, 0],
+            ],
+        );
+    }
 
     #[test]
     fn four_voice_note_on_messages_use_midi_channels_one_through_four() {
