@@ -15,7 +15,7 @@ use crate::voice::{Voice, VoiceRole, VoiceScope};
 
 const VOICE_COUNT: usize = 4;
 const MAX_NOTES_PER_VOICE: usize = MAX_VOICING_NOTES;
-const MAX_EVENTS_PER_UPDATE: usize = 32;
+const MAX_EVENTS_PER_UPDATE: usize = 64;
 const MAX_MELODY_STEPS: usize = 64;
 
 /// When a performer's larger rhythmic state naturally renews.
@@ -220,7 +220,7 @@ const MELODY_ORNAMENT: [PatternVariant; 3] = [
 ];
 
 /// One channel-specific MIDI intention emitted by a performer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum VoiceEvent {
     NoteOn {
         voice_index: usize,
@@ -273,6 +273,13 @@ impl NoteSet {
         Self { notes, len: 1 }
     }
 
+    fn push(&mut self, note: u8) {
+        if self.len < self.notes.len() && !self.iter().any(|pitch| pitch == note) {
+            self.notes[self.len] = note;
+            self.len += 1;
+        }
+    }
+
     fn chord(voicing: Voicing) -> Self {
         Self {
             notes: voicing.notes,
@@ -305,7 +312,7 @@ struct ScheduledNotes {
 #[derive(Clone, Copy, Debug)]
 struct PendingAttack {
     notes: NoteSet,
-    velocity: u8,
+    velocity: [u8; MAX_NOTES_PER_VOICE],
     start_beat: f64,
     gate_beats: f64,
     preserve_common: bool,
@@ -544,6 +551,7 @@ pub struct PerformerSnapshot {
     pub muted: bool,
     pub soloed: bool,
     pub vary_queued: bool,
+    pub polyphony: &'static str,
 }
 
 /// Lightweight snapshot of what the other performers are doing.
@@ -668,6 +676,41 @@ impl TextureStyle {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Polyphony {
+    pub texture: u8,
+    pub melody: u8,
+}
+
+impl Polyphony {
+    const fn default_const() -> Self {
+        Self {
+            texture: 1,
+            melody: 1,
+        }
+    }
+
+    pub fn valid(self) -> bool {
+        (1..=3).contains(&self.texture) && (1..=2).contains(&self.melody)
+    }
+
+    pub fn label(self, index: usize) -> &'static str {
+        match (index, self.texture, self.melody) {
+            (2, 2, _) => "DYAD",
+            (2, 3, _) => "TRIAD",
+            (3, _, 2) => "HARMONY",
+            (2 | 3, _, _) => "MONO",
+            _ => "",
+        }
+    }
+}
+
+impl Default for Polyphony {
+    fn default() -> Self {
+        Self::default_const()
+    }
+}
+
 /// Four independent role-aware performers sharing one active harmony.
 pub struct PerformerEngine {
     chord: Chord,
@@ -678,6 +721,9 @@ pub struct PerformerEngine {
     phrase_position: Option<PhrasePosition>,
     pub(crate) groove: Groove,
     pub(crate) texture_style: TextureStyle,
+    pub(crate) polyphony: Polyphony,
+    polyphony_reduce_at: [Option<f64>; 2],
+    drone_expand_at: Option<f64>,
     enabled: bool,
     muted: [bool; VOICE_COUNT],
     solo: Option<usize>,
@@ -792,6 +838,20 @@ impl PerformerEngine {
         }
     }
 
+    pub(crate) fn cycle_polyphony(&mut self, scope: VoiceScope, next_beat: Option<f64>) {
+        let (count, max, slot) = match scope {
+            VoiceScope::One(2) => (&mut self.polyphony.texture, 3, 0),
+            VoiceScope::One(3) => (&mut self.polyphony.melody, 2, 1),
+            _ => return,
+        };
+        let previous = *count;
+        *count = previous % max + 1;
+        self.polyphony_reduce_at[slot] = if *count < previous { next_beat } else { None };
+        if slot == 0 && self.texture_style == TextureStyle::CommonToneDrone {
+            self.drone_expand_at = if *count > previous { next_beat } else { None };
+        }
+    }
+
     pub(crate) fn request_live_revoice(&mut self) {
         self.live_revoice = true;
     }
@@ -815,6 +875,9 @@ impl PerformerEngine {
             phrase_position: None,
             groove: Groove::Straight,
             texture_style: TextureStyle::Auto,
+            polyphony: Polyphony::default_const(),
+            polyphony_reduce_at: [None; 2],
+            drone_expand_at: None,
             enabled: false,
             muted: [false; VOICE_COUNT],
             solo: None,
@@ -878,6 +941,12 @@ impl PerformerEngine {
             state.pending_resolution = None;
         }
 
+        if self.texture_style == TextureStyle::CommonToneDrone
+            && self.polyphony.texture > 1
+            && self.states[2].sounding.is_some()
+        {
+            self.states[2].force_attack = true;
+        }
         self.states[0].last_step_key = None;
         self.states[0].pattern.force_next_family_boundary();
         self.states[1].pattern.force_next_family_boundary();
@@ -927,6 +996,8 @@ impl PerformerEngine {
     pub fn transport_stopped(&mut self) {
         self.enabled = false;
         self.phrase_position = None;
+        self.polyphony_reduce_at = [None; 2];
+        self.drone_expand_at = None;
         self.live_revoice = false;
         for state in &mut self.states {
             state.sounding = None;
@@ -967,6 +1038,7 @@ impl PerformerEngine {
     pub fn snapshots(&self) -> [PerformerSnapshot; VOICE_COUNT] {
         std::array::from_fn(|index| PerformerSnapshot {
             held: self.states[index].held,
+            polyphony: self.polyphony.label(index),
             sustain: self.states[index].sustain,
             muted: self.muted[index],
             soloed: self.solo == Some(index),
@@ -994,6 +1066,10 @@ impl PerformerEngine {
         }
 
         let live_revoice = std::mem::take(&mut self.live_revoice);
+        if self.drone_expand_at.is_some_and(|beat| now_beat >= beat) {
+            self.drone_expand_at = None;
+            self.states[2].force_attack = self.states[2].sounding.is_some();
+        }
         let opening = self
             .phrase_position
             .is_some_and(|position| position.opening(beats_per_bar));
@@ -1009,10 +1085,29 @@ impl PerformerEngine {
                 self.mute_voice(index, &mut batch);
                 continue;
             }
+            if index >= 2
+                && self.polyphony_reduce_at[index - 2].is_some_and(|beat| now_beat >= beat)
+            {
+                self.polyphony_reduce_at[index - 2] = None;
+                let state = &mut self.states[index];
+                if let Some(active) = &mut state.sounding {
+                    for note in active.notes.iter().skip(1) {
+                        batch.push(VoiceEvent::NoteOff {
+                            voice_index: index,
+                            note,
+                        });
+                    }
+                    active.notes.len = 1;
+                }
+                if let Some(pending) = &mut state.pending {
+                    pending.notes.len = 1;
+                }
+            }
             let state = &self.states[index];
             if index >= 2
                 && (state.sustain
                     || index == 2 && self.texture_style == TextureStyle::CommonToneDrone)
+                && !state.force_attack
                 && let Some(active) = state.sounding
                 && active.sustain_eligible
                 && !active.notes.iter().all(|note| self.is_chord_tone(note))
@@ -1202,6 +1297,8 @@ impl PerformerEngine {
             self.states[index].force_attack = false;
             let legato_harmony = std::mem::take(&mut self.states[index].legato_harmony);
             let preserve_common = self.states[index].sustain
+                || drone
+                || role == VoiceRole::Melody && self.polyphony.melody > 1
                 || role == VoiceRole::Chords
                     && (live_revoice
                         || legato_harmony
@@ -1240,7 +1337,7 @@ impl PerformerEngine {
                 continue;
             }
 
-            let notes = match role {
+            let mut notes = match role {
                 VoiceRole::Chords => NoteSet::chord(self.chord_voicing),
                 VoiceRole::Melody => NoteSet::single(self.choose_melody_note(
                     index,
@@ -1283,6 +1380,31 @@ impl PerformerEngine {
                 }
             };
 
+            let max_notes = match role {
+                VoiceRole::Texture if self.texture_style != TextureStyle::SparseEcho => {
+                    self.polyphony.texture
+                }
+                VoiceRole::Melody
+                    if matches!(
+                        self.states[3].melody_plan.intent(timing.position),
+                        MelodyIntent::Skeleton(_)
+                    ) && self.states[3].melody_plan.step(timing.position).gate_steps >= 2 =>
+                {
+                    self.polyphony.melody
+                }
+                _ => 1,
+            };
+            if max_notes > 1 {
+                let prior = self.states[index].sounding.map(|active| active.notes);
+                add_companions(
+                    &mut notes,
+                    prior,
+                    self.chord,
+                    max_notes,
+                    voice.parameters.spread,
+                    drone,
+                );
+            }
             let mut velocity = attack_velocity(
                 role,
                 voice.parameters.dynamics,
@@ -1322,7 +1444,13 @@ impl PerformerEngine {
 
             self.states[index].pending = Some(PendingAttack {
                 notes,
-                velocity,
+                velocity: note_velocities(
+                    role,
+                    notes,
+                    self.chord,
+                    velocity,
+                    voice.parameters.color,
+                ),
                 start_beat: start,
                 gate_beats: gate,
                 preserve_common,
@@ -1373,6 +1501,18 @@ impl PerformerEngine {
         let notes = NoteSet::chord(self.chord_voicing);
         if let Some(pending) = &mut state.pending {
             pending.notes = notes;
+            pending.velocity = note_velocities(
+                VoiceRole::Chords,
+                notes,
+                self.chord,
+                attack_velocity(
+                    VoiceRole::Chords,
+                    voice.parameters.dynamics,
+                    0,
+                    self.intensity,
+                ),
+                voice.parameters.color,
+            );
             pending.preserve_common = true;
         }
         let Some(active) = state.sounding else {
@@ -1393,7 +1533,14 @@ impl PerformerEngine {
                 timing.position,
                 self.intensity,
             );
-            Self::transition_notes(1, Some(active), notes, velocity, true, batch);
+            let velocities = note_velocities(
+                VoiceRole::Chords,
+                notes,
+                self.chord,
+                velocity,
+                voice.parameters.color,
+            );
+            Self::transition_notes(1, Some(active), notes, velocities, true, batch);
             state.sounding = Some(ScheduledNotes { notes, ..active });
         }
     }
@@ -1486,7 +1633,7 @@ impl PerformerEngine {
             sustain_eligible: pending.sustain_eligible,
         });
         self.states[index].last_attack_beat = Some(now_beat);
-        if pending.notes.len == 1 {
+        if index != 1 {
             let next_note = pending.notes.notes[0];
             self.states[index].motion_direction =
                 self.states[index].previous_note.map_or(0, |previous| {
@@ -1505,7 +1652,7 @@ impl PerformerEngine {
         index: usize,
         active: Option<ScheduledNotes>,
         next: NoteSet,
-        velocity: u8,
+        velocities: [u8; MAX_NOTES_PER_VOICE],
         preserve_common: bool,
         batch: &mut VoiceEventBatch,
     ) {
@@ -1519,7 +1666,7 @@ impl PerformerEngine {
                 }
             }
         }
-        for note in next.iter() {
+        for (note, velocity) in next.iter().zip(velocities) {
             if !preserve_common
                 || !active.is_some_and(|old| old.notes.iter().any(|pitch| pitch == note))
             {
@@ -2983,6 +3130,88 @@ fn gate_ratio(role: VoiceRole, variant: PatternVariant, space: f32, intensity: f
         .clamp(0.14, 0.98)
 }
 
+fn add_companions(
+    notes: &mut NoteSet,
+    previous: Option<NoteSet>,
+    chord: Chord,
+    count: u8,
+    spread: f32,
+    drone: bool,
+) {
+    let lead = notes.notes[0];
+    let tones = chord.essential_pitch_classes();
+    if drone && let Some(previous) = previous {
+        for note in previous.iter().filter(|note| tones.contains(&(note % 12))) {
+            if notes.len == usize::from(count) {
+                break;
+            }
+            if !notes.iter().any(|held| held % 12 == note % 12) {
+                notes.push(note);
+            }
+        }
+    }
+    let spacing = (4.0 + spread * 7.0).round() as u8;
+    while notes.len < usize::from(count) {
+        let target = lead.saturating_sub(spacing * notes.len as u8);
+        let next = (36..lead.saturating_sub(2))
+            .filter(|note| {
+                tones.contains(&(note % 12))
+                    && notes
+                        .iter()
+                        .all(|chosen| chosen.abs_diff(*note) >= 3 && chosen % 12 != note % 12)
+            })
+            .min_by_key(|note| {
+                (
+                    note.abs_diff(target),
+                    !previous.is_some_and(|old| old.iter().any(|pitch| pitch == *note)),
+                )
+            });
+        let Some(next) = next else {
+            break;
+        };
+        notes.push(next);
+    }
+}
+
+fn note_velocities(
+    role: VoiceRole,
+    notes: NoteSet,
+    chord: Chord,
+    velocity: u8,
+    color: f32,
+) -> [u8; MAX_NOTES_PER_VOICE] {
+    let mut result = [velocity; MAX_NOTES_PER_VOICE];
+    if role != VoiceRole::Chords {
+        result[1..].fill(velocity.saturating_sub(17).max(1));
+        return result;
+    }
+    let intervals = chord.intervals();
+    let offsets: [f32; MAX_NOTES_PER_VOICE] = std::array::from_fn(|index| {
+        if index >= notes.len {
+            return 0.0;
+        }
+        let relative = (notes.notes[index] + 12 - chord.root.value()) % 12;
+        let degree = intervals
+            .iter()
+            .position(|interval| interval % 12 == relative);
+        let weights = match degree {
+            Some(0 | 2) => [9.0, 0.0, -6.0],
+            Some(1) => [-3.0, 9.0, if intervals.len() == 3 { 14.0 } else { 1.0 }],
+            _ => [-7.0, 1.0, 12.0],
+        };
+        let position = color.clamp(0.0, 1.0) * 2.0;
+        let low = (position as usize).min(1);
+        weights[low] + (weights[low + 1] - weights[low]) * (position - low as f32)
+    });
+    let mean = offsets.iter().sum::<f32>() / notes.len.max(1) as f32;
+    for (result, offset) in result.iter_mut().zip(offsets).take(notes.len) {
+        *result = (f32::from(velocity) + offset - mean)
+            .round()
+            .clamp(1.0, 127.0) as u8;
+    }
+    result
+}
+
 fn timing_offset_beats(role: VoiceRole) -> f64 {
     match role {
         VoiceRole::Melody => 0.0,
@@ -3080,6 +3309,89 @@ mod tests {
         assert!(engine.update(2.0, 4.0, &voices).iter().any(|event| {
             matches!(event, VoiceEvent::NoteOff { voice_index: 2, note } if note == drone)
         }));
+    }
+
+    #[test]
+    fn chord_color_rebalances_velocity_without_changing_the_mean_or_pitches() {
+        use super::{NoteSet, note_velocities};
+        let chord = Chord::new(
+            PitchClass::from_value(0),
+            ChordQuality::Major,
+            ChordExtension::Ninth,
+        );
+        let notes = NoteSet::chord(Voicing::from_slice(&[48, 55, 64, 71, 74]));
+        let low = note_velocities(VoiceRole::Chords, notes, chord, 75, 0.0);
+        let high = note_velocities(VoiceRole::Chords, notes, chord, 75, 1.0);
+        assert!(low[0] > low[3] && low[1] > low[4]);
+        assert!(high[3] > high[0] && high[4] > high[1]);
+        for velocities in [low, high] {
+            let sum = velocities[..notes.len]
+                .iter()
+                .map(|&velocity| i32::from(velocity))
+                .sum::<i32>();
+            assert!((sum - 375).abs() <= 2);
+        }
+    }
+
+    #[test]
+    fn held_drone_grows_and_reduces_on_beat_without_retriggering_lead() {
+        use super::TextureStyle;
+        use crate::voice::VoiceScope;
+        let settings = MusicalSettings::default();
+        let mut voices = default_voices();
+        for index in [0, 1, 3] {
+            voices[index].parameters.density = 0.0;
+        }
+        let mut engine = PerformerEngine::new(
+            c_major(),
+            settings.tonal,
+            Voicing::from_slice(&[60, 64, 67]),
+        );
+        engine.texture_style = TextureStyle::CommonToneDrone;
+        engine.transport_started(0.0);
+        engine.update(0.0, 4.0, &voices);
+        engine.update(0.03, 4.0, &voices);
+        let lead = engine.snapshots()[2].active_notes[0].unwrap();
+
+        engine.cycle_polyphony(VoiceScope::One(2), Some(1.0));
+        engine.cycle_polyphony(VoiceScope::One(2), Some(1.0));
+        engine.update(1.0, 4.0, &voices);
+        let expansion = engine.update(1.03, 4.0, &voices);
+        assert_eq!(
+            expansion
+                .iter()
+                .filter(|event| matches!(event, VoiceEvent::NoteOn { voice_index: 2, .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            engine.snapshots()[2]
+                .active_notes
+                .into_iter()
+                .flatten()
+                .fold(0_u16, |classes, note| classes | (1 << (note % 12)))
+                .count_ones(),
+            3
+        );
+
+        engine.cycle_polyphony(VoiceScope::One(2), Some(2.0));
+        assert!(engine.update(1.99, 4.0, &voices).iter().next().is_none());
+        let reduced = engine.update(2.0, 4.0, &voices);
+        assert_eq!(
+            reduced
+                .iter()
+                .filter(|event| matches!(event, VoiceEvent::NoteOff { voice_index: 2, .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            engine.snapshots()[2]
+                .active_notes
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            vec![lead]
+        );
     }
 
     #[test]
@@ -3660,7 +3972,7 @@ mod tests {
         engine.states[2].pending = Some(super::PendingAttack {
             sustain_eligible: false,
             notes: super::NoteSet::single(79),
-            velocity: 90,
+            velocity: [90; super::MAX_NOTES_PER_VOICE],
             start_beat: 1.0,
             gate_beats: 0.25,
             preserve_common: false,
@@ -3685,7 +3997,7 @@ mod tests {
         engine.states[2].pending = Some(super::PendingAttack {
             sustain_eligible: false,
             notes: super::NoteSet::single(76),
-            velocity: 90,
+            velocity: [90; super::MAX_NOTES_PER_VOICE],
             start_beat: 1.0,
             gate_beats: 0.5,
             preserve_common: false,

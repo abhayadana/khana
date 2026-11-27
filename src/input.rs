@@ -23,6 +23,9 @@ pub enum InputAction {
     BiasTension,
     DirectionStep(i32),
     ToggleMacroMember,
+    CyclePolyphony,
+    ToggleWorkspace,
+    WorkspaceRecall,
     ScopePrevious,
     ScopeNext,
     AdjustMacro { kind: MacroKind, delta: f32 },
@@ -79,6 +82,9 @@ pub fn map_key(keycode: Keycode) -> Option<InputAction> {
             delta: 0.05,
         }),
         Keycode::F4 => Some(ToggleMacroMember),
+        Keycode::F3 => Some(CyclePolyphony),
+        Keycode::F2 => Some(ToggleWorkspace),
+        Keycode::F1 => Some(WorkspaceRecall),
         Keycode::Y => Some(AdjustMacro {
             kind: MacroKind::Dynamics,
             delta: -0.05,
@@ -188,7 +194,9 @@ fn map_event(event: &Event, page: InputPage) -> Option<InputAction> {
             keycode: Some(Keycode::X),
             repeat: false,
             ..
-        } if page == InputPage::Settings => Some(InputAction::Tertiary),
+        } if matches!(page, InputPage::Settings | InputPage::Workspace) => {
+            Some(InputAction::Tertiary)
+        }
         Event::KeyDown {
             keycode: Some(keycode),
             repeat: false,
@@ -215,6 +223,7 @@ fn map_controller_button(button: Button, page: InputPage) -> Option<InputAction>
         Button::X => Some(Tertiary),
         Button::Y if page == InputPage::Performance => Some(ToggleMacroMember),
         Button::Y if page == InputPage::Editor => Some(ToggleScreen),
+        Button::Y if page == InputPage::Workspace => Some(WorkspaceRecall),
         Button::Back => Some(ToggleSettings),
         Button::LeftStick => Some(LeftClick),
         Button::RightStick => Some(RightClick),
@@ -261,6 +270,7 @@ pub enum InputPage {
     Performance,
     Editor,
     Settings,
+    Workspace,
 }
 
 const MENU_HOLD: Duration = Duration::from_millis(700);
@@ -312,7 +322,11 @@ impl HandheldInput {
                 keycode: Some(key),
                 repeat: false,
                 ..
-            } if *key == Keycode::X && page == InputPage::Settings => Some(InputAction::Tertiary),
+            } if *key == Keycode::X
+                && matches!(page, InputPage::Settings | InputPage::Workspace) =>
+            {
+                Some(InputAction::Tertiary)
+            }
             Event::KeyDown {
                 keycode: Some(key),
                 repeat: false,
@@ -335,7 +349,13 @@ impl HandheldInput {
                     }
                     None
                 }
-                button if button == self.left_click => Some(InputAction::LeftClick),
+                button if button == self.left_click => {
+                    Some(if self.select && page == InputPage::Performance {
+                        InputAction::CyclePolyphony
+                    } else {
+                        InputAction::LeftClick
+                    })
+                }
                 button if Some(button) == self.right_click => {
                     Some(if self.select && page == InputPage::Performance {
                         InputAction::Vary
@@ -541,6 +561,15 @@ fn brick_button(page: InputPage, button: u8, select: bool) -> Option<InputAction
         (InputPage::Editor, true, 2) => Some(EditDelete),
         (InputPage::Editor, true, 4) => Some(ZoomOut),
         (InputPage::Editor, true, 5) => Some(ZoomIn),
+        (InputPage::Performance | InputPage::Editor | InputPage::Workspace, true, 7) => {
+            Some(ToggleWorkspace)
+        }
+        (InputPage::Workspace, false, 1) => Some(Primary),
+        (InputPage::Workspace, false, 0) => Some(Secondary),
+        (InputPage::Workspace, false, 3) => Some(Tertiary),
+        (InputPage::Workspace, false, 2) => Some(WorkspaceRecall),
+        (InputPage::Workspace, false, 4) => Some(ScopePrevious),
+        (InputPage::Workspace, false, 5) => Some(ScopeNext),
         (InputPage::Settings, false, 0) => Some(ToggleSettings),
         (InputPage::Settings, false, 1) => Some(Primary),
         (InputPage::Settings, false, 3) => Some(Tertiary),

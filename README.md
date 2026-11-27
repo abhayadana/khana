@@ -1,4 +1,4 @@
-# Khaṇa v0.12.3
+# Khaṇa v0.13.0
 
 Khaṇa is a playable MIDI instrument for TrimUI Brick Pro with NextUI and for
 Linux desktop. Choose a chord, shape the four performers, then record and
@@ -15,7 +15,7 @@ toolchain. This guide uses the local PIC image for both build and deploy.
 
 When installing a patch, start from its stated GitHub commit and use
 `git apply --check /path/to/patch` followed by `git apply /path/to/patch`.
-The v0.12.3 patch is based on `31af195d5bf44b0d9e951dcd3feee4455b7939c7`.
+The v0.13.0 patch is based on `6d73dc143ea3420b49bd98538b432c96114e8bd6`.
 
 From the repository root, build a Link-enabled Pak or deploy it over SSH:
 
@@ -77,6 +77,8 @@ cargo run --locked --features ableton-link
 | Spread − / + | Right stick ← / → | U / J |
 | Color − / + | Right stick ↓ / ↑ | I / K |
 | Toggle Sustain | L3 | F5 |
+| Cycle Texture or Melody polyphony | Focus the performer, then Select+L3 | F3 |
+| Open Workspace | Select+Start | F2 |
 | Cycle chord voicing | R3 | F6 |
 | Request scoped Vary | Select+R3 or Select+Y | F7 |
 | Toggle scoped Pattern Hold | Select+L2 | F8 |
@@ -106,13 +108,41 @@ latest commit replaces the pending chord. Changing the grid leaves an
 already queued chord at its scheduled time. While stopped, A commits
 immediately. In 6/8, 9/8, and 12/8, Beat means a dotted quarter.
 
-**Performer macros** shape independent roles. Bass anchors the harmony
-and can walk into a known chord. Chords play the complete displayed chord
-with register and spacing set by Spread and voicing. Texture contributes
-repeating figures and drones. Melody uses phrase-shaped motifs, peaks,
-and answers. Density changes activity, Dynamics changes velocity, Spread
-changes register and voicing width, and Color opens up each role's pitch
-choices. At Density zero a performer is silent.
+### How the four macros shape the ensemble
+
+**Density** chooses the kind of pattern and how much space it leaves.
+Zero silences the performer. **Dynamics** changes MIDI attack velocity.
+The sound depends on the receiving instrument's response to velocity.
+**Spread** affects register and spacing. **Color** changes the pitch
+palette or brings selected chord tones forward.
+
+| Performer | Density | Dynamics | Spread | Color |
+|---|---|---|---|---|
+| Bass | Sustained anchors, root/fifth foundations, then moving patterns and turnarounds | Bass attack weight | Higher values favor a higher bass position. Patterns can make octave jumps. | Root/fifth first, then thirds, sevenths, and scale notes where the figure supports them. High Color can allow a chromatic approach. |
+| Chords | Long gates, pulses, then comping and stabs | Overall chord attack | Widens the voicing and influences inversion and register. R3 chooses Smooth, Close, or Open. | Brings root/fifth forward at low settings, the third around the middle, and the seventh or ninth up high. High Color on a triad emphasizes the third. Every pitch of the displayed chord stays in the voicing. |
+| Texture | In Auto, drones, isolated notes, pulses, then figures and shimmer. An explicit role shapes how it uses that space. | Brings figures forward or lets them sit behind Melody | Raises typical figures and widens polyphonic spacing | Chord tones first, then colors such as the ninth, eleventh, and thirteenth. Drone and Echo favor compatible tones. |
+| Melody | Sparse motifs, developed phrases, then ornaments | Lifts the lead. Structural peaks can receive an accent and passing notes play softer. | Raises the lead's register and separates a companion when Harmony is enabled | Structural notes stay on chord tones. Higher settings let fills use more of the scale and can add chromatic steps into a chord tone. |
+
+Try a slow progression with Chords Density low and Texture on Common-tone
+Drone. Raise Melody Density while keeping its Dynamics restrained. For a
+Chord Color comparison, play Cmaj9 at both ends of the Color range.
+Listen for C and G at the low end and B and D at the high end.
+
+### Texture and Melody polyphony
+
+Focus Texture or Melody with **L1/R1**, then press **Select+L3** or **F3**.
+The performer row shows the setting. The gesture follows the outlined
+performer. The macro group continues to govern stick movements.
+
+- **Texture** cycles Mono, Dyad, and Triad. Figures can add up to two
+  chord tones, and Common-tone Drone can keep compatible notes through
+  harmony changes. Sparse Echo keeps its single-note reply.
+- **Melody** cycles Mono and Harmony. Harmony adds a quieter lower note
+  on longer structural notes. Passing notes and fast ornaments stay
+  single. Spread affects the separation.
+- Extra voices enter on an eligible figure or at the next beat for a
+  sounding drone. Reducing to Mono releases the extra voices by the next
+  beat. Plain L3 still controls Sustain.
 
 **Sustain** extends sounding notes for the active scope. It holds a stable
 note already sounding, or waits for the next one. Chords hold the current
@@ -159,6 +189,7 @@ phrase, the current performer settings supply the arrangement.
 | Previous / next duration grid | D-pad ↑ / ↓ | Up / Down or [ / ] |
 | Zoom out / in | Select+L1 / Select+R1 | - / = |
 | Toggle selected phrase loop | L3 | F5 |
+| Open Workspace | Select+Start | F2 |
 | Clear queued phrase | R3 or Select+B | F6 |
 | Undo the selected phrase's last edit | Select+A | F12 |
 | Return to Performance | Y or tap Menu | Tab |
@@ -249,10 +280,48 @@ or path. `KHANA_INPUT_LOG=1` logs SDL events. `KHANA_MIDI_TRACE=1` shows MIDI
 traffic. On desktop, `cargo run --locked -- --midi-list` lists ports.
 Use `KHANA_MIDI_DRY_RUN=1` to try the interface without sending MIDI.
 
+## Capture Take and Workspace
+
+Open **Workspace** from either main screen with **Select+Start** on Brick
+or **F2** on desktop. Left/Right switches tabs. Up/Down selects an item.
+
+| Tab | A / Z | X | Other controls |
+|---|---|---|---|
+| Takes | Play highlighted take | Switch Phrase / Take capture | Y / F1 recalls setup while stopped. L3 / F5 copies captured harmony into Phrase Editor. |
+| Projects | Review, then press again to load | Save the current workspace under a name | Stop transport first. B / M cancels. |
+| Presets | Load the highlighted performer setup | Save the current setup under a name | Stop transport first. B / M cancels. |
+
+To capture, choose **Take** with X in the Takes tab, return to Performance,
+and use the usual **Select+A** or **P**. An existing phrase loop records
+one complete pass from its next seam. During live play, capture starts
+on the next bar and a second press schedules the end. Press again while
+armed to cancel. Stopping transport ends an active take. The status strip
+shows which capture mode is selected.
+
+**Play Phrase** generates a fresh rendition from the chord events.
+**Play Take** sends the notes, voicings, velocities, and beat-relative
+timing from the original pass over the current MIDI routing. The active
+Internal, MIDI Clock, or Link tempo sets replay speed. Take settings are
+stored with it and can be recalled separately. Copy Harmony adds an
+editable looping phrase alongside the take.
+
+Projects save key, meter, internal tempo, phrases, takes, and the current
+performer setup. Edit and save the project again to update its named
+snapshot. Presets save the reusable performer setup, including macros,
+voicing, polyphony, Chord Gate, Groove, and Texture Role. A preset leaves
+the current project and phrase bank in place. MIDI channels, transpose,
+clock source, and port settings belong to the rig.
+
+For a name, use Left/Right to move between characters and Up/Down or
+L1/R1 to cycle letters, digits, spaces, and a hyphen. Y or F1 clears the
+name. A or Z saves. Saving under an existing name prompts for confirmation.
+The workspace supports up to 64 takes, projects, and presets each.
+
 ## Save and resume
 
 Khaṇa saves the key, meter, clock mode, performer settings, output channels
-and transpose, voicing, groove, Texture Role, both grids, and phrases with their loop flags.
+and transpose, voicing, polyphony, groove, Texture Role, both grids, phrases, takes,
+and the project and preset lists.
 Quit cleanly to flush the last changes. The next launch restores the
 setup with transport stopped and empty playback and recording queues.
 Mute, Solo, Sustain, the macro group, and undo history are performance-session state.
@@ -270,9 +339,10 @@ The Rust tests cover performer note transitions, phrase editing, routing,
 and transport. The Link-enabled Brick build and desktop checks exercise
 the compiled code. Physical Brick controls and external MIDI and Link
 timing need a device test. Try setting Melody to channel 7 and +12
-without the guide, then set a macro group of Bass and Texture. Play an
-off-grid loop with each Texture role and compare Straight, Light Swing,
-and Laid Back against an external clock.
+without the guide, then set a macro group of Bass and Texture. Capture an
+off-grid phrase loop with Texture in Triad and Melody in Harmony. Change
+the preset and replay the take through MIDI Clock or Link. Check its note
+releases and timing, then reopen the project after restarting the app.
 
 ## LLM disclosure
 

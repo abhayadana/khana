@@ -265,6 +265,16 @@ impl PhraseRecorder {
         RecorderStatus::Idle
     }
 
+    pub fn copy_harmony(&mut self, events: &[ChordEvent]) -> Phrase {
+        let id = self.next_phrase_id;
+        self.next_phrase_id = self.next_phrase_id.saturating_add(1);
+        Phrase {
+            id,
+            looping: true,
+            events: events.to_vec(),
+        }
+    }
+
     pub fn continue_numbering(&mut self, phrases: &[Phrase]) {
         self.next_phrase_id = phrases
             .iter()
@@ -434,6 +444,18 @@ impl PhrasePlayer {
         }
     }
 
+    pub fn loop_window(&self, phrases: &[Phrase], now: f64) -> Option<(f64, f64, u32)> {
+        let playing = self.playing?;
+        let phrase = phrases.get(playing.phrase_index)?;
+        let duration = phrase.duration_beats();
+        if !phrase.looping || duration <= 0.0 {
+            return None;
+        }
+        let start =
+            playing.started_beat + next_strict_boundary(now - playing.started_beat, duration);
+        Some((start, start + duration, phrase.id))
+    }
+
     pub fn playing_phrase(&self) -> Option<usize> {
         self.playing.map(|state| state.phrase_index)
     }
@@ -588,7 +610,7 @@ fn close_current_event(active: &mut ActiveRecording, end_beat: f64) {
     });
 }
 
-fn next_boundary(now_beat: f64, quantum: f64) -> f64 {
+pub(crate) fn next_boundary(now_beat: f64, quantum: f64) -> f64 {
     let quotient = now_beat / quantum;
     let rounded = quotient.ceil() * quantum;
 
@@ -698,6 +720,10 @@ mod tests {
         let mut player = PhrasePlayer::new();
         player.request(0, 4.0, 4.0);
         assert_eq!(player.update(&phrases, 4.0).chord, Some(c_major()));
+        let (start, stop, id) = player.loop_window(&phrases, 5.0).unwrap();
+        assert!((start - 6.3).abs() < 1.0e-9);
+        assert!((stop - 8.6).abs() < 1.0e-9);
+        assert_eq!(id, 1);
         let last = player.update(&phrases, 5.0);
         assert_eq!(last.chord, Some(d_minor()));
         assert_eq!(last.next_chord_beat, Some(6.3));

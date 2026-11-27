@@ -13,8 +13,9 @@ use crate::music::voicing::VoicingStyle;
 use crate::performer::PerformerSnapshot;
 use crate::phrase::{EditGrid, Phrase, RecorderStatus};
 use crate::sync::{SyncMode, SyncStatus, SyncTransport};
-use crate::ui::{PerformanceView, PhraseEditorView, Ui};
+use crate::ui::{PerformanceView, PhraseEditorView, Ui, WorkspaceView};
 use crate::voice::{Voice, VoiceRender, VoiceScope};
+use crate::workspace::Tab;
 use crate::{App, Screen, dispatch_action};
 
 const POLL_PERIOD: Duration = Duration::from_millis(1);
@@ -23,6 +24,9 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Owned render data; drawing and present never hold a musical-state lock.
 pub(crate) struct Frame {
     screen: Screen,
+    workspace: Option<WorkspaceView>,
+    take_status: Option<&'static str>,
+    take_count: usize,
     worker_ticks: u64,
     active_midi: [u32; 4],
     settings: MusicalSettings,
@@ -83,8 +87,71 @@ impl Frame {
             EditGrid::Beat.beats(app.settings.meter.numerator, app.settings.meter.denominator);
         let bar_phase = now_beat.rem_euclid(bar);
         let beat_index = (bar_phase / beat).floor() as u32;
+        let take_status = if let Some(playback) = &app.playing_take {
+            Some(if playback.started {
+                "PLAYING TAKE"
+            } else {
+                "TAKE QUEUED"
+            })
+        } else if app.recording_take.is_some() {
+            Some("RECORDING")
+        } else if app.take_armed_at.is_some() {
+            Some("ARMED")
+        } else {
+            None
+        };
         Self {
             screen: app.screen,
+            workspace: app.workspace_ui.as_ref().map(|ui| {
+                let first = ui.row.saturating_sub(7);
+                let items = match ui.tab {
+                    Tab::Takes => app
+                        .takes
+                        .iter()
+                        .skip(first)
+                        .take(8)
+                        .map(|take| format!("{}   {:.1} BEATS", take.name, take.duration))
+                        .collect(),
+                    Tab::Projects => app
+                        .collection
+                        .projects
+                        .iter()
+                        .skip(first)
+                        .take(8)
+                        .map(|entry| entry.name.clone())
+                        .collect(),
+                    Tab::Presets => app
+                        .collection
+                        .presets
+                        .iter()
+                        .skip(first)
+                        .take(8)
+                        .map(|entry| entry.name.clone())
+                        .collect(),
+                };
+                WorkspaceView {
+                    tab: ui.tab,
+                    items,
+                    row: ui.row - first,
+                    name: ui.name.as_ref().map(|edit| (edit.bytes, edit.cursor)),
+                    message: if ui.message.is_empty() {
+                        take_status.unwrap_or("").into()
+                    } else {
+                        ui.message.clone()
+                    },
+                    take_mode: app.take_mode,
+                    project: app.project_name.clone(),
+                }
+            }),
+            take_status: take_status.or_else(|| {
+                app.take_mode
+                    .then_some(if app.takes.len() >= crate::workspace::MAX_LIBRARY_ITEMS {
+                        "LIST FULL"
+                    } else {
+                        "READY"
+                    })
+            }),
+            take_count: app.takes.len(),
             worker_ticks,
             active_midi: midi.active_counts(),
             settings: app.settings,
@@ -164,6 +231,9 @@ impl Frame {
         canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
         select_held: bool,
     ) -> Result<(), String> {
+        if let Some(workspace) = &self.workspace {
+            return ui.draw_workspace(canvas, workspace);
+        }
         match if self.setting_focus.is_some() {
             Screen::Performance
         } else {
@@ -199,6 +269,8 @@ impl Frame {
                     performer_snapshots: self.performer_snapshots,
                     scope: self.scope,
                     recorder_status: self.recorder_status,
+                    take_status: self.take_status,
+                    take_count: self.take_count,
                     next_recording_armed: self.next_recording_armed,
                     phrase_count: self.phrase_count,
                     midi_destination: &self.midi_destination,
@@ -355,7 +427,7 @@ fn run(
     mut store: Option<&mut crate::session::Store>,
 ) -> Result<(), String> {
     let mut save_at = None;
-    let mut phrases = app.phrases.len();
+    let mut counts = (app.phrases.len(), app.takes.len());
     let mut was_running = false;
     let mut last_poll = Instant::now();
     let mut last_report = last_poll;
@@ -372,8 +444,9 @@ fn run(
         let live_commit = tick(app, transport, midi, &mut was_running)?;
         midi.service();
         max_work = max_work.max(poll.elapsed());
-        if live_commit || phrases != app.phrases.len() {
-            phrases = app.phrases.len();
+        let current_counts = (app.phrases.len(), app.takes.len());
+        if live_commit || counts != current_counts {
+            counts = current_counts;
             save_at = Some(poll + Duration::from_millis(650));
         }
         if save_at.is_some_and(|at| poll >= at) {
@@ -460,10 +533,13 @@ fn tick(
         app.pending_chord = None;
         app.pending_voicing = None;
         app.recorder.reset_timeline();
+        app.take_armed_at = None;
+        app.recording_take = None;
+        app.playing_take = None;
         if *was_running {
             app.phrase_player.stop();
             app.performer_engine.transport_stopped();
-            midi.stop_all()?;
+            app.stop_notes(midi)?;
             *was_running = false;
         }
     }
@@ -475,17 +551,42 @@ fn tick(
             app.chord_started_beat = now_beat;
             app.performer_engine.transport_started(now_beat);
         } else {
+            app.finish_take(now_beat);
+            app.take_armed_at = None;
+            app.playing_take = None;
             app.pending_chord = None;
             app.pending_voicing = None;
             app.phrase_player.stop();
             app.performer_engine.transport_stopped();
-            midi.stop_all()?;
+            app.stop_notes(midi)?;
         }
         *was_running = running_now;
     }
 
     let mut live_commit = false;
     if running_now {
+        if app
+            .playing_take
+            .as_ref()
+            .is_some_and(|playback| now_beat >= playback.start)
+        {
+            return tick_take_playback(app, midi, now_beat);
+        }
+        if let Some(stop) = app
+            .recording_take
+            .as_ref()
+            .and_then(|take| {
+                if take.full() {
+                    Some(now_beat)
+                } else {
+                    take.stop
+                }
+            })
+            .filter(|&stop| now_beat >= stop)
+        {
+            live_commit |= app.finish_take(stop);
+        }
+        crate::workspace::begin_take(app, now_beat);
         let voicing_due = app.pending_voicing.filter(|&(_, at)| now_beat >= at);
         if let Some((style, _)) = voicing_due {
             app.pending_voicing = None;
@@ -527,17 +628,119 @@ fn tick(
             .set_next_chord_target(next.map(|(chord, _)| chord), next.map(|(_, beat)| beat));
         if playback.ended && app.phrase_player.queued_phrase().is_none() {
             app.performer_engine.set_enabled(false);
-            midi.stop_all()?;
+            app.stop_notes(midi)?;
         }
         app.update_performers(now_beat, midi)?;
     }
     Ok(live_commit)
 }
 
+fn tick_take_playback(app: &mut App, midi: &mut MidiEngine, now: f64) -> Result<bool, String> {
+    let Some(mut playback) = app.playing_take.take() else {
+        return Ok(false);
+    };
+    if !playback.started {
+        app.stop_notes(midi)?;
+        app.performer_engine.set_enabled(false);
+        app.phrase_player.stop();
+        app.pending_chord = None;
+        app.pending_voicing = None;
+        playback.started = true;
+    }
+    let elapsed = now - playback.start;
+    while let Some(entry) = playback
+        .take
+        .events
+        .get(playback.event)
+        .filter(|event| event.beat <= elapsed)
+    {
+        app.active_notes.apply(entry.event);
+        midi.apply_event(entry.event)?;
+        playback.event += 1;
+    }
+    let mut chord = None;
+    while let Some(event) = playback
+        .take
+        .harmony
+        .get(playback.harmony)
+        .filter(|event| event.start_beat <= elapsed)
+    {
+        chord = Some(*event);
+        playback.harmony += 1;
+    }
+    if let Some(event) = chord.filter(|event| event.chord != app.current_chord) {
+        app.set_harmony(event.chord, playback.start + event.start_beat, false, false);
+    }
+    if elapsed >= playback.take.duration {
+        app.stop_notes(midi)?;
+        Ok(true)
+    } else {
+        app.playing_take = Some(playback);
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::handle_performance_action;
+
+    #[test]
+    fn take_playback_uses_recorded_velocity_and_beat_and_releases_at_end() {
+        use crate::performer::VoiceEvent;
+        let mut app = App::new();
+        let mut midi = MidiEngine::dry_run();
+        let note = VoiceEvent::NoteOn {
+            voice_index: 2,
+            note: 64,
+            velocity: 79,
+        };
+        let seed = VoiceEvent::NoteOn {
+            voice_index: 3,
+            note: 72,
+            velocity: 92,
+        };
+        let mut draft = crate::workspace::TakeRecording::new(&app, 4.0, None, "TAKE 01".into());
+        app.active_notes.apply(seed);
+        draft.seed_notes(&app.active_notes);
+        draft.event(4.6, note);
+        let recorded = draft.finish(5.8).unwrap();
+        assert_eq!(recorded.events[0].event, seed);
+        assert_eq!(recorded.events[1].event, note);
+        assert!(recorded.valid());
+        app.playing_take = Some(crate::workspace::TakePlayback::new(recorded, 8.0));
+        tick_take_playback(&mut app, &mut midi, 8.0).unwrap();
+        assert_eq!(midi.active_counts(), [0, 0, 0, 1]);
+        tick_take_playback(&mut app, &mut midi, 8.7).unwrap();
+        assert_eq!(midi.active_counts(), [0, 0, 1, 1]);
+        assert!(tick_take_playback(&mut app, &mut midi, 10.0).unwrap());
+        assert_eq!(midi.active_counts(), [0; 4]);
+        assert!(app.playing_take.is_none());
+    }
+
+    #[test]
+    fn workspace_actions_save_and_restore_project_while_keeping_the_rig() {
+        let mut app = App::new();
+        let mut midi = MidiEngine::dry_run();
+        let mut clock = SyncTransport::new(120.0);
+        for action in [
+            InputAction::ToggleWorkspace,
+            InputAction::NavigateRight,
+            InputAction::Tertiary,
+            InputAction::Primary,
+        ] {
+            dispatch_action(action, &mut app, &mut clock, &mut midi).unwrap();
+        }
+        assert_eq!(app.project_name.as_deref(), Some("PROJECT 01"));
+        let saved = app.voices[3].parameters.color;
+        app.voices[3].parameters.color = 0.1;
+        midi.adjust_channel(3, 3).unwrap();
+        for _ in 0..2 {
+            dispatch_action(InputAction::Primary, &mut app, &mut clock, &mut midi).unwrap();
+        }
+        assert_eq!(app.voices[3].parameters.color, saved);
+        assert_eq!(midi.channels(), [1, 2, 3, 7]);
+    }
 
     #[test]
     fn live_commit_replaces_pending_chord_and_records_its_boundary() {

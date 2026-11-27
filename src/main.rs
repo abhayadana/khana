@@ -13,6 +13,7 @@ mod session;
 mod sync;
 mod ui;
 mod voice;
+mod workspace;
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,9 +30,11 @@ use performer::PerformerEngine;
 use phrase::{ChordEvent, EditGrid, LiveGrid, Phrase, PhrasePlayer, PhraseRecorder};
 use sdl2::event::Event;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use sync::{SyncMode, SyncTransport};
 use ui::Ui;
 use voice::{MacroKind, Voice, VoiceEngine, VoiceRender, VoiceScope, adjust_macro, default_voices};
+use workspace::{ActiveNotes, Collection, Take, TakePlayback, TakeRecording, WorkspaceUi};
 
 const WINDOW_WIDTH: u32 = 1024;
 const WINDOW_HEIGHT: u32 = 768;
@@ -51,6 +54,15 @@ struct App {
     screen: Screen,
     settings: MusicalSettings,
     setting_focus: Option<SettingField>,
+    workspace_ui: Option<WorkspaceUi>,
+    collection: Collection,
+    project_name: Option<String>,
+    takes: Vec<Arc<Take>>,
+    take_mode: bool,
+    take_armed_at: Option<workspace::TakeArm>,
+    recording_take: Option<TakeRecording>,
+    playing_take: Option<TakePlayback>,
+    active_notes: ActiveNotes,
     panic_confirm: bool,
     current_chord: Chord,
     chord_started_beat: f64,
@@ -82,7 +94,9 @@ struct App {
 
 impl App {
     fn input_page(&self) -> InputPage {
-        if self.setting_focus.is_some() {
+        if self.workspace_ui.is_some() {
+            InputPage::Workspace
+        } else if self.setting_focus.is_some() {
             InputPage::Settings
         } else if self.screen == Screen::Performance {
             InputPage::Performance
@@ -109,6 +123,15 @@ impl App {
             screen: Screen::Performance,
             settings,
             setting_focus: None,
+            workspace_ui: None,
+            collection: Collection::default(),
+            project_name: None,
+            takes: Vec::new(),
+            take_mode: false,
+            take_armed_at: None,
+            recording_take: None,
+            playing_take: None,
+            active_notes: ActiveNotes::default(),
             panic_confirm: false,
             current_chord,
             chord_started_beat: 0.0,
@@ -137,6 +160,25 @@ impl App {
             pending_chord: None,
             pending_voicing: None,
         }
+    }
+
+    fn finish_take(&mut self, beat: f64) -> bool {
+        if let Some(take) = self
+            .recording_take
+            .take()
+            .and_then(|take| take.finish(beat))
+        {
+            println!("CAPTURED {}", take.name);
+            self.takes.push(take);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn stop_notes(&mut self, midi: &mut MidiEngine) -> Result<(), String> {
+        self.active_notes = ActiveNotes::default();
+        midi.stop_all()
     }
 
     fn macro_targets(&self) -> [bool; 4] {
@@ -184,6 +226,9 @@ impl App {
         );
         self.performer_engine.set_enabled(transport_running);
 
+        if let Some(take) = &mut self.recording_take {
+            take.chord(now_beat, chord);
+        }
         if record {
             self.recorder.chord_changed(now_beat, chord);
         }
@@ -227,6 +272,10 @@ impl App {
         );
 
         for event in batch.iter() {
+            self.active_notes.apply(event);
+            if let Some(take) = &mut self.recording_take {
+                take.event(now_beat, event);
+            }
             midi.apply_event(event)?;
         }
 
@@ -500,6 +549,16 @@ fn dispatch_action(
     if action == InputAction::Quit {
         return Ok(true);
     }
+    if action == InputAction::ToggleWorkspace && app.setting_focus.is_none() {
+        if app.workspace_ui.take().is_none() {
+            app.workspace_ui = Some(WorkspaceUi::default());
+        }
+        return Ok(false);
+    }
+    if app.workspace_ui.is_some() && action != InputAction::ToggleTransport {
+        workspace::handle_action(action, app, transport, midi)?;
+        return Ok(false);
+    }
     if action == InputAction::MenuTap {
         action = if app.setting_focus.is_some() {
             InputAction::ToggleSettings
@@ -523,7 +582,7 @@ fn dispatch_action(
     } else {
         match app.screen {
             Screen::Performance => handle_performance_action(action, app, transport, midi)?,
-            Screen::PhraseEditor => handle_editor_action(action, app, transport)?,
+            Screen::PhraseEditor => handle_editor_action(action, app, transport, midi)?,
         }
     }
     Ok(false)
@@ -535,6 +594,8 @@ fn toggle_transport(app: &mut App, transport: &mut SyncTransport) {
     if transport.start_pending() {
         app.phrase_player.stop();
         app.recorder.cancel_pending_start();
+        app.take_armed_at = None;
+        app.playing_take = None;
     }
     if transport.is_running() || transport.start_pending() {
         app.pending_chord = None;
@@ -549,7 +610,7 @@ fn handle_performance_action(
     action: InputAction,
     app: &mut App,
     transport: &mut SyncTransport,
-    _midi: &mut MidiEngine,
+    midi: &mut MidiEngine,
 ) -> Result<(), String> {
     let now_beat = transport.beat(app.settings.meter.beats_per_bar());
 
@@ -569,6 +630,10 @@ fn handle_performance_action(
             app.selected_row = (app.selected_row + 1) % 3;
         }
         InputAction::Primary => {
+            if app.playing_take.take().is_some() {
+                app.stop_notes(midi)?;
+                app.performer_engine.transport_started(now_beat);
+            }
             let chord = app.chosen_chord();
             if transport.is_running()
                 && let Some(quantum) = app.live_grid.quantum(app.settings.meter)
@@ -581,6 +646,16 @@ fn handle_performance_action(
             }
         }
         InputAction::CycleLiveGrid => app.live_grid = app.live_grid.next(),
+        InputAction::CyclePolyphony => {
+            let meter = app.settings.meter;
+            let next = transport.is_running().then(|| {
+                phrase::next_strict_boundary(
+                    now_beat,
+                    EditGrid::Beat.beats(meter.numerator, meter.denominator),
+                )
+            });
+            app.performer_engine.cycle_polyphony(app.scope, next);
+        }
         InputAction::PatternHold => app.performer_engine.toggle_hold(app.scope),
         InputAction::ToggleMute => app.performer_engine.toggle_mute(app.scope),
         InputAction::ToggleSolo => app.performer_engine.toggle_solo(app.scope),
@@ -651,7 +726,13 @@ fn handle_performance_action(
                 app.revoice_current();
             }
         }
+        InputAction::ToggleRecord if app.take_mode => {
+            workspace::toggle_capture(app, transport);
+        }
         InputAction::ToggleRecord => {
+            if app.playing_take.is_some() {
+                return Ok(());
+            }
             if !transport.is_running() {
                 if transport.mode() == SyncMode::MidiIn {
                     return Ok(());
@@ -665,7 +746,7 @@ fn handle_performance_action(
                 .unwrap_or_else(|| transport.beat(bar));
             app.recorder.toggle(beat, bar);
         }
-        InputAction::ArmNextRecording => {
+        InputAction::ArmNextRecording if !app.take_mode => {
             app.recorder.toggle_arm_next();
         }
         InputAction::ToggleScreen => {
@@ -827,6 +908,7 @@ fn handle_editor_action(
     action: InputAction,
     app: &mut App,
     transport: &mut SyncTransport,
+    midi: &mut MidiEngine,
 ) -> Result<(), String> {
     match action {
         InputAction::ToggleScreen => {
@@ -854,6 +936,9 @@ fn handle_editor_action(
         }
         InputAction::Primary => {
             if app.selected_phrase().is_some() {
+                if app.playing_take.take().is_some() {
+                    app.stop_notes(midi)?;
+                }
                 if !transport.is_running() {
                     if transport.mode() == SyncMode::MidiIn {
                         return Ok(());
@@ -954,7 +1039,7 @@ fn print_controls() {
     println!("Khana v{}", env!("CARGO_PKG_VERSION"));
     println!("GLOBAL:");
     println!("  Space   transport start/stop");
-    println!("  Tab     Performance / Phrase Editor");
+    println!("  Tab     Performance / Phrase Editor; F2 opens Workspace; F3 cycles polyphony");
     println!("PERFORMANCE:");
     println!("  arrows  browse Safe / Colorful / Bold");
     println!("  Z       commit highlighted chord");
@@ -997,6 +1082,7 @@ fn print_controls() {
     println!("  Sticks: left X/Y density/dynamics, right X/Y spread/color");
     println!("  Performance: L3 Sustain, R3 voicing, SELECT+L/R1 Mute/Solo");
     println!("  SELECT+L/R2 Pattern Hold/live grid, SELECT+R3 or SELECT+Y Vary");
+    println!("  SELECT+L3 cycles polyphony on Texture or Melody; SELECT+START opens Workspace");
     println!("  Editor: A play B change X duplicate Y back; SELECT+Y delete");
     println!("  Editor: L3 Loop, R3 clear queue, SELECT+A Undo, SELECT+X Setup");
     println!("  L/R1 phrase, L/R2 duration, SELECT+L/R1 zoom, D-pad grid/event");

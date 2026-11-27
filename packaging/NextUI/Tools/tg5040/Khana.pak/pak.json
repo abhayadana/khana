@@ -1,6 +1,6 @@
 {
   "name": "Khana",
-  "version": "0.12.3",
+  "version": "0.13.0",
   "type": "tool",
   "platform": "tg5040",
   "description": "Performance-oriented MIDI harmony and phrase instrument"

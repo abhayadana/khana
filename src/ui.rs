@@ -8,6 +8,7 @@ use crate::performer::PerformerSnapshot;
 use crate::phrase::{EditGrid, Phrase, RecorderStatus};
 use crate::sync::{SyncMode, SyncStatus};
 use crate::voice::{Voice, VoiceRender, VoiceScope};
+use crate::workspace::{NAME_LEN, Tab};
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 
@@ -40,6 +41,8 @@ pub struct PerformanceView<'a> {
     pub performer_snapshots: [PerformerSnapshot; 4],
     pub scope: VoiceScope,
     pub recorder_status: RecorderStatus,
+    pub take_status: Option<&'a str>,
+    pub take_count: usize,
     pub next_recording_armed: bool,
     pub phrase_count: usize,
     pub midi_destination: &'a str,
@@ -65,6 +68,16 @@ pub struct PhraseEditorView<'a> {
     pub edit_grid: EditGrid,
     pub can_undo: bool,
     pub select_held: bool,
+}
+
+pub struct WorkspaceView {
+    pub tab: Tab,
+    pub items: Vec<String>,
+    pub row: usize,
+    pub name: Option<([u8; NAME_LEN], usize)>,
+    pub message: String,
+    pub take_mode: bool,
+    pub project: Option<String>,
 }
 
 /// Stateless 1024×768 renderer.
@@ -107,6 +120,8 @@ impl Ui {
             performer_snapshots,
             scope,
             recorder_status,
+            take_status,
+            take_count,
             next_recording_armed,
             phrase_count,
             midi_clock,
@@ -265,8 +280,8 @@ impl Ui {
         draw_recording_strip(
             canvas,
             recorder_status,
-            next_recording_armed,
-            phrase_count,
+            (next_recording_armed, phrase_count),
+            (take_status, take_count),
             self.brick,
         )?;
         let footer = if self.brick && select_held {
@@ -288,16 +303,115 @@ impl Ui {
             } else {
                 "SOLO"
             };
-            format!(
-                "L1 {mute}  R1 {solo}  L2 PATTERN HOLD  R2 LIVE GRID  R3 VARY  B ARM NEXT  X SETUP"
-            )
+            format!("L1 {mute}  R1 {solo}  L2 HOLD  R2 GRID  L3 POLY  R3 VARY  START WORKSPACE")
         } else if self.brick {
             "A COMMIT   Y MACRO GROUP   L3 SUSTAIN   HOLD SELECT FOR SHORTCUTS".into()
         } else {
-            "Z COMMIT   F4 MACRO GROUP   F5 SUSTAIN   M SETUP".into()
+            "Z COMMIT   F3 POLY   F4 GROUP   F2 WORKSPACE   M SETUP".into()
         };
         draw_text(canvas, 32, 739, &footer, 2, dim_text())?;
         Ok(())
+    }
+
+    pub fn draw_workspace(
+        &self,
+        canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+        view: &WorkspaceView,
+    ) -> Result<(), String> {
+        canvas.set_draw_color(background());
+        canvas.clear();
+        draw_text(canvas, 36, 30, "WORKSPACE", 4, text_color())?;
+        if let Some(project) = &view.project {
+            draw_text(canvas, 600, 38, project, 2, accent())?;
+        }
+        for (x, tab, label) in [
+            (44, Tab::Takes, "TAKES"),
+            (230, Tab::Projects, "PROJECTS"),
+            (454, Tab::Presets, "PRESETS"),
+        ] {
+            let color = if tab == view.tab {
+                accent()
+            } else {
+                dim_text()
+            };
+            draw_text(canvas, x, 110, label, 3, color)?;
+        }
+        draw_panel(canvas, Rect::new(32, 165, 960, 438), panel())?;
+        if let Some((name, cursor)) = view.name {
+            draw_text(canvas, 58, 204, "NAME", 2, dim_text())?;
+            for (index, character) in name.into_iter().enumerate() {
+                let x = 61 + index as i32 * 32;
+                let focused = index == cursor;
+                draw_panel(
+                    canvas,
+                    Rect::new(x - 5, 276, 30, 40),
+                    if focused { accent() } else { dim_panel() },
+                )?;
+                draw_text(
+                    canvas,
+                    x,
+                    285,
+                    &char::from(character).to_string(),
+                    3,
+                    if focused { background() } else { text_color() },
+                )?;
+            }
+            draw_text(
+                canvas,
+                58,
+                377,
+                "LEFT/RIGHT POSITION   UP/DOWN LETTER",
+                2,
+                dim_text(),
+            )?;
+        } else if view.items.is_empty() {
+            draw_text(canvas, 58, 214, "NO SAVED ITEMS", 2, dim_text())?;
+        } else {
+            for (index, name) in view.items.iter().enumerate() {
+                let y = 194 + index as i32 * 48;
+                let focused = index == view.row;
+                if focused {
+                    draw_panel(canvas, Rect::new(46, y - 10, 928, 38), scoped_panel())?;
+                }
+                draw_text(
+                    canvas,
+                    58,
+                    y,
+                    name,
+                    2,
+                    if focused { accent() } else { text_color() },
+                )?;
+            }
+        }
+        draw_text(canvas, 36, 624, &view.message, 2, accent())?;
+        let (choose, back, recall) = if self.brick {
+            ("A", "B", "Y")
+        } else {
+            ("Z", "M", "F1")
+        };
+        let hint = if view.name.is_some() {
+            format!("{choose} SAVE   {recall} CLEAR   {back} CANCEL")
+        } else {
+            match view.tab {
+                Tab::Takes => format!(
+                    "{choose} PLAY   X CAPTURE MODE   {recall} RECALL   {} COPY HARMONY",
+                    if self.brick { "L3" } else { "F5" }
+                ),
+                Tab::Projects | Tab::Presets => format!("{choose} LOAD   X SAVE   {back} BACK"),
+            }
+        };
+        draw_text(canvas, 36, 676, &hint, 2, text_color())?;
+        let footer = if view.name.is_some() {
+            String::new()
+        } else if view.tab == Tab::Takes {
+            format!(
+                "LEFT/RIGHT TABS   {back} BACK   CAPTURE {}",
+                if view.take_mode { "TAKE" } else { "PHRASE" }
+            )
+        } else {
+            "LEFT/RIGHT TABS   UP/DOWN SELECT".into()
+        };
+        draw_text(canvas, 36, 724, &footer, 2, dim_text())
     }
 
     pub fn draw_phrase_editor(
@@ -463,7 +577,7 @@ impl Ui {
             32,
             746,
             if self.brick && select_held {
-                "Y DELETE   L/R1 ZOOM   X SETUP"
+                "Y DELETE   L/R1 ZOOM   X SETUP   START WORKSPACE"
             } else if self.brick {
                 "L3 LOOP   R3 CLEAR QUEUE   HOLD SELECT FOR SHORTCUTS"
             } else {
@@ -901,6 +1015,16 @@ fn draw_voice_rows(
         draw_value_bar(canvas, 420, y + 4, voice.parameters.dynamics)?;
         draw_value_bar(canvas, 590, y + 4, voice.parameters.spread)?;
         draw_value_bar(canvas, 770, y + 4, voice.parameters.color)?;
+        if index == 1 {
+            let emphasis = match voice.parameters.color {
+                c if c < 0.33 => "ROOT / FIFTH",
+                c if c < 0.67 => "THIRD",
+                _ => "UPPER TONES",
+            };
+            draw_text(canvas, 907, y + 6, emphasis, 1, dim_text())?;
+        } else if index >= 2 {
+            draw_text(canvas, 907, y + 6, state.polyphony, 1, accent())?;
+        }
     }
 
     Ok(())
@@ -928,8 +1052,8 @@ fn active_note_summary(
 fn draw_recording_strip(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
     status: RecorderStatus,
-    next_armed: bool,
-    phrase_count: usize,
+    (next_armed, phrase_count): (bool, usize),
+    (take_status, take_count): (Option<&str>, usize),
     brick: bool,
 ) -> Result<(), String> {
     let capture = match status {
@@ -938,16 +1062,41 @@ fn draw_recording_strip(
         RecorderStatus::Recording { phrase_id } => format!("RECORDING P{phrase_id:02}"),
         RecorderStatus::Stopping { phrase_id, .. } => format!("STOPPING P{phrase_id:02}"),
     };
-    draw_text(canvas, 52, 686, "CAPTURE", 2, dim_text())?;
-    draw_text(canvas, 180, 686, &capture, 2, accent())?;
-    if next_armed {
+    draw_text(
+        canvas,
+        52,
+        686,
+        if take_status.is_some() {
+            "TAKE"
+        } else {
+            "CAPTURE"
+        },
+        2,
+        dim_text(),
+    )?;
+    draw_text(
+        canvas,
+        180,
+        686,
+        take_status.unwrap_or(&capture),
+        2,
+        accent(),
+    )?;
+    if take_status.is_none() && next_armed {
         draw_text(canvas, 410, 686, "NEXT ARMED", 2, accent())?;
     }
     draw_text(
         canvas,
         635,
         686,
-        &format!("{phrase_count} SAVED"),
+        &format!(
+            "{} SAVED",
+            if take_status.is_some() {
+                take_count
+            } else {
+                phrase_count
+            }
+        ),
         2,
         dim_text(),
     )?;

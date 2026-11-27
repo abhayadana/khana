@@ -8,11 +8,10 @@ use crate::App;
 use crate::midi::MidiEngine;
 use crate::music::chord::Chord;
 use crate::music::settings::{MusicalSettings, TimeSignature};
-use crate::music::voicing::VoicingStyle;
-use crate::performer::{ChordHold, Groove, TextureStyle};
 use crate::phrase::{EditGrid, LiveGrid, Phrase};
 use crate::sync::{SyncMode, SyncTransport};
-use crate::voice::VoiceParameters;
+use crate::workspace::{Collection, EnsembleSetup, Take, valid_chord_event};
+use std::sync::Arc;
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Session {
@@ -24,14 +23,16 @@ struct Session {
     channels: [u8; 4],
     transpose: [i8; 4],
     clock_out: bool,
-    voices: [VoiceParameters; 4],
-    chord_hold: ChordHold,
+    #[serde(flatten)]
+    ensemble: EnsembleSetup,
     #[serde(default)]
-    groove: Groove,
+    collection: Collection,
     #[serde(default)]
-    texture_style: TextureStyle,
-    voice_led_bass: bool,
-    voicing: VoicingStyle,
+    project_name: Option<String>,
+    #[serde(default)]
+    take_mode: bool,
+    #[serde(default)]
+    takes: Vec<Arc<Take>>,
     live_grid: LiveGrid,
     edit_grid: EditGrid,
     phrases: Vec<Phrase>,
@@ -50,12 +51,11 @@ impl Session {
             channels: midi.channels(),
             transpose: midi.transpositions(),
             clock_out: midi.clock_enabled(),
-            voices: app.voices.map(|voice| voice.parameters),
-            chord_hold: app.performer_engine.hold_length,
-            groove: app.performer_engine.groove,
-            texture_style: app.performer_engine.texture_style,
-            voice_led_bass: app.performer_engine.voice_led_bass,
-            voicing: app.voice_engine.style,
+            ensemble: EnsembleSetup::capture(app),
+            collection: app.collection.clone(),
+            project_name: app.project_name.clone(),
+            take_mode: app.take_mode,
+            takes: app.takes.clone(),
             live_grid: app.live_grid,
             edit_grid: app.editor_grid,
             phrases: app.phrases.clone(),
@@ -70,20 +70,12 @@ impl Session {
             && (30.0..=300.0).contains(&self.settings.tempo_bpm)
             && self.channels.iter().all(|x| (1..=16).contains(x))
             && self.transpose.iter().all(|x| (-24..=24).contains(x))
-            && self.voices.iter().all(|voice| {
-                [voice.density, voice.dynamics, voice.spread, voice.color]
-                    .iter()
-                    .all(|value| (0.0..=1.0).contains(value))
-            })
+            && self.ensemble.valid()
+            && self.collection.valid()
+            && self.takes.len() <= crate::workspace::MAX_LIBRARY_ITEMS
+            && self.takes.iter().all(|take| take.valid())
             && self.phrases.iter().all(|phrase| {
-                !phrase.events.is_empty()
-                    && phrase.events.iter().all(|event| {
-                        event.chord.root.value() < 12
-                            && event.start_beat.is_finite()
-                            && event.start_beat >= 0.0
-                            && event.duration_beats.is_finite()
-                            && event.duration_beats > 0.0
-                    })
+                !phrase.events.is_empty() && phrase.events.iter().all(valid_chord_event)
             })
     }
 
@@ -96,14 +88,11 @@ impl Session {
             self.shared_transport,
         );
         midi.restore_routing(self.channels, self.transpose, self.clock_out);
-        for (voice, params) in app.voices.iter_mut().zip(self.voices) {
-            voice.parameters = params;
-        }
-        app.performer_engine.hold_length = self.chord_hold;
-        app.performer_engine.groove = self.groove;
-        app.performer_engine.texture_style = self.texture_style;
-        app.performer_engine.voice_led_bass = self.voice_led_bass;
-        app.voice_engine.style = self.voicing;
+        self.ensemble.apply(app);
+        app.collection = self.collection;
+        app.project_name = self.project_name;
+        app.take_mode = self.take_mode;
+        app.takes = self.takes;
         app.live_grid = self.live_grid;
         app.editor_grid = self.edit_grid;
         app.phrases = self.phrases;
@@ -223,8 +212,35 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::music::voicing::VoicingStyle;
+    use crate::performer::{ChordHold, Groove, TextureStyle};
     use crate::phrase::ChordEvent;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn version_one_session_defaults_missing_workspace_and_polyphony() {
+        let app = App::new();
+        let mut clock = SyncTransport::new(120.0);
+        let midi = MidiEngine::dry_run();
+        let mut old = serde_json::to_value(Session::capture(&app, &mut clock, &midi)).unwrap();
+        let fields = old.as_object_mut().unwrap();
+        for key in [
+            "collection",
+            "takes",
+            "take_mode",
+            "project_name",
+            "polyphony",
+        ] {
+            assert!(fields.remove(key).is_some());
+        }
+        let session: Session = serde_json::from_value(old).unwrap();
+        assert!(session.valid());
+        assert_eq!(
+            session.ensemble.polyphony,
+            crate::performer::Polyphony::default()
+        );
+        assert!(session.takes.is_empty());
+    }
 
     #[test]
     fn clean_exit_writes_session_and_restore_leaves_transport_stopped() {
@@ -246,6 +262,8 @@ mod tests {
         app.performer_engine.hold_length = ChordHold::Sixteen;
         app.performer_engine.groove = Groove::LaidBack;
         app.performer_engine.texture_style = TextureStyle::SparseEcho;
+        app.performer_engine.polyphony.texture = 3;
+        app.take_mode = true;
         app.voices[0].parameters.color = 0.7;
         midi.adjust_channel(0, 5).unwrap();
         midi.adjust_transpose(3, 12).unwrap();
@@ -258,6 +276,18 @@ mod tests {
                 duration_beats: 3.2,
             }],
         });
+        let take = crate::workspace::TakeRecording::new(&app, 0.0, Some(8), "TEST TAKE".to_owned());
+        app.takes.push(take.finish(2.0).unwrap());
+        let project = crate::workspace::Project::capture(&app);
+        app.collection.projects.push(crate::workspace::Named {
+            name: "TEST PROJECT".into(),
+            value: project,
+        });
+        let preset = EnsembleSetup::capture(&app);
+        app.collection.presets.push(crate::workspace::Named {
+            name: "TEST PRESET".into(),
+            value: preset,
+        });
         transport.set_mode(SyncMode::MidiIn, 4.0);
         transport.start(4.0);
         store.finish(&app, &mut transport, &midi);
@@ -268,6 +298,11 @@ mod tests {
         let reader = Store::open(path.clone(), &mut restored, &mut clock, &mut routing).unwrap();
         reader.finish(&restored, &mut clock, &routing);
         std::fs::remove_file(path).unwrap();
+        assert!(restored.take_mode);
+        assert_eq!(restored.takes, app.takes);
+        assert_eq!(restored.collection.projects[0].name, "TEST PROJECT");
+        assert_eq!(restored.collection.presets[0].name, "TEST PRESET");
+        assert_eq!(restored.performer_engine.polyphony.texture, 3);
         assert_eq!(restored.live_grid, LiveGrid::Bar);
         assert_eq!(restored.editor_grid, EditGrid::Eighth);
         assert_eq!(restored.voice_engine.style, VoicingStyle::Open);
